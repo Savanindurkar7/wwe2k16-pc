@@ -46,6 +46,9 @@ jobs:
             -DBUILD_EXTERNAL=ON \
             -DBUILD_TESTING=OFF
 
+      - name: Generate WWE 2K16 code
+        run: cmake --build sdk/rexglue/out/build/android-arm64 --target wwe2k16_codegen --parallel 2
+
       - name: Build native library
         run: cmake --build sdk/rexglue/out/build/android-arm64 --parallel 2
 
