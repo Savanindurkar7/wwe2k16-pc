@@ -8,6 +8,10 @@ project(ReXGlue
     DESCRIPTION "Xbox 360 Recompilation SDK"
 )
 
+if(ANDROID)
+    enable_language(ASM)
+endif()
+
 #==========================================================
 # Build Options
 #==========================================================
@@ -17,6 +21,7 @@ option(REXGLUE_ENABLE_FIDELITYFX "Enable optional AMD FidelityFX integration (ex
 option(REXGLUE_ENABLE_TRACY                "Enable Tracy profiler integration" OFF)
 option(REXGLUE_ENABLE_PERF_COUNTERS        "Enable lightweight perf counter registry and overlay" OFF)
 option(REXGLUE_PROFILE_GUEST_FUNCTIONS     "Enable per-function Tracy zones in recompiled guest code (high overhead)" OFF)
+option(REXGLUE_FFMPEG_SHARED "Build FFmpeg libavutil/libavcodec as shared libraries" ON)
 
 # Propagate profiling defines globally (compiled out in Release)
 if(REXGLUE_ENABLE_TRACY)
@@ -126,6 +131,13 @@ if(WIN32)
         message(FATAL_ERROR "Unsupported Windows architecture: ${CMAKE_SYSTEM_PROCESSOR}")
     endif()
     add_compile_definitions(REX_PLATFORM_WINDOWS=1)
+elseif(ANDROID)
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64")
+        set(REX_PLATFORM "android-arm64")
+    else()
+        message(FATAL_ERROR "Unsupported Android architecture: ${CMAKE_SYSTEM_PROCESSOR}")
+    endif()
+    add_compile_definitions(REX_PLATFORM_ANDROID=1)
 elseif(UNIX AND NOT APPLE)
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64")
         set(REX_PLATFORM "linux-amd64")

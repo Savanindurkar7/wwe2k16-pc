@@ -10,15 +10,23 @@
  */
 
 #include <array>
+#include <chrono>
+#include <future>
+#include <thread>
 #include <filesystem>
 
 #include <rex/assert.h>
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
+#include <rex/filesystem.h>
 #include <rex/input/flags.h>
 #include <rex/input/sdl/sdl_input_driver.h>
 #include <rex/logging.h>
 #include <rex/ui/virtual_key.h>
+
+REXCVAR_DEFINE_BOOL(sdl_input_poll_thread, true, "Input",
+                    "Run SDL controller input on its own thread, polled every ~1 ms (lower input latency); "
+                    "false = pump from the UI thread when the game reads a controller");
 
 REXCVAR_DEFINE_STRING(hid_mappings_file, "gamecontrollerdb.txt", "Input",
                       "Path to SDL gamecontroller mappings file");
@@ -35,7 +43,7 @@ SDLInputDriver::SDLInputDriver(rex::ui::Window* window, size_t window_z_order)
       controllers_mutex_(),
       keystroke_states_() {}
 
-SDLInputDriver::~SDLInputDriver() {}
+SDLInputDriver::~SDLInputDriver() { StopPollThread(); }
 
 X_STATUS SDLInputDriver::Setup() {
   if (!TestSDLVersion()) {
@@ -49,7 +57,7 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
   if (window && !attached_window_) {
     attached_window_ = window;
     window->AddListener(this);
-    window->app_context().CallInUIThreadSynchronous([this]() {
+    auto init_sdl = [this]() {
       // Initialize SDL events subsystem
       if (!SDL_InitSubSystem(SDL_INIT_EVENTS)) {
         REXLOG_ERROR("SDL: Failed to init events subsystem: {}", SDL_GetError());
@@ -91,7 +99,7 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
 
       // Load custom controller mappings if available
       if (!REXCVAR_GET(hid_mappings_file).empty()) {
-        std::filesystem::path mappings_path(REXCVAR_GET(hid_mappings_file));
+        std::filesystem::path mappings_path(rex::to_path(REXCVAR_GET(hid_mappings_file)));
         if (!std::filesystem::exists(mappings_path)) {
           REXLOG_WARN("SDL GameControllerDB: file '{}' does not exist.",
                       REXCVAR_GET(hid_mappings_file));
@@ -107,11 +115,46 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
         }
       }
       REXLOG_INFO("SDL input driver initialized successfully");
-    });
+    };
+    if (REXCVAR_GET(sdl_input_poll_thread)) {
+      StartPollThread(std::move(init_sdl));
+    } else {
+      window->app_context().CallInUIThreadSynchronous(init_sdl);
+    }
+  }
+}
+
+void SDLInputDriver::StartPollThread(std::function<void()> init_sdl) {
+  std::promise<void> ready;
+  std::future<void> ready_future = ready.get_future();
+  poll_thread_running_ = true;
+  poll_thread_ = std::thread([this, init_sdl = std::move(init_sdl), ready = std::move(ready)]() mutable {
+    // Initialized here, not on the UI thread: SDL's Windows joystick backends deliver device data to the thread
+    // that set them up, and this thread is the one that keeps pumping.
+    init_sdl();
+    const bool ok = sdl_events_initialized_ && SDL_Gamepad_initialized_;
+    ready.set_value();
+    if (!ok) {
+      return;
+    }
+    REXLOG_INFO("SDL input: polling on a dedicated thread (~1 ms)");
+    while (poll_thread_running_.load(std::memory_order_relaxed)) {
+      SDL_PumpEvents();
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  });
+  ready_future.wait();
+}
+
+void SDLInputDriver::StopPollThread() {
+  poll_thread_running_ = false;
+  if (poll_thread_.joinable()) {
+    poll_thread_.join();
   }
 }
 
 void SDLInputDriver::OnClosing(rex::ui::UIEvent&) {
+  StopPollThread();
   if (attached_window_) {
     attached_window_->RemoveListener(this);
     if (sdl_pumpevents_queued_) {
@@ -451,23 +494,17 @@ void SDLInputDriver::OnControllerDeviceAddedLocked(const SDL_Event& event) {
       static_cast<int>(SDL_GetGamepadType(controller)), SDL_GetGamepadVendor(controller),
       SDL_GetGamepadProduct(controller));
   int user_id = -1;
-  // Check if the controller has a player index LED.
-  user_id = SDL_GetGamepadPlayerIndex(controller);
-  // Is that id already taken?
-  if (user_id < 0 || user_id >= static_cast<int>(controllers_.size()) ||
-      controllers_.at(user_id).sdl) {
-    user_id = -1;
-  }
-  // No player index or already taken, just take the first free slot.
-  if (user_id < 0) {
-    for (size_t i = 0; i < controllers_.size(); i++) {
-      if (!controllers_.at(i).sdl) {
-        user_id = static_cast<int>(i);
+  // Always take the first free slot, not the controller's own player index (on Windows its XInput
+  // slot): only user 0 is signed in, so a pad that Windows put in XInput slot 1+ (another pad or a
+  // virtual one connected first, even after that device is unplugged) would otherwise play signed
+  // out, with no storage device and no saves (GitHub #14).
+  for (size_t i = 0; i < controllers_.size(); i++) {
+    if (!controllers_.at(i).sdl) {
+      user_id = static_cast<int>(i);
 #if SDL_VERSION_ATLEAST(2, 0, 12)
-        SDL_SetGamepadPlayerIndex(controller, user_id);
+      SDL_SetGamepadPlayerIndex(controller, user_id);
 #endif
-        break;
-      }
+      break;
     }
   }
   if (user_id >= 0) {
@@ -669,6 +706,9 @@ void SDLInputDriver::UpdateXCapabilities(ControllerState& state) {
 }
 
 void SDLInputDriver::QueueControllerUpdate() {
+  if (poll_thread_.joinable()) {
+    return;  // The poll thread pumps continuously.
+  }
   // Pump SDL events to ensure controller state is up to date.
   bool is_queued = false;
   sdl_pumpevents_queued_.compare_exchange_strong(is_queued, true);

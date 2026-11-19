@@ -1,4 +1,4 @@
-# rexkernel: Xbox 360 kernel/XAM export implementations (ported from Xenia)
+# rexkernel: Xbox 360 kernel/XAM export implementations
 # Namespace: rex::kernel
 # System emulation layer has moved to rexsystem (rex::system)
 
@@ -24,6 +24,7 @@ set(REXKERNEL_SOURCES
     xam/xam_task.cpp
     xam/xam_ui.cpp
     xam/xam_user.cpp
+    xam/achievements.cpp
     xam/xam_video.cpp
     xam/xam_voice.cpp
     xam/xam_misc.cpp

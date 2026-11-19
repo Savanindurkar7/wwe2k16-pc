@@ -15,16 +15,42 @@
 #include <cstring>
 
 #include <rex/assert.h>
+#include <rex/cvar.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/ppc/function.h>
 #include <rex/ppc/types.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/xthread.h>
 #include <rex/system/xtypes.h>
+
+REXCVAR_DEFINE_BOOL(ignore_offset_for_ranged_allocations, false, "Memory",
+                    "Allows to ignore 4k offset for physical allocations with provided range. "
+                    "Certain titles check if result matches provided lower range.");
 
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
+
+namespace {
+// Cycle-22 diagnostic: bounded trace of 1264-class (1200..1300 byte) virtual
+// allocations/frees. Phase 2 (logs/cycle22-static.txt) shows the 1264-byte
+// movie-player struct is allocated by the guest CRT heap (sub_822047A0), whose
+// SDK bottom is NtAllocateVirtualMemory/NtFreeVirtualMemory; a match here means
+// the request crosses the SDK boundary. Bounded: 32 logged lines + one
+// suppression notice per path; no behavior change.
+constexpr uint32_t kSizeClassMin = 1200;
+constexpr uint32_t kSizeClassMax = 1300;
+constexpr unsigned kSizeClassCap = 32;
+uint32_t g_size_class_alloc_addr[kSizeClassCap] = {};
+uint32_t g_size_class_alloc_size[kSizeClassCap] = {};
+unsigned g_size_class_alloc_count = 0;
+
+uint32_t CurrentGuestLr() {
+  auto* thread_state = rex::runtime::ThreadState::Get();
+  return (thread_state && thread_state->context()) ? (uint32_t)thread_state->context()->lr : 0;
+}
+}  // namespace
 
 uint32_t ToXdkProtectFlags(uint32_t protect) {
   uint32_t result = 0;
@@ -196,6 +222,28 @@ ppc_u32_result_t NtAllocateVirtualMemory_entry(ppc_pu32_t base_addr_ptr, ppc_pu3
   // Maybe set X_STATUS_ALREADY_COMMITTED if MEM_COMMIT?
   *base_addr_ptr = address;
   *region_size_ptr = adjusted_size;
+  // Cycle-22 diagnostic: bounded 1264-class allocation trace (see the
+  // anonymous-namespace note above). Logged after the final address/size are
+  // known; the requested size is logged too, since the guest heap's request
+  // may be rounded before it reaches this entry.
+  if ((input_size >= kSizeClassMin && input_size <= kSizeClassMax) ||
+      (adjusted_size >= kSizeClassMin && adjusted_size <= kSizeClassMax)) {
+    if (g_size_class_alloc_count < kSizeClassCap) {
+      g_size_class_alloc_addr[g_size_class_alloc_count] = address;
+      g_size_class_alloc_size[g_size_class_alloc_count] = adjusted_size;
+      ++g_size_class_alloc_count;
+      REXKRNL_IMPORT_TRACE(
+          "NtAllocateVirtualMemory",
+          "SIZE-1264-CLASS alloc base={:#x} req={:#x} size={:#x} type={:#x} lr={:#010x} count={}",
+          address, input_size, adjusted_size, (uint32_t)alloc_type, CurrentGuestLr(),
+          g_size_class_alloc_count);
+    } else if (g_size_class_alloc_count == kSizeClassCap) {
+      ++g_size_class_alloc_count;
+      REXKRNL_IMPORT_TRACE(
+          "NtAllocateVirtualMemory",
+          "SIZE-1264-CLASS further 1200..1300 allocations suppressed (cap=32)");
+    }
+  }
   REXKRNL_IMPORT_RESULT("NtAllocateVirtualMemory", "0x0 addr={:#x} size={:#x}", address,
                         adjusted_size);
   return X_STATUS_SUCCESS;
@@ -254,6 +302,42 @@ ppc_u32_result_t NtFreeVirtualMemory_entry(ppc_pu32_t base_addr_ptr, ppc_pu32_t 
   REXKRNL_IMPORT_TRACE("NtFreeVirtualMemory", "base={:#x} size={:#x} type={:#x} debug={}",
                        base_addr_value, region_size_value, (uint32_t)free_type,
                        (uint32_t)debug_memory);
+  // Cycle-22 diagnostic: bounded 1264-class free trace. The freed block's size
+  // is taken from the caller's region size; if that is not in the 1200..1300
+  // range the base address is matched against the addresses logged by
+  // NtAllocateVirtualMemory (the allocator records no per-block size here, so
+  // the logged alloc ranges are the fallback). Bounded: 32 lines + suppression.
+  {
+    static unsigned free_size_class_count = 0;
+    bool size_class_hit =
+        (region_size_value >= kSizeClassMin && region_size_value <= kSizeClassMax);
+    if (!size_class_hit) {
+      unsigned logged = g_size_class_alloc_count < kSizeClassCap ? g_size_class_alloc_count
+                                                                 : kSizeClassCap;
+      for (unsigned i = 0; i < logged; ++i) {
+        if (base_addr_value >= g_size_class_alloc_addr[i] &&
+            base_addr_value < g_size_class_alloc_addr[i] + g_size_class_alloc_size[i]) {
+          size_class_hit = true;
+          break;
+        }
+      }
+    }
+    if (size_class_hit) {
+      if (free_size_class_count < kSizeClassCap) {
+        ++free_size_class_count;
+        REXKRNL_IMPORT_TRACE(
+            "NtFreeVirtualMemory",
+            "SIZE-1264-CLASS free base={:#x} size={:#x} type={:#x} lr={:#010x} count={}",
+            base_addr_value, region_size_value, (uint32_t)free_type, CurrentGuestLr(),
+            free_size_class_count);
+      } else if (free_size_class_count == kSizeClassCap) {
+        ++free_size_class_count;
+        REXKRNL_IMPORT_TRACE(
+            "NtFreeVirtualMemory",
+            "SIZE-1264-CLASS further 1200..1300 frees suppressed (cap=32)");
+      }
+    }
+  }
   // X_MEM_DECOMMIT | X_MEM_RELEASE
 
   // NTSTATUS
@@ -390,10 +474,12 @@ ppc_u32_result_t MmAllocatePhysicalMemoryEx_entry(ppc_u32_t flags, ppc_u32_t reg
   // min_addr_range/max_addr_range are bounds in physical memory, not virtual.
   uint32_t heap_base = heap->heap_base();
   uint32_t heap_physical_address_offset = heap->GetPhysicalAddress(heap_base);
-  // NOTE: xenia-canary has a per-title workaround (ignore_offset_for_ranged_allocations cvar)
-  // for title 545108B4 where min_addr_range comparison fails due to 0x1000 offset.
-  // If needed, set heap_physical_address_offset = 0 when min_addr_range && max_addr_range.
-  // Reference: xenia-canary 81aaf98e0.
+  // Some titles compare the returned address with min_addr_range;
+  // the 0x1000 physical offset of the 4 KB heap puts a bottom-of-range result
+  // below that minimum.
+  if (min_addr_range && max_addr_range && REXCVAR_GET(ignore_offset_for_ranged_allocations)) {
+    heap_physical_address_offset = 0;
+  }
   uint32_t heap_min_addr = rex::sat_sub(min_addr_range.value(), heap_physical_address_offset);
   uint32_t heap_max_addr = rex::sat_sub(max_addr_range.value(), heap_physical_address_offset);
   uint32_t heap_size = heap->heap_size();

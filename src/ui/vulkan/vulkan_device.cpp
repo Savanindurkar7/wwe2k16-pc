@@ -20,7 +20,11 @@
 #include <rex/logging.h>
 #include <rex/platform.h>
 #include <rex/ui/vulkan/device.h>
+#include <rex/ui/vulkan/util.h>
 
+REXCVAR_DEFINE_BOOL(vulkan_stencil_export, true, "UI/Vulkan",
+                    "Use VK_EXT_shader_stencil_export when available (false = per-bit stencil fallback, as on "
+                    "NVIDIA; A/B for the Radeon 780M)");
 REXCVAR_DEFINE_BOOL(vulkan_require_fragment_stores_and_atomics, true, "UI/Vulkan",
                     "Deprecated and ignored for parity; fragmentStoresAndAtomics is always "
                     "required for Vulkan GPU emulation")
@@ -41,6 +45,40 @@ REXCVAR_DEFINE_BOOL(vulkan_require_fill_mode_non_solid, true, "UI/Vulkan",
 namespace rex {
 namespace ui {
 namespace vulkan {
+
+namespace {
+
+void LogDecodedDriverVersion(const VulkanDevice::Properties& properties) {
+  const uint32_t version = properties.driverVersion;
+  if (properties.driverID == VK_DRIVER_ID_NVIDIA_PROPRIETARY ||
+      (properties.driverID == VkDriverId(0) && properties.vendorID == 0x10DE)) {
+    REXLOG_INFO(
+        "VulkanDriverVersion: vendor=NVIDIA scheme=nvidia major={} minor={} patch={} tweak={} raw=0x{:X}",
+        version >> 22, (version >> 14) & 0xFF, (version >> 6) & 0xFF, version & 0x3F,
+        version);
+  } else if (properties.driverID == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS ||
+             (properties.driverID == VkDriverId(0) && properties.vendorID == 0x8086 &&
+              REX_PLATFORM_WIN32)) {
+    // Intel Windows packs the last two fields of the driver version shown in Device Manager
+    // (e.g. 31.0.101.2145) as (101 << 14) | 2145.
+    REXLOG_INFO(
+        "VulkanDriverVersion: vendor=Intel scheme=intel-windows driver=x.x.{}.{} raw=0x{:X}",
+        version >> 14, version & 0x3FFF, version);
+  } else if (properties.driverID == VK_DRIVER_ID_AMD_PROPRIETARY ||
+             (properties.driverID == VkDriverId(0) && properties.vendorID == 0x1002 &&
+              REX_PLATFORM_WIN32)) {
+    REXLOG_INFO(
+        "VulkanDriverVersion: vendor=AMD scheme=amd-proprietary major={} minor={} patch={} raw=0x{:X}",
+        version >> 22, (version >> 12) & 0x3FF, version & 0xFFF, version);
+  } else {
+    REXLOG_INFO(
+        "VulkanDriverVersion: vendor=0x{:04X} driver_id={} scheme=VK_MAKE_VERSION major={} minor={} patch={} raw=0x{:X}",
+        properties.vendorID, uint32_t(properties.driverID), VK_VERSION_MAJOR(version),
+        VK_VERSION_MINOR(version), VK_VERSION_PATCH(version), version);
+  }
+}
+
+}  // namespace
 
 template <typename Structure, VkStructureType StructureType>
 struct VulkanFeatures {
@@ -176,7 +214,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION(KHR_driver_properties, 1, 2)
   }
 
-  // Used by the Vulkan Memory Allocator and potentially by Xenia.
+  // Used by the Vulkan Memory Allocator and potentially by the runtime.
   // #128.
   XE_UI_VULKAN_STRUCT_PROMOTED_EXTENSION(KHR_dedicated_allocation, 1, 1)
   // #147. Also must be enabled for VK_KHR_dedicated_allocation and
@@ -187,6 +225,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   if (get_physical_device_properties2_supported) {
     // #238.
     XE_UI_VULKAN_STRUCT_EXTENSION(EXT_memory_budget)
+    // Optional diagnostic query after VK_ERROR_DEVICE_LOST.
+    XE_UI_VULKAN_STRUCT_EXTENSION(EXT_device_fault)
   }
   if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 1, 0)) {
     // #414.
@@ -212,8 +252,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION(KHR_sampler_mirror_clamp_to_edge, 1, 2)
     // #70. Must be enabled for VK_KHR_sampler_ycbcr_conversion.
     XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION(KHR_maintenance1, 1, 1)
-    // #141.
-    XE_UI_VULKAN_STRUCT_EXTENSION(EXT_shader_stencil_export)
+    // #141. vulkan_stencil_export=false forces the per-bit stencil fallback used by GPUs without it.
+    if (REXCVAR_GET(vulkan_stencil_export)) {
+      XE_UI_VULKAN_STRUCT_EXTENSION(EXT_shader_stencil_export)
+    }
     // #148.
     XE_UI_VULKAN_STRUCT_PROMOTED_EXTENSION(KHR_image_format_list, 1, 2)
     if (get_physical_device_properties2_supported) {
@@ -332,6 +374,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   VulkanFeatures<VkPhysicalDeviceRobustness2FeaturesEXT,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT>
       features_EXT_robustness2;
+  VulkanFeatures<VkPhysicalDeviceFaultFeaturesEXT,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT>
+      features_EXT_device_fault;
 
   if (get_physical_device_properties2_supported) {
     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
@@ -372,6 +417,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     }
     if (device->extensions_.ext_EXT_robustness2) {
       features_EXT_robustness2.Link(supported_features_2, device_create_info);
+    }
+    if (device->extensions_.ext_EXT_device_fault) {
+      features_EXT_device_fault.Link(supported_features_2, device_create_info);
     }
     ifn.vkGetPhysicalDeviceProperties2(physical_device, &properties_2);
     ifn.vkGetPhysicalDeviceFeatures2(physical_device, &supported_features_2);
@@ -586,6 +634,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
                 properties_1_2_KHR_driver_properties.conformanceVersion.patch);
   }
 
+  LogDecodedDriverVersion(device->properties_);
+
   XE_UI_VULKAN_LIMIT(maxImageDimension2D)
   XE_UI_VULKAN_LIMIT(maxImageDimension3D)
   XE_UI_VULKAN_LIMIT(maxImageDimensionCube)
@@ -727,6 +777,17 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     }
   }
 
+  if (device->extensions_.ext_EXT_device_fault) {
+    device->properties_.deviceFault = features_EXT_device_fault.supported.deviceFault;
+    features_EXT_device_fault.enabled.deviceFault =
+        features_EXT_device_fault.supported.deviceFault;
+    // The description, address, and vendor fault code/data are sufficient;
+    // do not request a driver-specific binary dump.
+    features_EXT_device_fault.enabled.deviceFaultVendorBinary = VK_FALSE;
+    REXLOG_INFO("* VK_EXT_device_fault.deviceFault: {}",
+                device->properties_.deviceFault ? "true" : "false");
+  }
+
 #undef XE_UI_VULKAN_LIMIT
 #undef XE_UI_VULKAN_ENUM_LIMIT
 #undef XE_UI_VULKAN_FEATURE
@@ -843,6 +904,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       device->memory_types_.host_cached |= memory_type_bit;
     }
   }
+
+  util::LogVulkanMemoryBudget(device.get(), "startup");
 
   return device;
 }

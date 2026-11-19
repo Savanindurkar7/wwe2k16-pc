@@ -15,6 +15,14 @@
 
 REXCVAR_DEFINE_BOOL(gpu_allow_invalid_fetch_constants, false, "GPU",
                     "Allow invalid fetch constants");
+REXCVAR_DEFINE_BOOL(gpu_content_probe, false, "GPU",
+                    "Per-second content probe for H-a/H-b/H-c diagnostics");
+REXCVAR_DEFINE_BOOL(wwe2k16_dof_composite_nop, false, "GPU",
+                    "Skip the depth-of-field composite draw when explicitly selected");
+REXCVAR_DEFINE_INT32(edram_tiles, 2048, "GPU",
+                     "Emulated EDRAM tile count (2048 default; 4096 opt-in 20 MiB mode)")
+    .allowed({"2048", "4096"})
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(native_2x_msaa, true, "GPU", "Enable native 2x MSAA");
 REXCVAR_DEFINE_BOOL(depth_float24_round, false, "GPU", "Round float24 depth values");
 REXCVAR_DEFINE_BOOL(depth_float24_convert_in_pixel_shader, false, "GPU",

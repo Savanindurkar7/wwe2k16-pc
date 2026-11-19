@@ -71,6 +71,13 @@ class WindowedAppContext {
   // otherwise.
   bool CallInUIThread(std::function<void()> function);
   bool CallInUIThreadSynchronous(std::function<void()> function);
+  // Displays a native error dialog from the UI thread. Platforms that do not
+  // provide an implementation return false.
+  virtual bool ShowSimpleMessageBox(const char* title, const char* message) {
+    (void)title;
+    (void)message;
+    return false;
+  }
   // It's okay to call this function from the queued functions themselves (such
   // as in the case of waiting for a pending async CallInUIThreadDeferred
   // described above - the wait may be done inside a CallInUIThreadSynchronous

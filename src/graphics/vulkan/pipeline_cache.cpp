@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -58,6 +59,10 @@ REXCVAR_DEFINE_INT32(
 REXCVAR_DEFINE_BOOL(vulkan_tessellation_wireframe, false, "GPU/Vulkan",
                     "Render tessellation as wireframe")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(vulkan_float24_depth_pixel_rate, false, "GPU",
+                    "Shade at pixel rate while converting float24 depth in Vulkan")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex::graphics::vulkan {
 
@@ -314,7 +319,8 @@ bool VulkanPipelineCache::Initialize() {
   } else {
     std::vector<uint8_t> depth_float24_truncate_fragment_shader_code =
         shader_translator_->CreateDepthOnlyFragmentShader(
-            SpirvShaderTranslator::Modification::DepthStencilMode::kFloat24Truncating);
+            SpirvShaderTranslator::Modification::DepthStencilMode::kFloat24Truncating,
+            REXCVAR_GET(vulkan_float24_depth_pixel_rate));
     depth_float24_truncate_fragment_shader_ = ui::vulkan::util::CreateShaderModule(
         vulkan_device,
         reinterpret_cast<const uint32_t*>(depth_float24_truncate_fragment_shader_code.data()),
@@ -327,7 +333,8 @@ bool VulkanPipelineCache::Initialize() {
     }
     std::vector<uint8_t> depth_float24_round_fragment_shader_code =
         shader_translator_->CreateDepthOnlyFragmentShader(
-            SpirvShaderTranslator::Modification::DepthStencilMode::kFloat24Rounding);
+            SpirvShaderTranslator::Modification::DepthStencilMode::kFloat24Rounding,
+            REXCVAR_GET(vulkan_float24_depth_pixel_rate));
     depth_float24_round_fragment_shader_ = ui::vulkan::util::CreateShaderModule(
         vulkan_device,
         reinterpret_cast<const uint32_t*>(depth_float24_round_fragment_shader_code.data()),
@@ -390,6 +397,7 @@ bool VulkanPipelineCache::Initialize() {
 
 void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_root,
                                                   uint32_t title_id, bool blocking) {
+  const auto storage_initialization_start = std::chrono::steady_clock::now();
   ShutdownShaderStorage();
   {
     std::lock_guard<std::mutex> lock(creation_request_lock_);
@@ -416,6 +424,8 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
   std::vector<PipelineStoredDescription> pipeline_stored_descriptions;
   // <Shader hash, modification bits>.
   std::set<std::pair<uint64_t, uint64_t>> shader_translations_needed;
+  size_t shaders_loaded_from_storage = 0;
+  size_t pipelines_loaded_from_storage = 0;
   auto pipeline_storage_file_path =
       shader_storage_shareable_root /
       fmt::format("{:08X}.{}.vk.xpso", title_id, edram_fragment_shader_interlock ? "fsi" : "fbo");
@@ -554,6 +564,7 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
       }
       // Loaded from the current storage - don't write again.
       shader->set_ucode_storage_index(shader_storage_index_);
+      ++shaders_loaded_from_storage;
     }
     rex::filesystem::TruncateStdioFile(shader_storage_file_, shader_storage_valid_bytes);
   } else {
@@ -679,8 +690,7 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
       }
     }
 
-    REXGPU_INFO("Created {} graphics pipelines from Vulkan storage ({} requested)",
-                created_pipeline_count.load(), pipeline_creations.size());
+    pipelines_loaded_from_storage = created_pipeline_count.load();
     {
       std::lock_guard<std::mutex> lock(creation_request_lock_);
       startup_loading_ = false;
@@ -702,6 +712,13 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
            pipeline_storage_file_);
   }
 
+  // C requires a seek between reading and writing an update stream unless the
+  // read hit end-of-file. The pipeline loader stops exactly at the last record
+  // (no EOF), and the MSVC runtime then fails every later append silently;
+  // glibc tolerates it. Seek both streams to the end before the writer starts.
+  rex::filesystem::Seek(pipeline_storage_file_, 0, SEEK_END);
+  rex::filesystem::Seek(shader_storage_file_, 0, SEEK_END);
+
   shader_storage_cache_root_ = cache_root;
   shader_storage_title_id_ = title_id;
 
@@ -712,6 +729,16 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
   storage_write_thread_ = rex::thread::Thread::Create({}, [this]() { StorageWriteThread(); });
   assert_not_null(storage_write_thread_);
   storage_write_thread_->set_name("Vulkan Storage writer");
+
+  const double storage_initialization_time_ms =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                storage_initialization_start)
+          .count();
+  REXGPU_INFO(
+      "Loaded {} pipelines and {} shaders from storage in {:.1f} ms; pipeline file: {}, shader "
+      "file: {}",
+      pipelines_loaded_from_storage, shaders_loaded_from_storage, storage_initialization_time_ms,
+      rex::path_to_utf8(pipeline_storage_file_path), rex::path_to_utf8(shader_storage_file_path));
 }
 
 void VulkanPipelineCache::ShutdownShaderStorage() {
@@ -996,6 +1023,8 @@ SpirvShaderTranslator::Modification VulkanPipelineCache::GetCurrentPixelShaderMo
       modification.pixel.depth_stencil_mode = render_target_cache_.depth_float24_round()
                                                   ? DepthStencilMode::kFloat24Rounding
                                                   : DepthStencilMode::kFloat24Truncating;
+      modification.pixel.float24_depth_pixel_rate =
+          uint32_t(REXCVAR_GET(vulkan_float24_depth_pixel_rate) && !shader.writes_depth());
     } else {
       if (shader.implicit_early_z_write_allowed() &&
           (!shader.writes_color_target(0) ||
@@ -1390,8 +1419,12 @@ bool VulkanPipelineCache::GetCurrentStateDescription(
         !pixel_shader->shader().writes_depth() &&
         (pixel_shader_modification.pixel.depth_stencil_mode ==
              DepthStencilMode::kFloat24Truncating ||
-         pixel_shader_modification.pixel.depth_stencil_mode == DepthStencilMode::kFloat24Rounding);
+         pixel_shader_modification.pixel.depth_stencil_mode == DepthStencilMode::kFloat24Rounding) &&
+        !pixel_shader_modification.pixel.float24_depth_pixel_rate;
   }
+  description_out.float24_depth_pixel_rate =
+      REXCVAR_GET(vulkan_float24_depth_pixel_rate) &&
+      render_target_cache_.depth_float24_convert_in_pixel_shader();
   description_out.render_pass_key = render_pass_key;
 
   bool tessellated = primitive_processing_result.IsTessellated();
@@ -3648,31 +3681,52 @@ void VulkanPipelineCache::StorageWriteThread() {
     const Shader* shader = nullptr;
     PipelineStoredDescription pipeline_description;
     bool write_pipeline = false;
+    bool shutdown = false;
     {
       std::unique_lock<std::mutex> lock(storage_write_request_lock_);
-      if (storage_write_thread_shutdown_) {
-        return;
+      if (storage_write_thread_shutdown_ && storage_write_shader_queue_.empty() &&
+          storage_write_pipeline_queue_.empty()) {
+        shutdown = true;
+      } else {
+        if (!storage_write_shader_queue_.empty()) {
+          shader = storage_write_shader_queue_.front();
+          storage_write_shader_queue_.pop_front();
+        } else if (storage_write_flush_shaders_) {
+          storage_write_flush_shaders_ = false;
+          flush_shaders = true;
+        }
+        if (!storage_write_pipeline_queue_.empty()) {
+          std::memcpy(&pipeline_description, &storage_write_pipeline_queue_.front(),
+                      sizeof(pipeline_description));
+          storage_write_pipeline_queue_.pop_front();
+          write_pipeline = true;
+        } else if (storage_write_flush_pipelines_) {
+          storage_write_flush_pipelines_ = false;
+          flush_pipelines = true;
+        }
       }
-      if (!storage_write_shader_queue_.empty()) {
-        shader = storage_write_shader_queue_.front();
-        storage_write_shader_queue_.pop_front();
-      } else if (storage_write_flush_shaders_) {
-        storage_write_flush_shaders_ = false;
-        flush_shaders = true;
-      }
-      if (!storage_write_pipeline_queue_.empty()) {
-        std::memcpy(&pipeline_description, &storage_write_pipeline_queue_.front(),
-                    sizeof(pipeline_description));
-        storage_write_pipeline_queue_.pop_front();
-        write_pipeline = true;
-      } else if (storage_write_flush_pipelines_) {
-        storage_write_flush_pipelines_ = false;
-        flush_pipelines = true;
-      }
-      if (!shader && !write_pipeline) {
+      if (!shutdown && !shader && !write_pipeline && !flush_shaders && !flush_pipelines) {
         storage_write_request_cond_.wait(lock);
         continue;
       }
+    }
+
+    if (shutdown) {
+      // Drain queued records above and flush them before closing the streams.
+      // Submission-end flushes provide the same protection during gameplay,
+      // including sessions terminated with SIGKILL.
+      assert_not_null(shader_storage_file_);
+      assert_not_null(pipeline_storage_file_);
+      fflush(shader_storage_file_);
+      fflush(pipeline_storage_file_);
+      return;
+    }
+
+    if (!shader && !write_pipeline) {
+      // A flush request has been removed from the protected flags. Start the
+      // next iteration so the stdio flush at the top of the loop runs now,
+      // rather than sleeping until another submission arrives.
+      continue;
     }
 
     if (shader) {

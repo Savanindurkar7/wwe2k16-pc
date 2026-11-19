@@ -45,6 +45,12 @@ struct PPCContext;
 // Function signature for recompiled PPC functions
 using PPCFunc = void(PPCContext& ctx, uint8_t* base);
 
+// Called only when an indirect guest dispatch resolves to an empty function
+// table entry. Kept out of the lookup-hit path.
+void PPCHandleMissingIndirectFunction(PPCContext& ctx, uint8_t* base,
+                                      uint32_t guest_address);
+uint64_t PPCMissingIndirectFunctionCallCount() noexcept;
+
 //=============================================================================
 // Compiler-Specific Intrinsics
 //=============================================================================
@@ -137,16 +143,35 @@ using PPCFunc = void(PPCContext& ctx, uint8_t* base);
 // Requires ppc_config.h to be included first.
 
 #ifdef PPC_CONFIG_H_INCLUDED
-// Function table lookup: indexed by (addr - CODE_BASE)
+// Function table lookup: indexed by (addr - CODE_BASE).
+// The index is (uint32_t(y) - PPC_CODE_BASE) * 2, so a guest target outside
+// [CODE_BASE, CODE_BASE + CODE_SIZE) (a null/garbage indirect-call target, or
+// a runtime thunk slot) would index an address outside the table and fault
+// before PPCHandleMissingIndirectFunction can run (GH3/#17: a null guest
+// function-pointer call died with SIGSEGV at 0x7F2E0000). Bound the target to
+// the image + thunk reserve; out-of-range returns nullptr so the missing-
+// function path gets the call instead.
 #undef PPC_LOOKUP_FUNC
-#define PPC_LOOKUP_FUNC(x, y) \
-  (*(PPCFunc**)(x + PPC_IMAGE_BASE + PPC_IMAGE_SIZE + (uint64_t(uint32_t(y) - PPC_CODE_BASE) * 2)))
+#define PPC_LOOKUP_FUNC(x, y)                                                        \
+  ((uint32_t(y) >= PPC_CODE_BASE &&                                                  \
+    uint32_t(y) < PPC_IMAGE_BASE + PPC_IMAGE_SIZE + 0x10000u)                        \
+       ? (*(PPCFunc**)((x) + PPC_IMAGE_BASE + PPC_IMAGE_SIZE +                       \
+                       (uint64_t(uint32_t(y) - PPC_CODE_BASE) * 2)))                 \
+       : static_cast<PPCFunc*>(nullptr))
 
 #undef PPC_CALL_INDIRECT_FUNC
 #include <rex/perf/counter.h>
 #define PPC_CALL_INDIRECT_FUNC(x) \
-  PROFILE_FUNCTION_DISPATCHED();  \
-  PPC_LOOKUP_FUNC(base, x)(ctx, base);
+  do { \
+    PROFILE_FUNCTION_DISPATCHED(); \
+    const uint32_t ppc_guest_target = uint32_t(x); \
+    PPCFunc* ppc_function = PPC_LOOKUP_FUNC(base, ppc_guest_target); \
+    if (__builtin_expect(ppc_function != nullptr, 1)) { \
+      ppc_function(ctx, base); \
+    } else { \
+      PPCHandleMissingIndirectFunction(ctx, base, ppc_guest_target); \
+    } \
+  } while (false)
 
 #endif  // PPC_CONFIG_H_INCLUDED
 

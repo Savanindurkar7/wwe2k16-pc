@@ -1,4 +1,4 @@
-// Vulkan 1.0 core instance functions used in Xenia.
+// Vulkan 1.0 core instance functions used in the runtime.
 XE_UI_VULKAN_FUNCTION(vkCreateDevice)
 XE_UI_VULKAN_FUNCTION(vkDestroyDevice)
 XE_UI_VULKAN_FUNCTION(vkEnumerateDeviceExtensionProperties)

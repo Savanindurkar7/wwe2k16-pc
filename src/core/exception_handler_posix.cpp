@@ -14,6 +14,7 @@
 #if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
 
 #include <signal.h>
+#include <unistd.h>
 
 #include <cstdint>
 #include <cstring>
@@ -39,6 +40,36 @@ constexpr size_t kMaxHandlerCount = 8;
 // All custom handlers, left-aligned and null terminated.
 // Executed in order.
 std::pair<ExceptionHandler::Handler, void*> handlers_[kMaxHandlerCount];
+
+// ReXGlue uses SIGILL/SIGSEGV for recoverable MMIO callbacks. Preserve the
+// signal action that was installed before that mechanism and pass unhandled
+// faults to it instead of returning to the same faulting instruction forever.
+static void ChainUnhandledSignal(int signal_number, siginfo_t* signal_info,
+                                 void* signal_context) {
+  const struct sigaction* original = nullptr;
+  if (signal_number == SIGILL) {
+    original = &original_sigill_handler_;
+  } else if (signal_number == SIGSEGV) {
+    original = &original_sigsegv_handler_;
+  }
+  if (!original || original->sa_handler == SIG_IGN) {
+    return;
+  }
+  if (original->sa_handler == SIG_DFL) {
+    sigaction(signal_number, original, nullptr);
+    sigset_t unblocked;
+    sigemptyset(&unblocked);
+    sigaddset(&unblocked, signal_number);
+    sigprocmask(SIG_UNBLOCK, &unblocked, nullptr);
+    raise(signal_number);
+    _exit(128 + signal_number);
+  }
+  if (original->sa_flags & SA_SIGINFO) {
+    original->sa_sigaction(signal_number, signal_info, signal_context);
+  } else {
+    original->sa_handler(signal_number);
+  }
+}
 
 static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
                                      void* signal_context) {
@@ -205,6 +236,8 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
       return;
     }
   }
+
+  ChainUnhandledSignal(signal_number, signal_info, signal_context);
 }
 
 void ExceptionHandler::Install(Handler fn, void* data) {

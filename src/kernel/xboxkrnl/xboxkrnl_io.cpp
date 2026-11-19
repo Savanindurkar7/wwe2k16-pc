@@ -12,6 +12,8 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <mutex>
+
 #include <rex/filesystem/device.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
@@ -198,6 +200,68 @@ ppc_u32_result_t NtReadFile_entry(ppc_u32_t file_handle, ppc_u32_t event_handle,
       (uint32_t)file_handle, (uint32_t)event_handle, apc_routine_ptr.guest_address(),
       apc_context.guest_address(), io_status_block.guest_address(), buffer.guest_address(),
       (uint32_t)buffer_length, byte_offset_ptr ? (int64_t)byte_offset : -1);
+  if ((uint32_t)file_handle == 0) {
+    // Cycle-19 diagnostic: identify the guest caller of a null-handle read.
+    // ctx.lr is the guest return address of the caller of NtReadFile (the
+    // instruction after the bl/bctrl that invoked this import). Bounded: at
+    // most 16 logged occurrences plus one suppression notice; no behavior
+    // change, normal-path logging untouched.
+    // Cycle-20b diagnostic: also read the two saved-LR words of the live guest
+    // frames (offsets derived and verified in logs/cycle20b-offsets.txt):
+    //   guest [ctx.r1 + 168] = LR saved by sub_82B88DB8's caller (sub_82B73860)
+    //   guest [ctx.r1 + 312] = LR saved by the caller of sub_82B73860
+    // Guest memory is big-endian; read via the same virtual-membase translation
+    // the iosb accessor uses (host = virtual_membase + guest_addr), with
+    // rex::memory::load_and_swap<uint32_t>. Bounded by the same cap below.
+    static unsigned null_read_log_count = 0;
+    if (null_read_log_count < 16) {
+      ++null_read_log_count;
+      auto* thread_state = rex::runtime::ThreadState::Get();
+      uint32_t guest_lr =
+          (thread_state && thread_state->context()) ? (uint32_t)thread_state->context()->lr : 0;
+      uint32_t caller_lr = 0;
+      uint32_t upper_lr = 0;
+      uint32_t caller_lr2 = 0;
+      uint32_t this_ptr = 0;
+      uint32_t obj0 = 0, obj80 = 0, objA4 = 0, objB8 = 0;
+      if (thread_state && thread_state->context()) {
+        uint32_t guest_r1 = thread_state->context()->r1.u32;
+        auto* kernel_state = thread_state->context()->kernel_state;
+        auto* memory = kernel_state ? kernel_state->memory() : nullptr;
+        if (memory) {
+          caller_lr =
+              memory::load_and_swap<uint32_t>(memory->TranslateVirtual(guest_r1 + 168));
+          upper_lr = memory::load_and_swap<uint32_t>(memory->TranslateVirtual(guest_r1 + 312));
+          // Cycle-23a: reader `this` and stream-object state at the failing read.
+          // [r1+308] = sub_82B73860's saved r31 low word (reader this; 157.cpp:6299-6300)
+          // [r1+424] = sub_8334C860's saved LR (0x8334CC50 or 0x8334CE90)
+          caller_lr2 = memory::load_and_swap<uint32_t>(memory->TranslateVirtual(guest_r1 + 424));
+          this_ptr = memory::load_and_swap<uint32_t>(memory->TranslateVirtual(guest_r1 + 308));
+          if (this_ptr >= 0x10000u && this_ptr < 0xF0000000u) {
+            obj0 = memory::load_and_swap<uint32_t>(memory->TranslateVirtual(this_ptr + 0));
+            obj80 = memory::load_and_swap<uint32_t>(memory->TranslateVirtual(this_ptr + 128));
+            objA4 = memory::load_and_swap<uint32_t>(memory->TranslateVirtual(this_ptr + 164));
+            objB8 = memory::load_and_swap<uint32_t>(memory->TranslateVirtual(this_ptr + 184));
+          }
+        }
+      }
+      REXKRNL_IMPORT_TRACE(
+          "NtReadFile",
+          "NULL-HANDLE handle={:#x} event={:#x} apc={:#x} apc_ctx={:#x} iosb={:#x} buf={:#x} "
+          "len={:#x} offset={} lr={:#010x} count={} caller_lr={:#010x} upper_lr={:#010x} "
+          "this={:#010x} obj0={:#010x} obj80={:#010x} objA4={:#010x} objB8={:#010x} "
+          "caller_lr2={:#010x}",
+          (uint32_t)file_handle, (uint32_t)event_handle, apc_routine_ptr.guest_address(),
+          apc_context.guest_address(), io_status_block.guest_address(), buffer.guest_address(),
+          (uint32_t)buffer_length, byte_offset_ptr ? (int64_t)byte_offset : -1, guest_lr,
+          null_read_log_count, caller_lr, upper_lr, this_ptr, obj0, obj80, objA4, objB8,
+          caller_lr2);
+    } else if (null_read_log_count == 16) {
+      ++null_read_log_count;
+      REXKRNL_IMPORT_TRACE("NtReadFile",
+                           "NULL-HANDLE further null-handle reads suppressed (cap=16)");
+    }
+  }
   X_STATUS result = X_STATUS_SUCCESS;
   bool apc_queued = false;
 
@@ -746,7 +810,14 @@ ppc_u32_result_t IoCreateDevice_entry(ppc_u32_t device_struct, ppc_u32_t r4, ppc
 }
 
 ppc_u32_result_t IoDismountVolumeByFileHandle_entry(ppc_u32_t handle) {
-  REXKRNL_WARN("IoDismountVolumeByFileHandle({:#x}) - stub", (uint32_t)handle);
+  // The VFS exposes shared host-backed devices rather than per-file guest
+  // volume mounts, so dismounting this handle must not unmount the host device.
+  // Titles seen so far treat this call as cleanup and ignores its return value.
+  static std::once_flag dismount_logged;
+  std::call_once(dismount_logged, [handle] {
+    REXKRNL_DEBUG("IoDismountVolumeByFileHandle({:#x}): no host VFS dismount (logged once)",
+                  (uint32_t)handle);
+  });
   return X_STATUS_SUCCESS;
 }
 

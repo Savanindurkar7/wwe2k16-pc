@@ -11,13 +11,17 @@
  */
 
 #include <array>
+#include <atomic>
 #include <climits>
+#include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -26,6 +30,7 @@
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/graphics/registers.h>
+#include <rex/graphics/util/content_probe.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
 #include <rex/graphics/vulkan/graphics_system.h>
@@ -44,6 +49,9 @@
 #include <rex/ui/vulkan/upload_buffer_pool.h>
 
 namespace rex::graphics::vulkan {
+
+class GpuTiming;
+enum class GpuTimingCategory : uint32_t;
 
 class VulkanCommandProcessor : public CommandProcessor {
  public:
@@ -160,6 +168,22 @@ class VulkanCommandProcessor : public CommandProcessor {
   }
   uint64_t GetCompletedSubmission() const { return submission_completed_; }
 
+  // Content probe (cvar gpu_content_probe, default off): records a deferred
+  // readback sample of a resolve destination matching one of the evidence-
+  // derived probe targets. Copies GPU-local shared memory into a host-visible
+  // readback buffer only - guest physical memory is never touched.
+  void ContentProbeRecordResolveSample(const draw_util::ResolveInfo& resolve_info);
+
+  // GPU timing is sampled once from WWE2K16_GPU_TIMING during Vulkan setup.
+  // These helpers append deferred category transitions only when it is active.
+  void SetGpuTimingCategory(GpuTimingCategory category);
+  void SetGpuTimingSceneDrawCategory(uint32_t render_target_width);
+  void GpuTimingBeginRecording(VkCommandBuffer command_buffer, uint64_t frame,
+                               uint64_t submission) const;
+  void GpuTimingChangeCategory(VkCommandBuffer command_buffer,
+                               GpuTimingCategory category) const;
+  void GpuTimingEndRecording(VkCommandBuffer command_buffer) const;
+
   // Sparse binds are:
   // - In a single submission, all submitted in one vkQueueBindSparse.
   // - Sent to the queue without waiting for a semaphore.
@@ -261,6 +285,12 @@ class VulkanCommandProcessor : public CommandProcessor {
   void OnGammaRampPWLValueWritten() override;
   void OnPrimaryBufferEnd() override;
 
+  // Content probe (sub-second ordering): the monotonic guest-frame ordinal
+  // (one increment per presented guest frame, driven by the XE_SWAP packet
+  // executed in the base layer). Const read is safe: frame_current_ changes
+  // only in EndSubmission on the same CP worker thread that runs WriteRegister.
+  uint64_t ContentProbeFrameOrdinal() const override { return frame_current_; }
+
   void IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                  uint32_t frontbuffer_height) override;
 
@@ -277,6 +307,16 @@ class VulkanCommandProcessor : public CommandProcessor {
   struct CommandBuffer {
     VkCommandPool pool;
     VkCommandBuffer buffer;
+  };
+
+  struct SubmissionJob {
+    CommandBuffer command_buffer = {};
+    VkFence fence = VK_NULL_HANDLE;
+    uint64_t frame = 0;
+    uint64_t submission = 0;
+    std::vector<VkSemaphore> wait_semaphores;
+    std::vector<VkPipelineStageFlags> wait_stage_masks;
+    std::unique_ptr<DeferredCommandBuffer> deferred_command_buffer;
   };
 
   struct SparseBufferBind {
@@ -366,6 +406,20 @@ class VulkanCommandProcessor : public CommandProcessor {
     VkDescriptorSet set;
   };
 
+  struct TextureDescriptorSetReuse {
+    VkDescriptorSetLayout layout = VK_NULL_HANDLE;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    uint64_t frame = 0;
+    uint64_t submission = 0;
+    uint64_t allocator_generation = 0;
+    uint64_t image_infos_hash = 0;
+    std::vector<VkDescriptorImageInfo> image_infos;
+    bool valid = false;
+  };
+  // Recently written texture descriptor sets per stage (vertex, pixel), reused by content within one submission:
+  // draws often alternate between a few materials, which a single "previous draw" entry never matches.
+  static constexpr size_t kTextureDescriptorSetReuseEntries = 16;
+
   enum SwapApplyGammaDescriptorSet : uint32_t {
     kSwapApplyGammaDescriptorSetRamp,
     kSwapApplyGammaDescriptorSetSource,
@@ -413,6 +467,13 @@ class VulkanCommandProcessor : public CommandProcessor {
   // the submission to await to simply check status, or pass
   // GetCurrentSubmission() to wait for all queue operations to be completed.
   void CheckSubmissionFenceAndDeviceLoss(uint64_t await_submission);
+  void StartSubmissionWorker();
+  void StopSubmissionWorker();
+  bool DrainSubmissionWorker(uint64_t await_submission = UINT64_MAX);
+  void SubmissionWorkerMain();
+  void ObserveSubmissionWorkerFailure();
+  void ReturnSubmissionWorkerCommandBuffer(
+      std::unique_ptr<DeferredCommandBuffer> deferred_command_buffer);
   // If is_guest_command is true, a new full frame - with full cleanup of
   // resources and, if needed, starting capturing - is opened if pending (as
   // opposed to simply resuming after mid-frame synchronization). Returns
@@ -431,7 +492,14 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool CanEndSubmissionImmediately() const;
 
   void ClearTransientDescriptorPools();
+  void InvalidateTextureDescriptorSetReuse();
   bool IssueCopy_ReadbackResolvePath();
+  void LogResolveDiagnostic(uint32_t written_address, uint32_t written_length);
+  bool ReadbackGpuWrittenRange(uint32_t physical_address, uint32_t length) override;
+  bool ReadbackScaledGpuWrittenRanges(
+      const std::vector<std::pair<uint32_t, uint32_t>>& runs,
+      const std::vector<TextureCache::ScaledResolveRange>& scaled_ranges,
+      const std::vector<std::pair<uint32_t, uint32_t>>& unscaled_ranges);
   bool IssueDraw_MemexportReadbackFullPath(uint32_t total_size);
   bool IssueDraw_MemexportReadbackFastPath(uint32_t total_size);
 
@@ -491,14 +559,17 @@ class VulkanCommandProcessor : public CommandProcessor {
   void DestroySwapFxaaSourceImage();
 
   void UpdateDynamicState(const draw_util::ViewportInfo& viewport_info, bool primitive_polygonal,
-                          reg::RB_DEPTHCONTROL normalized_depth_control);
+                          reg::RB_DEPTHCONTROL normalized_depth_control,
+                          bool ui_c0_remap_this_draw);
   void UpdateSystemConstantValues(
       bool primitive_polygonal,
       const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
       bool shader_32bit_index_dma, uint32_t compute_memexport_vertex_count,
       const draw_util::ViewportInfo& viewport_info, uint32_t used_texture_mask,
       reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask);
-  bool UpdateBindings(const VulkanShader* vertex_shader, const VulkanShader* pixel_shader);
+  bool UpdateBindings(const VulkanShader* vertex_shader, const VulkanShader* pixel_shader,
+                      bool ui_c0_remap_this_draw, uint32_t ui_c0_target_x,
+                      uint32_t ui_c0_target_y);
   // Allocates a descriptor set and fills one or two VkWriteDescriptorSet
   // structure instances (for images and samplers).
   // The descriptor set layout must be the one for the given is_vertex,
@@ -515,8 +586,13 @@ class VulkanCommandProcessor : public CommandProcessor {
                                          VkWriteDescriptorSet* descriptor_set_writes_out);
 
   bool device_lost_ = false;
+  bool submission_failed_ = false;
 
   bool cache_clear_requested_ = false;
+
+  // debug_periodic_cache_clear state.
+  uint32_t periodic_cache_clear_frames_ = 0;
+  uint64_t periodic_cache_clears_ = 0;
 
   // Host shader types that guest shaders can be translated into - they can
   // access the shared memory (via vertex fetch, memory export, or manual index
@@ -558,6 +634,22 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::vector<CommandBuffer> command_buffers_writable_;
   std::deque<std::pair<uint64_t, CommandBuffer>> command_buffers_submitted_;
   DeferredCommandBuffer deferred_command_buffer_;
+  std::unique_ptr<GpuTiming> gpu_timing_;
+
+  static constexpr size_t kSubmissionWorkerDeferredCommandBufferCount = 3;
+  bool async_submission_enabled_ = true;
+  std::thread submission_worker_;
+  std::mutex submission_worker_mutex_;
+  std::condition_variable submission_worker_condition_;
+  std::deque<SubmissionJob> submission_worker_jobs_;
+  std::vector<std::unique_ptr<DeferredCommandBuffer>>
+      submission_worker_deferred_command_buffers_free_;
+  std::atomic<uint64_t> submission_worker_submitted_{0};
+  std::atomic<uint64_t> submission_worker_last_enqueued_{0};
+  std::atomic<bool> submission_worker_failed_{false};
+  bool submission_worker_stop_requested_ = false;
+  bool submission_worker_failure_reported_ = false;
+  VkResult submission_worker_error_ = VK_SUCCESS;
 
   std::vector<VkSparseMemoryBind> sparse_memory_binds_;
   std::vector<SparseBufferBind> sparse_buffer_binds_;
@@ -610,6 +702,10 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::unordered_map<TextureDescriptorSetLayoutKey, std::vector<VkDescriptorSet>,
                      TextureDescriptorSetLayoutKey::Hasher>
       texture_transient_descriptor_sets_free_;
+  std::array<std::array<TextureDescriptorSetReuse, kTextureDescriptorSetReuseEntries>, 2>
+      texture_descriptor_set_reuse_;
+  std::array<uint32_t, 2> texture_descriptor_set_reuse_next_ = {};
+  uint64_t texture_descriptor_allocator_generation_ = 1;
 
   std::unique_ptr<VulkanSharedMemory> shared_memory_;
 
@@ -839,12 +935,47 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Float constant usage masks of the last draw call.
   uint64_t current_float_constant_map_vertex_[4];
   uint64_t current_float_constant_map_pixel_[4];
+  bool vertex_float_constants_remapped_ = false;
+  bool ui_c0_remap_trace_counting_ = false;
+  std::array<uint64_t, 8> ui_c0_remap_trace_draw_counts_{};
 
   // System shader constants.
   SpirvShaderTranslator::SystemConstants system_constants_;
 
   // Temporary storage for memexport stream constants used in the draw.
   std::vector<draw_util::MemExportRange> memexport_ranges_;
+
+  // Content probe (cvar gpu_content_probe, default off): per-second deferred
+  // content samples of the front buffer and the two scene targets. Zero
+  // overhead when the cvar is off - no allocation, no barrier, no readback.
+  // Slot state is the pure content_probe::ProbeSlot POD (recorded/sampled +
+  // ResolveInfo metadata + record-time frame); its consumption reset is
+  // unit-testable without Vulkan.
+  using ContentProbeSlotInfo = content_probe::ProbeSlot;
+  struct ContentProbeTargetState {
+    ReadbackBuffer readback;
+    ContentProbeSlotInfo slots[2];
+    // One recorded sample per emission interval (bounds the copy/barrier cost).
+    bool sample_due = true;
+  };
+  struct ContentProbeSnapshot {
+    uint32_t base = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t pitch = 0;
+    uint32_t bpp = 0;
+    uint32_t luma = 0;
+    uint32_t hash = 0;
+    // Monotonic frame counter at record time (0 when no sample this interval).
+    uint64_t frame = 0;
+    uint32_t clock_luma = 0;
+    uint32_t clock_hash = 0;
+  };
+  ContentProbeTargetState content_probe_targets_[content_probe::kProbeTargetCount];
+  ContentProbeSnapshot content_probe_snapshots_[content_probe::kProbeTargetCount];
+  std::chrono::steady_clock::time_point content_probe_last_wall_;
+  bool content_probe_first_enabled_ = false;
+  bool EnsureContentProbeReadbackSlot(ReadbackBuffer& readback, uint32_t index, uint32_t size);
 };
 
 }  // namespace rex::graphics::vulkan

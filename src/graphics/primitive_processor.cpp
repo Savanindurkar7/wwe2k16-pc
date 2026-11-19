@@ -359,7 +359,7 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
     if (host_vertex_shader_type == Shader::HostVertexShaderType(-1)) {
       REXGPU_ERROR(
           "Primitive processor: Unsupported tessellation mode {} for primitive "
-          "type {}. Report the game to Xenia developers!",
+          "type {}. Please report this.",
           uint32_t(tessellation_mode), uint32_t(guest_primitive_type));
       assert_always();
       return false;
@@ -403,7 +403,7 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
       default:
         REXGPU_ERROR(
             "Primitive processor: Unsupported primitive type {}. Report the "
-            "game to Xenia developers!",
+            "game to the runtime developers!",
             uint32_t(guest_primitive_type));
         assert_always();
         return false;
@@ -419,7 +419,7 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
         "Primitive processor: {} vertices attempted to be drawn with an index "
         "buffer only containing {}. Should be fetching zero indices instead of "
         "overflowing ones, but this is a rare situation, so not handled yet. "
-        "Report the game to Xenia developers!",
+        "Please report this.",
         guest_draw_vertex_count, static_cast<uint32_t>(vgt_dma_size.num_words));
     guest_draw_vertex_count = vgt_dma_size.num_words;
   }
@@ -452,7 +452,7 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
         // TODO(Triang3l): Support immediate-indexed vertices.
         REXGPU_ERROR(
             "Primitive processor: Unsupported vertex index source {}. Report "
-            "the game to Xenia developers!",
+            "the game to the runtime developers!",
             uint32_t(vgt_draw_initiator.source_select));
         return false;
       }
@@ -466,7 +466,7 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
         REXGPU_WARN(
             "Primitive processor: 32-bit endian swap mode {} is used for "
             "16-bit indices. This shouldn't normally be happening, but report "
-            "the game to Xenia developers for investigation of the intended "
+            "the game to the runtime developers for investigation of the intended "
             "behavior (ignore or actually swap across adjacent indices)! "
             "Currently disabling the swap for 16-and-32 and replacing 8-in-32 "
             "with 8-in-16.",
@@ -546,7 +546,7 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
       // TODO(Triang3l): Support immediate-indexed vertices.
       REXGPU_ERROR(
           "Primitive processor: Unsupported vertex index source {}. Report the "
-          "game to Xenia developers!",
+          "game to the runtime developers!",
           uint32_t(vgt_draw_initiator.source_select));
       return false;
     }
@@ -560,7 +560,7 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
       REXGPU_WARN(
           "Primitive processor: 32-bit endian swap mode {} is used for 16-bit "
           "indices. This shouldn't normally be happening, but report the game "
-          "to Xenia developers for investigation of the intended behavior "
+          "to the runtime developers for investigation of the intended behavior "
           "(ignore or actually swap across adjacent indices)! Currently "
           "disabling the swap for 16-and-32 and replacing 8-in-32 with "
           "8-in-16.",

@@ -135,8 +135,8 @@ void KernelState::SetProcessTLSVars(X_KPROCESS* process, uint32_t num_slots, uin
   process->tls_slot_size = static_cast<uint16_t>(4 * slots_padded);
   process->tls_static_data_address = tls_raw_data_address;
 
-  // Initialize TLS bitmap - mark used slots with 1s in HIGH bits (matching xenia).
-  // Xenia formula: bitmap[count_div32] = -1 << (32 - ((num_slots + 3) & 0x1C))
+  // Initialize TLS bitmap - mark used slots with 1s in HIGH bits (matching runtime).
+  // the runtime formula: bitmap[count_div32] = -1 << (32 - ((num_slots + 3) & 0x1C))
   uint32_t bitmap_slots = slots_padded / 32;
   for (uint32_t i = 0; i < 8; i++) {
     if (i < bitmap_slots) {
@@ -759,7 +759,7 @@ void KernelState::OnThreadExecute(XThread* thread) {
   assert_true(XThread::GetCurrentThread() == thread);
 
   // TODO(tomc): Do we need this?
-  //             Xenia would iterate user_modules_ and call function_dispatcher()->Execute() for
+  //             the runtime would iterate user_modules_ and call function_dispatcher()->Execute() for
   //             each Note that this would require reimplementation of guest thread management
   (void)thread;
 }
@@ -875,19 +875,19 @@ void KernelState::CompleteOverlappedImmediateEx(uint32_t overlapped_ptr, X_RESUL
   CompleteOverlappedEx(overlapped_ptr, result, extended_error, length);
 }
 
-void KernelState::CompleteOverlappedDeferred(std::move_only_function<void()> completion_callback,
+void KernelState::CompleteOverlappedDeferred(::rex::MoveOnlyFunction<void()> completion_callback,
                                              uint32_t overlapped_ptr, X_RESULT result,
-                                             std::move_only_function<void()> pre_callback,
-                                             std::move_only_function<void()> post_callback) {
+                                             ::rex::MoveOnlyFunction<void()> pre_callback,
+                                             ::rex::MoveOnlyFunction<void()> post_callback) {
   CompleteOverlappedDeferredEx(std::move(completion_callback), overlapped_ptr, result, result, 0,
                                std::move(pre_callback), std::move(post_callback));
 }
 
-void KernelState::CompleteOverlappedDeferredEx(std::move_only_function<void()> completion_callback,
+void KernelState::CompleteOverlappedDeferredEx(::rex::MoveOnlyFunction<void()> completion_callback,
                                                uint32_t overlapped_ptr, X_RESULT result,
                                                uint32_t extended_error, uint32_t length,
-                                               std::move_only_function<void()> pre_callback,
-                                               std::move_only_function<void()> post_callback) {
+                                               ::rex::MoveOnlyFunction<void()> pre_callback,
+                                               ::rex::MoveOnlyFunction<void()> post_callback) {
   CompleteOverlappedDeferredEx(
       [completion_callback = std::move(completion_callback), result, extended_error, length](
           uint32_t& cb_extended_error, uint32_t& cb_length) mutable -> X_RESULT {
@@ -900,8 +900,8 @@ void KernelState::CompleteOverlappedDeferredEx(std::move_only_function<void()> c
 }
 
 void KernelState::CompleteOverlappedDeferred(
-    std::move_only_function<X_RESULT()> completion_callback, uint32_t overlapped_ptr,
-    std::move_only_function<void()> pre_callback, std::move_only_function<void()> post_callback) {
+    ::rex::MoveOnlyFunction<X_RESULT()> completion_callback, uint32_t overlapped_ptr,
+    ::rex::MoveOnlyFunction<void()> pre_callback, ::rex::MoveOnlyFunction<void()> post_callback) {
   CompleteOverlappedDeferredEx(
       [completion_callback = std::move(completion_callback)](uint32_t& extended_error,
                                                              uint32_t& length) mutable -> X_RESULT {
@@ -914,9 +914,9 @@ void KernelState::CompleteOverlappedDeferred(
 }
 
 void KernelState::CompleteOverlappedDeferredEx(
-    std::move_only_function<X_RESULT(uint32_t&, uint32_t&)> completion_callback,
-    uint32_t overlapped_ptr, std::move_only_function<void()> pre_callback,
-    std::move_only_function<void()> post_callback) {
+    ::rex::MoveOnlyFunction<X_RESULT(uint32_t&, uint32_t&)> completion_callback,
+    uint32_t overlapped_ptr, ::rex::MoveOnlyFunction<void()> pre_callback,
+    ::rex::MoveOnlyFunction<void()> post_callback) {
   REXSYS_DEBUG("CompleteOverlappedDeferredEx: queuing for overlapped {:08X}", overlapped_ptr);
   auto ptr = memory()->TranslateVirtual(overlapped_ptr);
   XOverlappedSetResult(ptr, X_ERROR_IO_PENDING);

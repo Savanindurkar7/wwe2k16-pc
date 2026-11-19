@@ -55,6 +55,12 @@ REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_mailbox, true, "UI/Vulkan",
 REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_fifo_relaxed, true, "UI/Vulkan",
                     "Allow FIFO relaxed present mode");
 
+REXCVAR_DEFINE_INT32(vulkan_swapchain_image_count, 0, "UI/Vulkan",
+                     "Swapchain images to request (0 = default 3). With FIFO vsync each extra image is a frame "
+                     "that can wait in the queue: 2 cuts up to one frame of input lag when the GPU keeps up")
+    .range(0, 8)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 namespace rex {
 namespace ui {
 namespace vulkan {
@@ -582,7 +588,8 @@ bool VulkanPresenter::CaptureGuestOutput(RawImage& image_out) {
     submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submit_info.commandBufferCount = 1;
     submit_info.pCommandBuffers = &command_buffer;
-    VulkanSubmissionTracker submission_tracker(vulkan_device_);
+    VulkanSubmissionTracker submission_tracker(vulkan_device_,
+                                                [this] { ReportHostGpuFailure(); });
     {
       VulkanSubmissionTracker::FenceAcquisition fence_acqusition(
           submission_tracker.AcquireFenceToAdvanceSubmission());
@@ -600,10 +607,13 @@ bool VulkanPresenter::CaptureGuestOutput(RawImage& image_out) {
       {
         const VulkanDevice::Queue::Acquisition queue_acquisition =
             vulkan_device_->AcquireQueue(vulkan_device_->queue_family_graphics_compute(), 0);
-        submit_result =
-            dfn.vkQueueSubmit(queue_acquisition.queue(), 1, &submit_info, fence_acqusition.fence());
+        submit_result = util::QueueSubmit(vulkan_device_, queue_acquisition.queue(), 1,
+                                          &submit_info, fence_acqusition.fence());
       }
       if (submit_result != VK_SUCCESS) {
+        util::LogVkResultFailure(vulkan_device_, "vkQueueSubmit (guest output capture)",
+                                 submit_result);
+        ReportHostGpuFailure();
         REXLOG_ERROR(
             "VulkanPresenter: Failed to submit the guest output capturing "
             "command buffer");
@@ -780,7 +790,7 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
     if (!(GetSupportedSurfaceTypes() & (Surface::TypeFlags(1) << surface_type))) {
       REXLOG_ERROR(
           "VulkanPresenter: Tried to create a Vulkan surface for an "
-          "unsupported Xenia surface type");
+          "unsupported the runtime surface type");
       return SurfacePaintConnectResult::kFailureSurfaceUnusable;
     }
     VkResult vulkan_surface_create_result = VK_ERROR_UNKNOWN;
@@ -828,7 +838,7 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
         assert_unhandled_case(surface_type);
         REXLOG_ERROR(
             "VulkanPresenter: Tried to create a Vulkan surface for an "
-            "unknown Xenia surface type");
+            "unknown the runtime surface type");
         return SurfacePaintConnectResult::kFailureSurfaceUnusable;
     }
     if (vulkan_surface_create_result != VK_SUCCESS) {
@@ -1057,15 +1067,20 @@ bool VulkanPresenter::RefreshGuestOutputImpl(
   // "Fence signal operations that are defined by vkQueueSubmit additionally
   //  include in the first synchronization scope all commands that occur earlier
   //  in submission order."
-  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
   {
     VulkanSubmissionTracker::FenceAcquisition fence_acqusition(
         guest_output_image_refresher_submission_tracker_.AcquireFenceToAdvanceSubmission());
     const VulkanDevice::Queue::Acquisition queue_acquisition =
         vulkan_device_->AcquireQueue(vulkan_device_->queue_family_graphics_compute(), 0);
-    if (dfn.vkQueueSubmit(queue_acquisition.queue(), 0, nullptr, fence_acqusition.fence()) !=
-        VK_SUCCESS) {
+    const VkResult submit_result =
+        util::QueueSubmit(vulkan_device_, queue_acquisition.queue(), 0, nullptr,
+                          fence_acqusition.fence());
+    if (submit_result != VK_SUCCESS) {
+      util::LogVkResultFailure(vulkan_device_, "vkQueueSubmit (guest output refresh fence)",
+                               submit_result);
       fence_acqusition.SubmissionSucceededSignalFailed();
+      ReportHostGpuFailure();
+      return false;
     }
   }
 
@@ -1288,8 +1303,12 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
   swapchain_create_info.pNext = nullptr;
   swapchain_create_info.flags = 0;
   swapchain_create_info.surface = surface;
+  // The submission ring (kSubmissionCount) is independent of the swapchain size; only the image count
+  // sets how many finished frames can queue up before the display (latency under FIFO).
+  const int32_t requested_images = REXCVAR_GET(vulkan_swapchain_image_count);
   swapchain_create_info.minImageCount =
-      std::max(kSubmissionCount, surface_capabilities.minImageCount);
+      std::max(requested_images > 0 ? uint32_t(requested_images) : kSubmissionCount,
+               surface_capabilities.minImageCount);
   if (surface_capabilities.maxImageCount) {
     swapchain_create_info.minImageCount =
         std::min(swapchain_create_info.minImageCount, surface_capabilities.maxImageCount);
@@ -1305,7 +1324,7 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
     // before presenting, which would require an additional command buffer
     // submission with the acquire barrier and a semaphore between the graphics
     // queue and the present queue. Different queues are an extremely rare case,
-    // and Xenia only uses the swapchain for the final guest output and the
+    // and the runtime only uses the swapchain for the final guest output and the
     // internal UI, so keeping framebuffer compression is not worth the
     // additional submission complexity and possibly latency.
     swapchain_queue_family_indices[0] = queue_family_index_graphics_compute;
@@ -1369,6 +1388,14 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
     // Highest latency (but always guaranteed to be available).
     swapchain_create_info.presentMode = VK_PRESENT_MODE_FIFO_KHR;
   }
+  REXLOG_INFO("VulkanPresenter: swapchain present mode {} ({}x{}, {} images requested)",
+              swapchain_create_info.presentMode == VK_PRESENT_MODE_IMMEDIATE_KHR  ? "immediate"
+              : swapchain_create_info.presentMode == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox"
+              : swapchain_create_info.presentMode == VK_PRESENT_MODE_FIFO_RELAXED_KHR
+                  ? "fifo_relaxed"
+                  : "fifo",
+              swapchain_create_info.imageExtent.width, swapchain_create_info.imageExtent.height,
+              swapchain_create_info.minImageCount);
   swapchain_create_info.clipped = VK_TRUE;
   swapchain_create_info.oldSwapchain = old_swapchain;
   VkSwapchainKHR swapchain;
@@ -1538,6 +1565,10 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   VkResult acquire_result =
       dfn.vkAcquireNextImageKHR(device, paint_context_.swapchain, UINT64_MAX, acquire_semaphore,
                                 VK_NULL_HANDLE, &swapchain_image_index);
+  if (acquire_result != VK_SUCCESS) {
+    util::LogVkResultFailure(vulkan_device_, "vkAcquireNextImageKHR", acquire_result);
+  }
+  const bool acquire_suboptimal = acquire_result == VK_SUBOPTIMAL_KHR;
   switch (acquire_result) {
     case VK_SUCCESS:
     case VK_SUBOPTIMAL_KHR:
@@ -1548,8 +1579,6 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
           "device has been lost");
       return PaintResult::kGpuLostResponsible;
     case VK_ERROR_OUT_OF_DATE_KHR:
-    case VK_ERROR_SURFACE_LOST_KHR:
-    case VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT:
       // Not an error, reporting just as info (may normally occur while resizing
       // on some platforms).
       REXLOG_INFO(
@@ -1558,7 +1587,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
       return PaintResult::kNotPresentedConnectionOutdated;
     default:
       REXLOG_ERROR("VulkanPresenter: Failed to acquire the swapchain image");
-      return PaintResult::kNotPresented;
+      return PaintResult::kGpuLostResponsible;
   }
 
   // Non-zero extents needed for both the viewport (width must not be zero) and
@@ -2161,19 +2190,25 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
       ui_fence_acquisition = ui_submission_tracker_.AcquireFenceToAdvanceSubmission();
     }
     VkResult submit_result;
+    VkResult ui_fence_submit_result = VK_SUCCESS;
     {
       const VulkanDevice::Queue::Acquisition queue_acquisition =
           vulkan_device_->AcquireQueue(vulkan_device_->queue_family_graphics_compute(), 0);
-      submit_result =
-          dfn.vkQueueSubmit(queue_acquisition.queue(), 1, &submit_info, fence_acqusition.fence());
+      submit_result = util::QueueSubmit(vulkan_device_, queue_acquisition.queue(), 1,
+                                        &submit_info, fence_acqusition.fence());
       if (ui_fence_acquisition.fence() != VK_NULL_HANDLE && submit_result == VK_SUCCESS) {
-        if (dfn.vkQueueSubmit(queue_acquisition.queue(), 0, nullptr,
-                              ui_fence_acquisition.fence()) != VK_SUCCESS) {
+        ui_fence_submit_result = util::QueueSubmit(vulkan_device_, queue_acquisition.queue(), 0,
+                                                   nullptr, ui_fence_acquisition.fence());
+        if (ui_fence_submit_result != VK_SUCCESS) {
+          util::LogVkResultFailure(vulkan_device_, "vkQueueSubmit (UI submission fence)",
+                                   ui_fence_submit_result);
           ui_fence_acquisition.SubmissionSucceededSignalFailed();
         }
       }
     }
     if (submit_result != VK_SUCCESS) {
+      util::LogVkResultFailure(vulkan_device_, "vkQueueSubmit (present command buffers)",
+                               submit_result);
       REXLOG_ERROR("VulkanPresenter: Failed to submit command buffers");
       fence_acqusition.SubmissionFailedOrDropped();
       ui_fence_acquisition.SubmissionFailedOrDropped();
@@ -2186,10 +2221,12 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
         paint_context_.ui_setup_command_buffers[ui_setup_command_buffer_index]
             .last_usage_submission_index = 0;
       }
-      // The image is in an acquired state - but now, it will be in it forever.
-      // To avoid that, recreate the swapchain - don't return just
-      // kNotPresented.
-      return PaintResult::kNotPresentedConnectionOutdated;
+      // The image is now acquired without a successful submission. This is a
+      // fatal device/driver failure, not a swapchain-outdated retry.
+      return PaintResult::kGpuLostResponsible;
+    }
+    if (ui_fence_submit_result != VK_SUCCESS) {
+      return PaintResult::kGpuLostResponsible;
     }
   }
 
@@ -2208,9 +2245,15 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
         vulkan_device_->AcquireQueue(paint_context_.present_queue_family, 0);
     present_result = dfn.vkQueuePresentKHR(queue_acquisition.queue(), &present_info);
   }
+  if (present_result != VK_SUCCESS) {
+    util::LogVkResultFailure(vulkan_device_, "vkQueuePresentKHR", present_result);
+  }
+  if (present_result == VK_SUCCESS || present_result == VK_SUBOPTIMAL_KHR) {
+    host_present_count_.fetch_add(1, std::memory_order_relaxed);
+  }
   switch (present_result) {
     case VK_SUCCESS:
-      return PaintResult::kPresented;
+      return acquire_suboptimal ? PaintResult::kPresentedSuboptimal : PaintResult::kPresented;
     case VK_SUBOPTIMAL_KHR:
       return PaintResult::kPresentedSuboptimal;
     case VK_ERROR_DEVICE_LOST:
@@ -2219,8 +2262,6 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
           "device has been lost");
       return PaintResult::kGpuLostResponsible;
     case VK_ERROR_OUT_OF_DATE_KHR:
-    case VK_ERROR_SURFACE_LOST_KHR:
-    case VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT:
       // Not an error, reporting just as info (may normally occur while resizing
       // on some platforms).
       REXLOG_INFO(
@@ -2231,10 +2272,9 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
       return PaintResult::kNotPresentedConnectionOutdated;
     default:
       REXLOG_ERROR("VulkanPresenter: Failed to present the swapchain image");
-      // The image is in an acquired state - but now, it will be in it forever.
-      // To avoid that, recreate the swapchain - don't return just
-      // kNotPresented.
-      return PaintResult::kNotPresentedConnectionOutdated;
+      // Only OUT_OF_DATE is recoverable through swapchain recreation. Any other
+      // failure is fatal and must not be retried as an outdated connection.
+      return PaintResult::kGpuLostResponsible;
   }
 }
 

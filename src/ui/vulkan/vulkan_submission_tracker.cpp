@@ -77,7 +77,15 @@ uint64_t VulkanSubmissionTracker::UpdateAndGetCompletedSubmission() {
     while (!fences_pending_.empty()) {
       const std::pair<uint64_t, VkFence>& pending_pair = fences_pending_.front();
       assert_true(pending_pair.first > submission_completed_on_gpu_);
-      if (dfn.vkGetFenceStatus(device, pending_pair.second) != VK_SUCCESS) {
+      const VkResult fence_status = dfn.vkGetFenceStatus(device, pending_pair.second);
+      if (fence_status != VK_SUCCESS) {
+        if (fence_status != VK_NOT_READY) {
+          util::LogVkResultFailure(vulkan_device_, "vkGetFenceStatus (submission tracker)",
+                                   fence_status);
+          if (failure_callback_) {
+            failure_callback_();
+          }
+        }
         break;
       }
       fences_reclaimed_.push_back(pending_pair.second);
@@ -119,14 +127,30 @@ bool VulkanSubmissionTracker::AwaitSubmissionCompletion(uint64_t submission_inde
       assert_true(pending_pair.first > submission_completed_on_gpu_);
       if (pending_pair.first <= submission_index) {
         // Wait if requested.
-        if (dfn.vkWaitForFences(device, 1, &pending_pair.second, VK_TRUE, UINT64_MAX) ==
-            VK_SUCCESS) {
+        const VkResult wait_result =
+            dfn.vkWaitForFences(device, 1, &pending_pair.second, VK_TRUE, UINT64_MAX);
+        if (wait_result == VK_SUCCESS) {
           break;
         }
+        util::LogVkResultFailure(vulkan_device_, "vkWaitForFences (submission tracker)",
+                                 wait_result);
+        if (failure_callback_) {
+          failure_callback_();
+        }
+        return false;
       }
       // Just refresh the completed submission.
-      if (dfn.vkGetFenceStatus(device, pending_pair.second) == VK_SUCCESS) {
+      const VkResult fence_status = dfn.vkGetFenceStatus(device, pending_pair.second);
+      if (fence_status == VK_SUCCESS) {
         break;
+      }
+      if (fence_status != VK_NOT_READY) {
+        util::LogVkResultFailure(vulkan_device_, "vkGetFenceStatus (submission tracker)",
+                                 fence_status);
+        if (failure_callback_) {
+          failure_callback_();
+        }
+        return false;
       }
       --reclaim_end;
     }

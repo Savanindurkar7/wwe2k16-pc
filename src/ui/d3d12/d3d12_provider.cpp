@@ -57,7 +57,7 @@ std::unique_ptr<D3D12Provider> D3D12Provider::Create() {
         "Ensure that you have the latest drivers for your GPU and it supports "
         "Direct3D 12 with the feature level of at least 11_0.\n"
         "\n"
-        "See https://xenia.jp/faq/ for more information and a list of "
+        "See https://runtime.jp/faq/ for more information and a list of "
         "supported GPUs.");
     return nullptr;
   }
@@ -195,7 +195,7 @@ bool D3D12Provider::Initialize() {
         "debugging will be unavailable - if needed, download the DirectX "
         "Shader Compiler from "
         "https://github.com/microsoft/DirectXShaderCompiler/releases and place "
-        "the DLL in the Xenia directory");
+        "the DLL in the the runtime directory");
   }
 
   // Configure the DXGI debug info queue.
@@ -363,7 +363,7 @@ bool D3D12Provider::Initialize() {
       REXLOG_WARN(
           "Failed to enable SeIncreaseBasePriorityPrivilege for global "
           "realtime Direct3D 12 command queue priority, falling back to high "
-          "priority, try launching Xenia as administrator");
+          "priority, try launching the runtime as administrator");
       queue_desc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_HIGH;
     }
   } else if (REXCVAR_GET(d3d12_queue_priority) >= 1) {
@@ -380,7 +380,7 @@ bool D3D12Provider::Initialize() {
       REXLOG_WARN(
           "Failed to create a Direct3D 12 direct command queue with global "
           "realtime priority, falling back to high priority, try launching "
-          "Xenia as administrator");
+          "the runtime as administrator");
       queue_desc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_HIGH;
       queue_created =
           SUCCEEDED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&direct_queue)));

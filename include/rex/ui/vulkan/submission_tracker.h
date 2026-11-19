@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <utility>
 #include <vector>
 
@@ -40,6 +41,8 @@ namespace vulkan {
 // one.
 class VulkanSubmissionTracker {
  public:
+  using FailureCallback = std::function<void()>;
+
   class FenceAcquisition {
    public:
     FenceAcquisition() : submission_tracker_(nullptr), fence_(VK_NULL_HANDLE) {}
@@ -85,7 +88,9 @@ class VulkanSubmissionTracker {
     bool signal_failed_ = false;
   };
 
-  VulkanSubmissionTracker(const VulkanDevice* vulkan_device) : vulkan_device_(vulkan_device) {
+  VulkanSubmissionTracker(const VulkanDevice* vulkan_device,
+                          FailureCallback failure_callback = {})
+      : vulkan_device_(vulkan_device), failure_callback_(std::move(failure_callback)) {
     assert_not_null(vulkan_device);
   }
 
@@ -113,6 +118,7 @@ class VulkanSubmissionTracker {
 
  private:
   const VulkanDevice* vulkan_device_;
+  FailureCallback failure_callback_;
   uint64_t submission_current_ = 1;
   // Last submission with a successful fence signal as well as a successful
   // fence wait / query.

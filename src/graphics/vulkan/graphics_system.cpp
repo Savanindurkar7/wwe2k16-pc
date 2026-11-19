@@ -28,6 +28,12 @@ X_STATUS VulkanGraphicsSystem::Setup(runtime::FunctionDispatcher* function_dispa
                                      system::KernelState* kernel_state,
                                      ui::WindowedAppContext* app_context, bool with_presentation) {
   provider_ = rex::ui::vulkan::VulkanProvider::Create(true, with_presentation);
+  if (!provider_) {
+    REXLOG_ERROR(
+        "Failed to initialize Vulkan: no usable graphics device was found. The game cannot "
+        "continue without a graphics card.");
+    return X_STATUS_UNSUCCESSFUL;
+  }
   return GraphicsSystem::Setup(function_dispatcher, kernel_state, app_context, with_presentation);
 }
 

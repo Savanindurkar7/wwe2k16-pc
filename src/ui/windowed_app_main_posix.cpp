@@ -15,6 +15,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <spdlog/common.h>
@@ -33,10 +34,10 @@ extern "C" int main(int argc_pre_gtk, char** argv_pre_gtk) {
   setenv("GDK_BACKEND", "x11", 1);
 
   // Initialize GTK+, which will handle and remove its own arguments from argv.
-  // Both GTK+ and Xenia use --option=value argument format (see man
+  // Both GTK+ and the runtime use --option=value argument format (see man
   // gtk-options), however, it's meaningless to try to parse the same argument
   // both as a GTK+ one and as a cvar. Make GTK+ options take precedence in case
-  // of a name collision, as there's an alternative way of setting Xenia options
+  // of a name collision, as there's an alternative way of setting the runtime options
   // (the config).
   int argc_post_gtk = argc_pre_gtk;
   char** argv_post_gtk = argv_pre_gtk;
@@ -46,7 +47,17 @@ extern "C" int main(int argc_pre_gtk, char** argv_pre_gtk) {
     return EXIT_FAILURE;
   }
 
-  auto remaining = rex::cvar::Init(argc_post_gtk, argv_post_gtk);
+  auto init_result = rex::cvar::Init(argc_post_gtk, argv_post_gtk);
+  if (init_result.parse_error) {
+    std::fprintf(stderr,
+                 "WWE 2K16 could not start: invalid launch option: %s. Check your shortcut or launcher settings.\n",
+                 init_result.parse_error->c_str());
+    return EXIT_FAILURE;
+  }
+  if (init_result.exit_requested) {
+    return EXIT_SUCCESS;
+  }
+  auto remaining = std::move(init_result.remaining);
   rex::cvar::ApplyEnvironment();
 
   int result;

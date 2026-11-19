@@ -1,4 +1,4 @@
-// VK_EXT_debug_utils functions used in Xenia.
+// VK_EXT_debug_utils functions used in the runtime.
 XE_UI_VULKAN_FUNCTION(vkCreateDebugUtilsMessengerEXT)
 XE_UI_VULKAN_FUNCTION(vkDestroyDebugUtilsMessengerEXT)
 XE_UI_VULKAN_FUNCTION(vkSetDebugUtilsObjectNameEXT)

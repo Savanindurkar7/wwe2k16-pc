@@ -10,6 +10,8 @@
  */
 
 #include <rex/chrono/clock.h>
+#include <rex/cvar.h>
+#include <rex/filesystem.h>
 #include <rex/filesystem/devices/host_path_device.h>
 #include <rex/filesystem/devices/null_device.h>
 #include <rex/filesystem/vfs.h>
@@ -26,6 +28,12 @@
 #include <rex/system/xmemory.h>
 #include <rex/system/xthread.h>
 #include <rex/thread.h>
+
+#include "cache_drive.h"
+
+REXCVAR_DEFINE_BOOL(mount_cache, false, "Filesystem",
+                    "Mount a host-backed utility cache drive at cache:")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace rex {
 
@@ -236,7 +244,8 @@ bool Runtime::SetupVfs() {
 
   auto abs_game_root = std::filesystem::absolute(game_data_root_);
   if (!std::filesystem::exists(abs_game_root)) {
-    REXSYS_ERROR("Runtime::SetupVfs: game_data_root does not exist: {}", abs_game_root.string());
+    REXSYS_ERROR("Runtime::SetupVfs: game_data_root does not exist: {}",
+                 rex::path_to_utf8(abs_game_root));
     return false;
   }
 
@@ -252,7 +261,7 @@ bool Runtime::SetupVfs() {
     REXSYS_ERROR("Runtime::SetupVfs: Failed to register host path device");
     return false;
   }
-  REXSYS_INFO("  Mounted {} at {}", abs_game_root.string(), mount_path);
+  REXSYS_INFO("  Mounted {} at {}", rex::path_to_utf8(abs_game_root), mount_path);
 
   // Register symbolic links for game: and D:
   file_system_->RegisterSymbolicLink("game:", mount_path);
@@ -268,9 +277,17 @@ bool Runtime::SetupVfs() {
           std::make_unique<rex::filesystem::HostPathDevice>(update_mount, abs_update_root, true);
       if (update_device->Initialize() && file_system_->RegisterDevice(std::move(update_device))) {
         file_system_->RegisterSymbolicLink("update:", update_mount);
-        REXSYS_INFO("  Mounted {} at update:", abs_update_root.string());
+        REXSYS_INFO("  Mounted {} at update:", rex::path_to_utf8(abs_update_root));
       }
     }
+  }
+
+  // Mount the optional utility cache before the broader Harddisk0 NullDevice,
+  // so Cache0 is the first matching device. The default-off helper is a no-op,
+  // preserving the existing cache: failure behavior.
+  if (!system::internal::SetupUtilityCacheDrive(*file_system_, user_data_root_,
+                                                REXCVAR_GET(mount_cache))) {
+    return false;
   }
 
   // Setup NullDevice for raw HDD partition accesses

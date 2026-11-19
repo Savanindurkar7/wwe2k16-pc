@@ -1,4 +1,4 @@
-// VK_KHR_get_memory_requirements2 functions used in Xenia.
+// VK_KHR_get_memory_requirements2 functions used in the runtime.
 // Promoted to Vulkan 1.1 core.
 XE_UI_VULKAN_FUNCTION_PROMOTED(vkGetBufferMemoryRequirements2KHR,
                                vkGetBufferMemoryRequirements2)

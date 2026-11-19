@@ -135,11 +135,11 @@ reg::RB_DEPTHCONTROL GetNormalizedDepthControl(const RegisterFile& regs);
 //
 // While the polygon offset is a fixed-function feature in the pipeline, and the
 // formula can't be toggled between absolute and relative, it's important that
-// Xenia translates the guest absolute depth bias into the host relative depth
+// the runtime translates the guest absolute depth bias into the host relative depth
 // bias in a way that the values that separate coplanar geometry on the guest
 // qualitatively also still correctly separate them on the host.
 //
-// It also should be taken into account that on Xenia, float32 depth values may
+// It also should be taken into account that on the runtime, float32 depth values may
 // be snapped to float24 directly in the translated pixel shaders (to prevent
 // data loss if after reuploading a depth buffer to the EDRAM there's no way to
 // recover the full-precision value, that results in the inability to perform
@@ -147,12 +147,12 @@ reg::RB_DEPTHCONTROL GetNormalizedDepthControl(const RegisterFile& regs);
 // value, but also just truncating them (so in case of data loss, the "greater
 // or equal" depth test function still works).
 //
-// Because of this, the depth bias may be lost if Xenia translates it into a too
+// Because of this, the depth bias may be lost if the runtime translates it into a too
 // small value, and the conversion of the depth is done in the pixel shader.
-// Specifically, Xenia should not simply convert a value that separates coplanar
+// Specifically, the runtime should not simply convert a value that separates coplanar
 // primitives as float24 just into something that still separates them as
 // float32. Essentially, if conversion to float24 is done in the pixel shader,
-// Xenia should make sure the polygon offset on the host is calculated as if the
+// the runtime should make sure the polygon offset on the host is calculated as if the
 // host had float24 depth too, not float32.
 
 // Applies to both native host unorm24, and unorm24 emulated as host float32.
@@ -439,6 +439,9 @@ struct ResolveCopyShaderInfo {
   // prevents binding the entire shared memory buffer with smaller element
   // sizes).
   uint32_t dest_bpe_log2;
+  // Log2 of the guest destination pixel size in bytes. Unlike dest_bpe_log2,
+  // this describes the resolve format, not the host storage-buffer element.
+  uint32_t dest_pixel_size_log2;
   // Log2 of number of pixels in a single thread group along X and Y. 64 threads
   // per group preferred (GCN lane count).
   uint32_t group_size_x_log2, group_size_y_log2;

@@ -10,6 +10,7 @@
  */
 
 #include <cstdlib>
+#include <string>
 
 #include <rex/platform.h>
 #include <rex/ui/windowed_app_context_win.h>
@@ -95,6 +96,33 @@ void Win32WindowedAppContext::PlatformQuitFromUIThread() {
   // built-in modal window, which is unaware of HasQuitFromUIThread, don't let
   // it delay quitting indefinitely.
   PostQuitMessage(EXIT_SUCCESS);
+}
+
+bool Win32WindowedAppContext::ShowSimpleMessageBox(const char* const title,
+                                                  const char* const message) {
+  const auto to_wide = [](const char* const text) {
+    if (!text || !*text) {
+      return std::wstring();
+    }
+    const int length = MultiByteToWideChar(CP_UTF8, 0, text, -1, nullptr, 0);
+    if (length <= 1) {
+      return std::wstring();
+    }
+    std::wstring wide(static_cast<size_t>(length), L'\0');
+    if (!MultiByteToWideChar(CP_UTF8, 0, text, -1, wide.data(), length)) {
+      return std::wstring();
+    }
+    wide.resize(static_cast<size_t>(length - 1));
+    return wide;
+  };
+  const std::wstring wide_title = to_wide(title);
+  const std::wstring wide_message = to_wide(message);
+  if (wide_message.empty()) {
+    return false;
+  }
+  return MessageBoxW(nullptr, wide_message.c_str(),
+                     wide_title.empty() ? L"WWE 2K16" : wide_title.c_str(),
+                     MB_OK | MB_ICONERROR | MB_TASKMODAL) != 0;
 }
 
 int Win32WindowedAppContext::RunMainMessageLoop() {

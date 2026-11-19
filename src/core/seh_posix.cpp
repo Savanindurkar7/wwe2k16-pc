@@ -12,7 +12,10 @@
 static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only");
 
 #include <signal.h>
-#include <cstdlib>  // std::abort()
+#include <unistd.h>
+
+#include <cstdlib>   // std::abort()
+#include <cstring>   // std::memset()
 
 #include <rex/ppc/exceptions.h>
 
@@ -20,6 +23,67 @@ namespace rex::ppc::detail {
 
 static thread_local SehThreadState tls_seh_state;
 static thread_local bool tls_seh_active = false;
+
+// The signal actions that were installed before the PPC SEH layer claimed
+// SIGSEGV/SIGBUS/SIGFPE/SIGILL. A fault that the PPC SEH layer declines (we
+// are not inside SEH-protected guest code) must reach the handler that owned
+// the signal before, for example an application crash reporter. Without this
+// the handler installed by seh_initialize() buries any earlier handler and
+// fatal, unhandled faults terminate silently via SIG_DFL.
+static struct sigaction g_previous_sigsegv_action;
+static struct sigaction g_previous_sigbus_action;
+static struct sigaction g_previous_sigfpe_action;
+static struct sigaction g_previous_sigill_action;
+
+static const struct sigaction* PreviousActionForSignal(int sig) {
+  switch (sig) {
+    case SIGSEGV:
+      return &g_previous_sigsegv_action;
+    case SIGBUS:
+      return &g_previous_sigbus_action;
+    case SIGFPE:
+      return &g_previous_sigfpe_action;
+    case SIGILL:
+      return &g_previous_sigill_action;
+    default:
+      return nullptr;
+  }
+}
+
+// Terminate with the default disposition for the signal. Used both when there
+// is no previous handler to chain to and when the chained handler returns
+// without resolving the fault (returning from a fatal signal handler would
+// re-execute the faulting instruction forever).
+[[noreturn]] static void TerminateWithDefaultDisposition(int sig) {
+  struct sigaction action;
+  std::memset(&action, 0, sizeof(action));
+  action.sa_handler = SIG_DFL;
+  sigemptyset(&action.sa_mask);
+  sigaction(sig, &action, nullptr);
+  sigset_t unblocked;
+  sigemptyset(&unblocked);
+  sigaddset(&unblocked, sig);
+  sigprocmask(SIG_UNBLOCK, &unblocked, nullptr);
+  raise(sig);
+  _exit(128 + sig);
+}
+
+[[noreturn]] static void ChainToPreviousHandler(int sig, siginfo_t* info, void* context) {
+  const struct sigaction* previous = PreviousActionForSignal(sig);
+  if (previous) {
+    if (previous->sa_handler == SIG_IGN || previous->sa_handler == SIG_DFL) {
+      // No earlier handler: keep the default fatal behaviour.
+      TerminateWithDefaultDisposition(sig);
+    }
+    if (previous->sa_flags & SA_SIGINFO) {
+      previous->sa_sigaction(sig, info, context);
+    } else {
+      previous->sa_handler(sig);
+    }
+  }
+  // The previous handler returned without resolving the fault.
+  TerminateWithDefaultDisposition(sig);
+}
 
 SehThreadState& seh_thread_state() {
   return tls_seh_state;
@@ -31,13 +95,13 @@ int seh_filter(uint32_t /*code*/, void* /*ep*/) {
 }
 
 /// Signal handler for SIGSEGV/SIGBUS/SIGFPE/SIGILL
-static void signal_handler(int sig, siginfo_t* info, void* /*ucontext*/) {
+static void signal_handler(int sig, siginfo_t* info, void* context) {
   // Only handle if we're in SEH-protected code
   if (!tls_seh_active) {
-    // Not in SEH region - restore default handler and re-raise
-    signal(sig, SIG_DFL);
-    raise(sig);
-    return;
+    // Not in SEH region - pass the fault to the handler that owned the signal
+    // before this layer (e.g. an application crash reporter), or terminate
+    // with the default disposition if there was none.
+    ChainToPreviousHandler(sig, info, context);
   }
 
   // Determine exception code based on signal
@@ -110,10 +174,11 @@ void seh_initialize() {
   sigemptyset(&sa.sa_mask);
   sa.sa_flags = SA_SIGINFO | SA_NODEFER;  // SA_NODEFER allows re-entry for nested exceptions
 
-  sigaction(SIGSEGV, &sa, nullptr);
-  sigaction(SIGBUS, &sa, nullptr);
-  sigaction(SIGFPE, &sa, nullptr);
-  sigaction(SIGILL, &sa, nullptr);
+  // Save the actions being replaced so declined faults can be chained to them.
+  sigaction(SIGSEGV, &sa, &g_previous_sigsegv_action);
+  sigaction(SIGBUS, &sa, &g_previous_sigbus_action);
+  sigaction(SIGFPE, &sa, &g_previous_sigfpe_action);
+  sigaction(SIGILL, &sa, &g_previous_sigill_action);
 }
 
 bool& seh_active() {

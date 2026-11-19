@@ -128,7 +128,9 @@ bool build_bctr(BuilderContext& ctx) {
     ctx.println("\tswitch ({}.u32) {{", ctx.r(jt->indexRegister));
 
     for (size_t i = 0; i < jt->targets.size(); i++) {
-      ctx.println("\tcase {}:", i);
+      // Case labels are normalized by the detected index bias: the guest switch
+      // value is `bias + i`, while targets[] was read from the biased table window.
+      ctx.println("\tcase {}:", static_cast<int32_t>(i) + jt->indexBias);
       auto label = jt->targets[i];
 
       // TODO(tomc): Figure out if this actually is triggered on real hardware and what would

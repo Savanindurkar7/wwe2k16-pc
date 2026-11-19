@@ -35,7 +35,7 @@
 #include <linux/ashmem.h>
 
 // TODO(tomc): Android or maybe na. idk
-// #include "xenia/base/main_android.h"
+// #include "rex/base/main_android.h"
 #endif
 
 namespace rex {
@@ -61,7 +61,7 @@ static void* libandroid_;
 static int (*android_ASharedMemory_create_)(const char* name, size_t size);
 
 void AndroidInitialize() {
-  if (rex::GetAndroidApiLevel() >= 26) {
+  if (__ANDROID_API__ >= 26) {
     libandroid_ = dlopen("libandroid.so", RTLD_NOW);
     assert_not_null(libandroid_);
     if (libandroid_) {

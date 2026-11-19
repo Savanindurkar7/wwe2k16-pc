@@ -44,6 +44,7 @@ class GTKWindow : public Window {
   void ApplyNewFullscreen() override;
   void ApplyNewTitle() override;
   void ApplyNewMainMenu(MenuItem* old_main_menu) override;
+  void ApplyNewCursorVisibility(CursorVisibility old_cursor_visibility) override;
   // Mouse capture seems to happen implicitly compared to Windows.
   void FocusImpl() override;
 
@@ -70,6 +71,17 @@ class GTKWindow : public Window {
   static gboolean DrawingAreaEventHandlerThunk(GtkWidget* widget, GdkEvent* event,
                                                gpointer user_data);
   static gboolean DrawHandler(GtkWidget* widget, cairo_t* cr, gpointer data);
+
+  // Cursor auto-hide (CursorVisibility::kAutoHidden): hidden after kDefaultCursorAutoHideMilliseconds without
+  // mouse movement or clicks over the drawing area, shown again on the next real movement or click.
+  void SetDrawingAreaCursorHidden(bool hidden);
+  void RestartCursorAutoHideTimer();
+  void StopCursorAutoHideTimer();
+  static gboolean CursorAutoHideTimeout(gpointer user_data);
+  guint cursor_auto_hide_source_ = 0;
+  bool cursor_last_position_valid_ = false;
+  double cursor_last_x_ = 0.0;
+  double cursor_last_y_ = 0.0;
 
   // Non-owning (initially floating) references to the widgets.
   GtkWidget* window_ = nullptr;

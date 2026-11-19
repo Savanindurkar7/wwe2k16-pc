@@ -7,7 +7,7 @@
  *
  * @license     BSD 3-Clause License
  *              See LICENSE file in the project root for full license text.
- * @remarks     Based on Xenia emulator.h/cc
+ * @remarks     Based on the runtime emulator.h/cc
  */
 
 #pragma once

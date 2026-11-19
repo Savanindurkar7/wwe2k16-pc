@@ -1917,7 +1917,7 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
     PopSystemTemp();
 
     // Apply the bias and gamma correction (gamma is after filtering here,
-    // likely should be before, but it's outside Xenia's control for host
+    // likely should be before, but it's outside the runtime's control for host
     // sampler filtering).
     if (instr.opcode == FetchOpcode::kTextureFetch) {
       assert_true(signs_temp != UINT32_MAX);

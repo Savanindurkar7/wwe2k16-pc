@@ -19,6 +19,7 @@
 #include <rex/system/xfile.h>
 #include <rex/thread/mutex.h>
 
+#include <cstdlib>
 #include <span>
 
 namespace rex::system {
@@ -164,6 +165,21 @@ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address, uint32_t buffer_leng
                   buffer_length),
               size_t(byte_offset), &bytes_read);
           if (XSUCCEEDED(result)) {
+            // Diagnostic (WWE2K16_READ_AUDIT=<substring>): log reads of matching paths with an
+            // FNV-1a hash of the delivered bytes, for offline comparison with the host file.
+            static const char* read_audit = std::getenv("WWE2K16_READ_AUDIT");
+            if (read_audit && path().find(read_audit) != std::string::npos) {
+              const uint8_t* p = buffer_physical_heap
+                                     ? memory()->TranslatePhysical(
+                                           buffer_physical_heap->GetPhysicalAddress(
+                                               buffer_guest_address))
+                                     : memory()->TranslateVirtual(buffer_guest_address);
+              uint64_t h = 0xcbf29ce484222325ull;
+              for (size_t k = 0; k < bytes_read; ++k) h = (h ^ p[k]) * 0x100000001b3ull;
+              REXSYS_INFO("[read-audit] path={} off={} len={} got={} buf={:#x} fnv={:016x}",
+                          path(), byte_offset, buffer_length, bytes_read, buffer_guest_address,
+                          h);
+            }
             if (buffer_physical_heap) {
               buffer_physical_heap->TriggerCallbacks(
                   rex::thread::global_critical_region::AcquireDirect(), buffer_guest_address,

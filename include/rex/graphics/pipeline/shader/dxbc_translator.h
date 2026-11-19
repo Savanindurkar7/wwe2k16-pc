@@ -40,7 +40,7 @@ namespace rex::graphics {
 // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-// Before adding any sequence that you haven't seen in Xenia, try writing
+// Before adding any sequence that you haven't seen in the runtime, try writing
 // equivalent code in HLSL and running it through FXC, try with /Od, try with
 // full optimization, but if you see that FXC follows a different pattern than
 // what you are expecting, do what FXC does!!!
@@ -1028,7 +1028,7 @@ class DxbcShaderTranslator : public ShaderTranslator {
   // Whether the faceness has been used in the pixel shader.
   bool in_front_face_used_;
 
-  // Number of currently allocated Xenia internal r# registers.
+  // Number of currently allocated the runtime internal r# registers.
   uint32_t system_temp_count_current_;
   // Total maximum number of temporary registers ever used during this
   // translation (for the declaration).

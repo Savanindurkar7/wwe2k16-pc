@@ -74,6 +74,8 @@ class Win32WindowedAppContext final : public WindowedAppContext {
 
   void PlatformQuitFromUIThread() override;
 
+  bool ShowSimpleMessageBox(const char* title, const char* message) override;
+
   int RunMainMessageLoop();
 
   // Per-monitor DPI awareness version 2 is expected to be enabled via the

@@ -14,6 +14,7 @@
 #include <rex/ui/window_listener.h>
 
 #include <cstdint>
+#include <chrono>
 #include <mutex>
 #include <queue>
 #include <string>
@@ -41,6 +42,7 @@ class MnkInputDriver final : public InputDriver,
   // WindowInputListener
   void OnKeyDown(rex::ui::KeyEvent& e) override;
   void OnKeyUp(rex::ui::KeyEvent& e) override;
+  void OnKeyChar(rex::ui::KeyEvent& e) override;
   void OnMouseDown(rex::ui::MouseEvent& e) override;
   void OnMouseUp(rex::ui::MouseEvent& e) override;
   void OnMouseMove(rex::ui::MouseEvent& e) override;
@@ -56,12 +58,22 @@ class MnkInputDriver final : public InputDriver,
   void CenterCursor();
   void UpdateMouseCapture();
   void SetKeyState(uint16_t vk, bool down);
-  void EnqueueKeystroke(uint16_t vk_pad, bool down);
+  void EnqueueKeystroke(uint16_t virtual_key, bool down, uint16_t unicode = 0,
+                        bool repeat = false);
+  void EnqueueTextCharacter(char16_t character);
+  void EnqueueTextButton(uint16_t button);
+
+  struct TextEntryInput {
+    enum class Type { kCharacter, kButton } type;
+    char16_t character = 0;
+    uint16_t button = 0;
+  };
 
   rex::ui::Window* attached_window_ = nullptr;
 
   std::mutex state_mutex_;
   bool key_down_[256] = {};
+  bool paste_key_down_ = false;
 
   // Mouse delta tracking
   int32_t mouse_dx_ = 0;
@@ -69,10 +81,15 @@ class MnkInputDriver final : public InputDriver,
   int32_t prev_mouse_x_ = 0;
   int32_t prev_mouse_y_ = 0;
   bool mouse_captured_ = false;
+  bool mouse_enabled_ = false;
   bool has_focus_ = true;
 
   // Keystroke queue
   std::queue<X_INPUT_KEYSTROKE> keystroke_queue_;
+  // Independent queue for the game's pad-driven on-screen keyboard.
+  std::queue<TextEntryInput> text_entry_queue_;
+  uint16_t text_entry_held_button_ = 0;
+  std::chrono::steady_clock::time_point text_entry_phase_end_{};
 
   // Packet number incremented on state change
   uint32_t packet_number_ = 0;

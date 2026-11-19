@@ -136,7 +136,7 @@ class RenderTargetCache {
   // single-pixel quad, either 0...1 without half-pixel offset or 0.5...1.5 with
   // it (covers only the first pixel according the top-left rule), with 1.5x
   // resolution scaling, would become 0...1.5 (only the first pixel covered) or
-  // 0.75...2.25 (only the second). The workaround used in Xenia for 2x and 3x
+  // 0.75...2.25 (only the second). The workaround used in the runtime for 2x and 3x
   // resolution scaling for filling the gap caused by the half-pixel offset
   // becoming whole-pixel - stretching the second column / row of pixels into
   // the first - will not work in this case, as for one-pixel primitives without
@@ -181,6 +181,12 @@ class RenderTargetCache {
   uint32_t GetLastUpdateBoundRenderTargets(uint32_t* depth_and_color_formats_out = nullptr) const;
 
  protected:
+  // Update() fast path (host render targets): when a draw's Update inputs equal the previous successful call's and
+  // nothing else touched the cache in between, the previous result still holds (ownership, transfers, render pass,
+  // framebuffer, render target usage) and the call is skipped. Every other mutating entry point invalidates it.
+  void InvalidateUpdateFastPath() { update_fast_path_valid_ = false; }
+  bool update_fast_path_valid_ = false;
+
   RenderTargetCache(const RegisterFile& register_file, const memory::Memory& memory,
                     TraceWriter* trace_writer, uint32_t draw_resolution_scale_x,
                     uint32_t draw_resolution_scale_y)
@@ -564,6 +570,8 @@ class RenderTargetCache {
   uint32_t draw_resolution_scale_x_;
   uint32_t draw_resolution_scale_y_;
 
+  uint64_t debug_rt_cache_draw_index_ = 0;
+
   DrawExtentEstimator draw_extent_estimator_;
 
   // For host render targets.
@@ -644,6 +652,8 @@ class RenderTargetCache {
   }
 
   RenderTarget* GetOrCreateRenderTarget(RenderTargetKey key);
+
+  std::string DebugRenderTargetKeyString(RenderTargetKey key) const;
 
   // Checks if changing ownership of the range to the specified render target
   // would require transferring data - primarily for barrier placement on the

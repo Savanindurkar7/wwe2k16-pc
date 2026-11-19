@@ -13,15 +13,119 @@ static_assert(REX_PLATFORM_WIN32, "This file is Windows-only");
 
 #include "platform_win.h"
 
+#include <mmsystem.h>
 #include <spdlog/spdlog.h>
 
 #include <rex/assert.h>
 #include <rex/chrono/chrono_steady_cast.h>
 
+#include <cstdint>
+#include <limits>
+
 #define LOG_LASTERROR() \
   { spdlog::error("Win32 Error 0x{:08X} in {}(...)", GetLastError(), __FUNCTION__); }
 
 typedef HANDLE (*SetThreadDescriptionFn)(HANDLE hThread, PCWSTR lpThreadDescription);
+
+namespace {
+
+class ProcessTimerResolution {
+ public:
+  ProcessTimerResolution() : result_(timeBeginPeriod(1)) {
+    if (result_ == TIMERR_NOERROR) {
+      spdlog::info("Windows timer resolution raised to 1 ms");
+    } else {
+      spdlog::warn("timeBeginPeriod(1) failed with result {}; timer resolution unchanged",
+                   result_);
+    }
+  }
+
+  ~ProcessTimerResolution() {
+    if (result_ == TIMERR_NOERROR) {
+      timeEndPeriod(1);
+    }
+  }
+
+ private:
+  MMRESULT result_;
+};
+
+// Request 1 ms resolution before main and release the matching request at exit.
+ProcessTimerResolution g_process_timer_resolution;
+
+class ThreadWaitableTimer {
+ public:
+  ThreadWaitableTimer()
+      : handle_(CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                       TIMER_MODIFY_STATE | SYNCHRONIZE)) {}
+
+  ~ThreadWaitableTimer() {
+    if (handle_) {
+      CloseHandle(handle_);
+    }
+  }
+
+  DWORD Wait(std::chrono::microseconds duration, bool alertable) {
+    if (!handle_) {
+      return WAIT_FAILED;
+    }
+
+    const auto duration_us = duration.count();
+    const auto max_due_time = std::numeric_limits<LONGLONG>::max();
+    const LONGLONG due_time_100ns =
+        duration_us > max_due_time / 10 ? max_due_time : static_cast<LONGLONG>(duration_us) * 10;
+    LARGE_INTEGER due_time{};
+    due_time.QuadPart = -due_time_100ns;
+
+    CancelWaitableTimer(handle_);
+    if (!SetWaitableTimer(handle_, &due_time, 0, nullptr, nullptr, FALSE)) {
+      return WAIT_FAILED;
+    }
+
+    const DWORD result = WaitForSingleObjectEx(handle_, INFINITE, alertable ? TRUE : FALSE);
+    if (result == WAIT_OBJECT_0 || (result == WAIT_IO_COMPLETION && alertable)) {
+      if (result == WAIT_IO_COMPLETION) {
+        CancelWaitableTimer(handle_);
+      }
+      return result;
+    }
+
+    CancelWaitableTimer(handle_);
+    return WAIT_FAILED;
+  }
+
+ private:
+  HANDLE handle_ = nullptr;
+};
+
+thread_local ThreadWaitableTimer g_thread_waitable_timer;
+
+void SleepRoundedUp(std::chrono::microseconds duration) {
+  const uint64_t duration_us = static_cast<uint64_t>(duration.count());
+  uint64_t remaining_ms = duration_us / 1000 + (duration_us % 1000 != 0 ? 1 : 0);
+  constexpr DWORD kMaxFiniteSleep = MAXDWORD - 1;
+  while (remaining_ms > kMaxFiniteSleep) {
+    ::Sleep(kMaxFiniteSleep);
+    remaining_ms -= kMaxFiniteSleep;
+  }
+  ::Sleep(static_cast<DWORD>(remaining_ms));
+}
+
+DWORD SleepExRoundedUp(std::chrono::microseconds duration) {
+  const uint64_t duration_us = static_cast<uint64_t>(duration.count());
+  uint64_t remaining_ms = duration_us / 1000 + (duration_us % 1000 != 0 ? 1 : 0);
+  constexpr DWORD kMaxFiniteSleep = MAXDWORD - 1;
+  while (remaining_ms > kMaxFiniteSleep) {
+    const DWORD result = SleepEx(kMaxFiniteSleep, TRUE);
+    if (result == WAIT_IO_COMPLETION) {
+      return result;
+    }
+    remaining_ms -= kMaxFiniteSleep;
+  }
+  return SleepEx(static_cast<DWORD>(remaining_ms), TRUE);
+}
+
+}  // namespace
 
 namespace rex::thread {
 
@@ -97,12 +201,24 @@ void Sleep(std::chrono::microseconds duration) {
   if (duration.count() < 100) {
     MaybeYield();
   } else {
-    ::Sleep(static_cast<DWORD>(duration.count() / 1000));
+    if (g_thread_waitable_timer.Wait(duration, false) != WAIT_OBJECT_0) {
+      SleepRoundedUp(duration);
+    }
   }
 }
 
 SleepResult AlertableSleep(std::chrono::microseconds duration) {
-  if (SleepEx(static_cast<DWORD>(duration.count() / 1000), TRUE) == WAIT_IO_COMPLETION) {
+  if (duration.count() < 100) {
+    return SleepEx(0, TRUE) == WAIT_IO_COMPLETION ? SleepResult::kAlerted : SleepResult::kSuccess;
+  }
+  const DWORD timer_result = g_thread_waitable_timer.Wait(duration, true);
+  if (timer_result == WAIT_IO_COMPLETION) {
+    return SleepResult::kAlerted;
+  }
+  if (timer_result == WAIT_OBJECT_0) {
+    return SleepResult::kSuccess;
+  }
+  if (SleepExRoundedUp(duration) == WAIT_IO_COMPLETION) {
     return SleepResult::kAlerted;
   }
   return SleepResult::kSuccess;

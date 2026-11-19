@@ -174,7 +174,7 @@ uint32_t DxbcShaderTranslator::GetModificationRegisterCount() const {
 }
 
 bool DxbcShaderTranslator::UseSwitchForControlFlow() const {
-  // Xenia crashes on Intel HD Graphics 4000 with switch.
+  // the runtime crashes on Intel HD Graphics 4000 with switch.
   return REXCVAR_GET(dxbc_switch) && vendor_id_ != ui::GraphicsProvider::GpuVendorID::kIntel;
 }
 
@@ -1998,7 +1998,7 @@ void DxbcShaderTranslator::WriteResourceDefinition() {
   // known.
   shader_object_.resize(shader_object_.size() + sizeof(dxbc::RdefHeader) / sizeof(uint32_t));
   // Generator name.
-  dxbc::AppendAlignedString(shader_object_, "Xenia");
+  dxbc::AppendAlignedString(shader_object_, "WWE2K16");
 
   // ***************************************************************************
   // Constant types
@@ -3388,7 +3388,7 @@ void DxbcShaderTranslator::WriteShaderCode() {
   }
 
   // Temporary registers - guest general-purpose registers if not using dynamic
-  // indexing and Xenia internal registers.
+  // indexing and the runtime internal registers.
   uint32_t temp_register_count = system_temp_count_max_;
   if (!is_depth_only_pixel_shader_ && !current_shader().uses_register_dynamic_addressing()) {
     temp_register_count += register_count();

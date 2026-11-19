@@ -12,6 +12,7 @@
 #include <array>
 #include <cstring>
 #include <string>
+#include <system_error>
 
 #include <fmt/format.h>
 
@@ -22,6 +23,15 @@
 #include <rex/system/xam/content_manager.h>
 #include <rex/system/xfile.h>
 #include <rex/system/xobject.h>
+
+namespace {
+// Non-throwing exists(): an unreadable or permission-denied save path counts as absent instead of terminating
+// the game with std::filesystem::filesystem_error (release bug hunt 2026-10-02, review v2-sdk.md).
+bool PathExists(const std::filesystem::path& path) {
+  std::error_code ec;
+  return std::filesystem::exists(path, ec);
+}
+}  // namespace
 
 namespace rex {
 namespace system {
@@ -57,7 +67,7 @@ ContentPackage::~ContentPackage() {
 }
 
 void ContentPackage::LoadPackageLicenseMask(const std::filesystem::path header_path) {
-  if (!std::filesystem::exists(header_path)) {
+  if (!PathExists(header_path)) {
     return;
   }
 
@@ -155,6 +165,19 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device
     XCONTENT_AGGREGATE_DATA content_data;
     if (XSUCCEEDED(ReadContentHeaderFile(rex::path_to_utf8(file_info.name), xuid, title_id,
                                          content_type, content_data))) {
+      // GitHub #12: the game parses a saved-game entry's display name by copying the text after
+      // the first '.'; a community creation pack whose STFS display name has no dot (or is empty)
+      // makes it read through a null pointer right before the main menu. Sidecars written for
+      // saved games are free-form, so fall back to the package (directory) name whenever the
+      // stored display name cannot satisfy that contract (the runtime lists saved-game content by the
+      // package name). Pack display names that already contain a dot are unchanged.
+      if (content_type == XContentType::kSavedGame) {
+        const std::u16string display_name = content_data.display_name();
+        if (display_name.empty() || display_name.find(u'.') == std::u16string::npos) {
+          content_data.set_display_name(rex::path_to_utf16(file_info.name));
+          content_data.set_file_name(rex::path_to_utf8(file_info.name));
+        }
+      }
       result.emplace_back(std::move(content_data));
     } else {
       content_data.device_id = device_id;
@@ -173,7 +196,7 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device
 std::unique_ptr<ContentPackage> ContentManager::ResolvePackage(
     const std::string_view root_name, uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data) {
   auto package_path = ResolvePackagePath(xuid, data);
-  if (!std::filesystem::exists(package_path)) {
+  if (!PathExists(package_path)) {
     return nullptr;
   }
   auto package = std::make_unique<ContentPackage>(kernel_state_, root_name, data, package_path);
@@ -182,7 +205,7 @@ std::unique_ptr<ContentPackage> ContentManager::ResolvePackage(
 
 bool ContentManager::ContentExists(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data) {
   auto path = ResolvePackagePath(xuid, data);
-  return std::filesystem::exists(path);
+  return PathExists(path);
 }
 
 X_RESULT ContentManager::WriteContentHeaderFile(uint64_t xuid, XCONTENT_AGGREGATE_DATA data) {
@@ -198,8 +221,9 @@ X_RESULT ContentManager::WriteContentHeaderFile(uint64_t xuid, XCONTENT_AGGREGAT
       ResolvePackageHeaderPath(data.file_name(), used_xuid, data.title_id, data.content_type);
   auto parent_path = header_path.parent_path();
 
-  if (!std::filesystem::exists(parent_path)) {
-    if (!std::filesystem::create_directories(parent_path)) {
+  if (!PathExists(parent_path)) {
+    std::error_code ec;  // Non-throwing: a read-only save folder fails the call instead of terminating.
+    if (!std::filesystem::create_directories(parent_path, ec)) {
       return X_ERROR_ACCESS_DENIED;
     }
   }
@@ -221,7 +245,7 @@ X_RESULT ContentManager::ReadContentHeaderFile(const std::string_view file_name,
   auto header_file_path = ResolvePackageHeaderPath(file_name, xuid, title_id, content_type);
   constexpr uint32_t header_size = sizeof(XCONTENT_AGGREGATE_DATA);
 
-  if (!std::filesystem::exists(header_file_path)) {
+  if (!PathExists(header_file_path)) {
     return X_ERROR_FILE_NOT_FOUND;
   }
 
@@ -258,10 +282,11 @@ X_RESULT ContentManager::CreateContent(const std::string_view root_name, uint64_
   }
 
   auto package_path = ResolvePackagePath(xuid, data);
-  if (std::filesystem::exists(package_path)) {
+  if (PathExists(package_path)) {
     return X_ERROR_ALREADY_EXISTS;
   }
-  if (!std::filesystem::create_directories(package_path)) {
+  std::error_code create_error;  // Non-throwing: see WriteContentHeaderFile.
+  if (!std::filesystem::create_directories(package_path, create_error)) {
     return X_ERROR_ACCESS_DENIED;
   }
   auto package = ResolvePackage(root_name, xuid, data);
@@ -288,7 +313,7 @@ X_RESULT ContentManager::OpenContent(const std::string_view root_name, uint64_t 
   }
 
   auto package_path = ResolvePackagePath(xuid, data);
-  if (!std::filesystem::exists(package_path)) {
+  if (!PathExists(package_path)) {
     return X_ERROR_FILE_NOT_FOUND;
   }
   auto package = ResolvePackage(root_name, xuid, data);
@@ -329,8 +354,11 @@ X_RESULT ContentManager::GetContentThumbnail(uint64_t xuid, const XCONTENT_AGGRE
   auto global_lock = global_critical_region_.Acquire();
   auto package_path = ResolvePackagePath(xuid, data);
   auto thumb_path = package_path / kThumbnailFileName;
-  if (std::filesystem::exists(thumb_path)) {
+  if (PathExists(thumb_path)) {
     auto file = rex::filesystem::OpenFile(thumb_path, "rb");
+    if (!file) {
+      return X_ERROR_FILE_NOT_FOUND;
+    }
     fseek(file, 0, SEEK_END);
     size_t file_len = ftell(file);
     fseek(file, 0, SEEK_SET);
@@ -347,10 +375,15 @@ X_RESULT ContentManager::SetContentThumbnail(uint64_t xuid, const XCONTENT_AGGRE
                                              std::vector<uint8_t> buffer) {
   auto global_lock = global_critical_region_.Acquire();
   auto package_path = ResolvePackagePath(xuid, data);
-  std::filesystem::create_directories(package_path);
-  if (std::filesystem::exists(package_path)) {
+  // Non-throwing overloads: a read-only or missing save folder must fail the call, not terminate the game.
+  std::error_code ec;
+  std::filesystem::create_directories(package_path, ec);
+  if (std::filesystem::exists(package_path, ec)) {
     auto thumb_path = package_path / kThumbnailFileName;
     auto file = rex::filesystem::OpenFile(thumb_path, "wb");
+    if (!file) {
+      return X_ERROR_ACCESS_DENIED;
+    }
     fwrite(buffer.data(), 1, buffer.size(), file);
     fclose(file);
     return X_ERROR_SUCCESS;

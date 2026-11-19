@@ -9,6 +9,8 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 #include <rex/cvar.h>
@@ -107,6 +109,12 @@ X_STATUS UserModule::LoadFromFile(const std::string_view path) {
   if (REXCVAR_GET(xex_apply_patches)) {
     // Search for xexp patch file
     auto patch_entry = kernel_state_->file_system()->ResolvePath(path_ + "p");
+    // Title updates: the patch ships in the update package, mounted as update:\ (--update_data_root),
+    // so the game folder stays the untouched disc.
+    if (!patch_entry) {
+      auto name = path_.substr(path_.find_last_of("\\:") + 1);
+      patch_entry = kernel_state_->file_system()->ResolvePath("update:\\" + name + "p");
+    }
 
     if (patch_entry) {
       auto patch_path = patch_entry->absolute_path();
@@ -119,6 +127,17 @@ X_STATUS UserModule::LoadFromFile(const std::string_view path) {
         result = patch_module->xex_module()->ApplyPatch(xex_module());
         if (result) {
           REXSYS_ERROR("Failed to apply XEX patch, code: {}", result);
+        } else if (const char* dump_path = std::getenv("REX_DUMP_PATCHED_IMAGE")) {
+          // Diagnostic: write the patched image (base address .. image size) for offline
+          // comparison with the unpatched image (title-update porting).
+          auto* xex = xex_module();
+          const uint8_t* image = memory()->TranslateVirtual(xex->base_address());
+          if (FILE* dump = std::fopen(dump_path, "wb")) {
+            std::fwrite(image, 1, xex->image_size(), dump);
+            std::fclose(dump);
+            REXSYS_INFO("Dumped patched XEX image ({} bytes at {:08X}) to {}", xex->image_size(),
+                        xex->base_address(), dump_path);
+          }
         }
       } else {
         REXSYS_ERROR("Failed to load XEX patch, code: {}", result);
@@ -159,7 +178,7 @@ X_STATUS UserModule::LoadFromMemory(const void* addr, const size_t length) {
 
     processor_module_ = xex_module;
 
-    // Continue to LoadXexContinue (returns X_STATUS_PENDING per Xenia convention)
+    // Continue to LoadXexContinue (returns X_STATUS_PENDING per the runtime convention)
     return X_STATUS_PENDING;
 
   } else if (module_format_ == kModuleFormatElf) {

@@ -58,6 +58,7 @@ bool build_divw(BuilderContext& ctx);
 bool build_divwu(BuilderContext& ctx);
 
 // Multiplication
+bool build_mulchw(BuilderContext& ctx);
 bool build_mulhd(BuilderContext& ctx);
 bool build_mulhdu(BuilderContext& ctx);
 bool build_mulhw(BuilderContext& ctx);

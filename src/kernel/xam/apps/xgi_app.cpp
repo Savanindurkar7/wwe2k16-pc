@@ -11,6 +11,7 @@
 
 #include <rex/kernel/xam/apps/xgi_app.h>
 #include <rex/logging.h>
+#include <rex/system/xam/achievements.h>
 #include <rex/thread.h>
 
 namespace rex {
@@ -59,6 +60,15 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       uint32_t achievements_ptr = memory::load_and_swap<uint32_t>(buffer + 4);
       REXKRNL_DEBUG("XGIUserWriteAchievements({:08X}, {:08X})", achievement_count,
                     achievements_ptr);
+      // XUSER_ACHIEVEMENT[count]: { user_index, achievement_id }, big-endian. Unlocks are kept
+      // locally (achievements.cpp) and reported back by XamUserCreateAchievementEnumerator.
+      if (achievements_ptr && achievement_count <= 1024) {
+        const uint8_t* entries = memory_->TranslateVirtual(achievements_ptr);
+        for (uint32_t i = 0; i < achievement_count; ++i) {
+          rex::system::xam::UnlockAchievement(
+              memory::load_and_swap<uint32_t>(entries + i * 8 + 4));
+        }
+      }
       return X_E_SUCCESS;
     }
     case 0x000B0010: {

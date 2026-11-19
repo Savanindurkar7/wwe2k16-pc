@@ -112,8 +112,23 @@ using WinSystemClock = detail::NtSystemClock<detail::Domain::Host>;
 using XSystemClock = detail::NtSystemClock<detail::Domain::Guest>;
 
 }  // namespace chrono
+
+inline chrono::WinSystemClock::time_point ToWinSystemClock(
+    const chrono::XSystemClock::time_point& t) {
+  std::atomic_thread_fence(std::memory_order_acq_rel);
+  auto w_now = chrono::WinSystemClock::now();
+  auto x_now = chrono::XSystemClock::now();
+  std::atomic_thread_fence(std::memory_order_acq_rel);
+  auto delta = t - x_now;
+  if (!REXCVAR_GET(clock_no_scaling)) {
+    delta = std::chrono::floor<chrono::WinSystemClock::duration>(
+        delta * chrono::Clock::guest_time_scalar());
+  }
+  return w_now + delta;
+}
 }  // namespace rex
 
+#if !defined(__ANDROID__)
 namespace std::chrono {
 
 template <>
@@ -163,3 +178,4 @@ struct clock_time_conversion<::rex::chrono::XSystemClock, ::rex::chrono::WinSyst
 };
 
 }  // namespace std::chrono
+#endif  // !defined(__ANDROID__)

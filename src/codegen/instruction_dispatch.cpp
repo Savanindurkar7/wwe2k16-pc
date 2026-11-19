@@ -43,6 +43,7 @@ static const std::unordered_map<int, Builder>& GetDispatchTable() {
       {PPC_INST_DIVDU, build_divdu},
       {PPC_INST_DIVW, build_divw},
       {PPC_INST_DIVWU, build_divwu},
+      {PPC_INST_MULCHW, build_mulchw},
       {PPC_INST_MULHW, build_mulhw},
       {PPC_INST_MULHWU, build_mulhwu},
       {PPC_INST_MULLD, build_mulld},

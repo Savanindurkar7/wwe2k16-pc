@@ -30,6 +30,9 @@ REXCVAR_DEFINE_BOOL(headless, false, "Kernel",
 #include <rex/ui/window.h>
 #include <rex/ui/windowed_app_context.h>
 
+#include <string>
+#include <string_view>
+
 namespace rex {
 namespace kernel {
 namespace xam {
@@ -63,6 +66,50 @@ class XamDialog : public rex::ui::ImGuiDialog {
 
  protected:
   XamDialog(rex::ui::ImGuiDrawer* imgui_drawer) : rex::ui::ImGuiDialog(imgui_drawer) {}
+
+  // System dialogs are drawn in a neutral, game-like style (dark panel, red accent, centred, larger text) instead of
+  // the default debug-UI look, so players do not see an emulator/debug window in the middle of the game.
+  static constexpr int kStyleColors = 15;
+  static constexpr int kStyleVars = 7;
+  static void PushSystemDialogStyle(ImGuiIO& io) {
+    const ImVec4 red(0.78f, 0.06f, 0.09f, 1.0f);
+    const ImVec4 red_dark(0.50f, 0.03f, 0.05f, 1.0f);
+    ImGui::PushStyleColor(ImGuiCol_PopupBg, ImVec4(0.04f, 0.04f, 0.05f, 0.97f));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.04f, 0.04f, 0.05f, 0.97f));
+    ImGui::PushStyleColor(ImGuiCol_TitleBg, red_dark);
+    ImGui::PushStyleColor(ImGuiCol_TitleBgActive, red_dark);
+    ImGui::PushStyleColor(ImGuiCol_Border, red);
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.96f, 0.96f, 0.96f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.14f, 0.14f, 0.15f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0.20f, 0.20f, 0.21f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ImVec4(0.22f, 0.22f, 0.23f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.16f, 0.17f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, red);
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, red_dark);
+    ImGui::PushStyleColor(ImGuiCol_NavCursor, red);
+    ImGui::PushStyleColor(ImGuiCol_TextSelectedBg, ImVec4(0.78f, 0.06f, 0.09f, 0.55f));
+    ImGui::PushStyleColor(ImGuiCol_ModalWindowDimBg, ImVec4(0.0f, 0.0f, 0.0f, 0.55f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 2.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_PopupBorderSize, 2.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(24.0f, 18.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(12.0f, 8.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(12.0f, 12.0f));
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Always,
+                            ImVec2(0.5f, 0.5f));
+  }
+  static void PopSystemDialogStyle() {
+    ImGui::PopStyleVar(kStyleVars);
+    ImGui::PopStyleColor(kStyleColors);
+  }
+  static std::string SystemDialogTitle(std::string title) {
+    for (auto& c : title) {
+      if (c >= 'a' && c <= 'z') c = char(c - 'a' + 'A');
+    }
+    // "###" keeps the ImGui popup id stable and hidden.
+    return title + "###xam_system_dialog";
+  }
 
   void OnClose() override {
     if (close_callback_) {
@@ -220,8 +267,9 @@ class MessageBoxDialog : public XamDialog {
         default_button_(default_button),
         chosen_button_(default_button) {
     if (!title_.size()) {
-      title_ = "Message Box";
+      title_ = "Notice";
     }
+    title_ = SystemDialogTitle(title_);
   }
 
   uint32_t chosen_button() const { return chosen_button_; }
@@ -233,15 +281,20 @@ class MessageBoxDialog : public XamDialog {
       has_opened_ = true;
       first_draw = true;
     }
-    if (ImGui::BeginPopupModal(title_.c_str(), nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+    PushSystemDialogStyle(io);
+    if (ImGui::BeginPopupModal(title_.c_str(), nullptr,
+                               ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove)) {
+      ImGui::SetWindowFontScale(1.35f);
       if (description_.size()) {
-        ImGui::Text("%s", description_.c_str());
+        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 30.0f);
+        ImGui::TextUnformatted(description_.c_str());
+        ImGui::PopTextWrapPos();
       }
       if (first_draw) {
         ImGui::SetKeyboardFocusHere();
       }
       for (size_t i = 0; i < buttons_.size(); ++i) {
-        if (ImGui::Button(buttons_[i].c_str())) {
+        if (ImGui::Button(buttons_[i].c_str(), ImVec2(ImGui::GetFontSize() * 7.0f, 0.0f))) {
           chosen_button_ = static_cast<uint32_t>(i);
           ImGui::CloseCurrentPopup();
           Close();
@@ -249,11 +302,11 @@ class MessageBoxDialog : public XamDialog {
         ImGui::SameLine();
       }
       ImGui::Spacing();
-      ImGui::Spacing();
       ImGui::EndPopup();
     } else {
       Close();
     }
+    PopSystemDialogStyle();
   }
 
  private:
@@ -276,6 +329,7 @@ ppc_u32_result_t XamShowMessageBoxUI_entry(ppc_u32_t user_index, ppc_pchar16_t t
       uint32_t(user_index), title_ptr.guest_address(), text_ptr.guest_address(),
       uint32_t(button_count), button_ptrs.guest_address(), uint32_t(active_button), uint32_t(flags),
       result_ptr.guest_address(), overlapped.guest_address());
+  const uint32_t active_button_value = static_cast<uint32_t>(active_button);
   std::string title;
   if (title_ptr) {
     title = rex::string::to_utf8(title_ptr.value());
@@ -294,8 +348,8 @@ ppc_u32_result_t XamShowMessageBoxUI_entry(ppc_u32_t user_index, ppc_pchar16_t t
   X_RESULT result;
   if (REXCVAR_GET(headless)) {
     // Auto-pick the focused button.
-    auto run = [result_ptr, active_button]() -> X_RESULT {
-      *result_ptr = static_cast<uint32_t>(active_button);
+    auto run = [result_ptr, active_button_value]() -> X_RESULT {
+      *result_ptr = active_button_value;
       return X_ERROR_SUCCESS;
     };
     result = xeXamDispatchHeadless(run, overlapped.guest_address());
@@ -324,12 +378,12 @@ ppc_u32_result_t XamShowMessageBoxUI_entry(ppc_u32_t user_index, ppc_pchar16_t t
     if (imgui_drawer) {
       result = xeXamDispatchDialog<MessageBoxDialog>(
           new MessageBoxDialog(imgui_drawer, title, rex::string::to_utf8(text_ptr.value()), buttons,
-                               active_button),
+                               active_button_value),
           close, overlapped.guest_address());
     } else {
       // Fallback to headless if no drawer available
-      auto run = [result_ptr, active_button]() -> X_RESULT {
-        *result_ptr = static_cast<uint32_t>(active_button);
+      auto run = [result_ptr, active_button_value]() -> X_RESULT {
+        *result_ptr = active_button_value;
         return X_ERROR_SUCCESS;
       };
       result = xeXamDispatchHeadless(run, overlapped.guest_address());
@@ -350,12 +404,13 @@ class KeyboardInputDialog : public XamDialog {
         text_buffer_() {
     if (!title_.size()) {
       if (!description_.size()) {
-        title_ = "Keyboard Input";
+        title_ = "Enter text";
       } else {
         title_ = description_;
         description_ = "";
       }
     }
+    title_ = SystemDialogTitle(title_);
     text_ = default_text;
     text_buffer_.resize(max_length);
     rex::string::util_copy_truncating(text_buffer_.data(), default_text_, text_buffer_.size());
@@ -371,13 +426,19 @@ class KeyboardInputDialog : public XamDialog {
       has_opened_ = true;
       first_draw = true;
     }
-    if (ImGui::BeginPopupModal(title_.c_str(), nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+    PushSystemDialogStyle(io);
+    if (ImGui::BeginPopupModal(title_.c_str(), nullptr,
+                               ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove)) {
+      ImGui::SetWindowFontScale(1.35f);
       if (description_.size()) {
-        ImGui::TextWrapped("%s", description_.c_str());
+        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 30.0f);
+        ImGui::TextUnformatted(description_.c_str());
+        ImGui::PopTextWrapPos();
       }
       if (first_draw) {
         ImGui::SetKeyboardFocusHere();
       }
+      ImGui::SetNextItemWidth(ImGui::GetFontSize() * 22.0f);
       if (ImGui::InputText("##body", text_buffer_.data(), text_buffer_.size(),
                            ImGuiInputTextFlags_EnterReturnsTrue)) {
         text_ = std::string(text_buffer_.data(), text_buffer_.size());
@@ -385,24 +446,26 @@ class KeyboardInputDialog : public XamDialog {
         ImGui::CloseCurrentPopup();
         Close();
       }
-      if (ImGui::Button("OK")) {
+      const ImVec2 button_size(ImGui::GetFontSize() * 7.0f, 0.0f);
+      if (ImGui::Button("OK", button_size)) {
         text_ = std::string(text_buffer_.data(), text_buffer_.size());
         cancelled_ = false;
         ImGui::CloseCurrentPopup();
         Close();
       }
       ImGui::SameLine();
-      if (ImGui::Button("Cancel")) {
+      if (ImGui::Button("CANCEL", button_size) || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
         text_ = "";
         cancelled_ = true;
         ImGui::CloseCurrentPopup();
         Close();
       }
-      ImGui::Spacing();
+      ImGui::TextDisabled("Enter = OK    Esc = Cancel");
       ImGui::EndPopup();
     } else {
       Close();
     }
+    PopSystemDialogStyle();
   }
 
  private:
@@ -431,23 +494,30 @@ ppc_u32_result_t XamShowKeyboardUI_entry(ppc_u32_t user_index, ppc_u32_t flags,
 
   assert_true(overlapped.guest_address() != 0);
 
-  auto buffer_size = static_cast<size_t>(buffer_length) * 2;
+  const bool has_default_text = static_cast<bool>(default_text);
+  const std::u16string default_text_value =
+      has_default_text ? std::u16string(default_text.value()) : std::u16string();
+  const uint32_t buffer_length_value = static_cast<uint32_t>(buffer_length);
+  auto buffer_size = static_cast<size_t>(buffer_length_value) * 2;
 
   X_RESULT result;
   if (REXCVAR_GET(headless)) {
-    auto run = [default_text, buffer, buffer_length, buffer_size]() -> X_RESULT {
+    auto run = [has_default_text, default_text_value, buffer, buffer_length_value,
+                buffer_size]() -> X_RESULT {
       // Redirect default_text back into the buffer.
-      if (!default_text) {
+      if (!has_default_text) {
         std::memset(buffer, 0, buffer_size);
       } else {
-        rex::string::util_copy_and_swap_truncating(buffer, default_text.value(), buffer_length);
+        rex::string::util_copy_and_swap_truncating(
+            buffer, std::u16string_view(default_text_value), buffer_length_value);
       }
       return X_ERROR_SUCCESS;
     };
     result = xeXamDispatchHeadless(run, overlapped.guest_address());
   } else {
-    auto close = [buffer, buffer_length](KeyboardInputDialog* dialog, uint32_t& extended_error,
-                                         uint32_t& length) -> X_RESULT {
+    auto close = [buffer, buffer_length_value](KeyboardInputDialog* dialog,
+                                               uint32_t& extended_error,
+                                               uint32_t& length) -> X_RESULT {
       if (dialog->cancelled()) {
         extended_error = X_ERROR_CANCELLED;
         length = 0;
@@ -455,7 +525,7 @@ ppc_u32_result_t XamShowKeyboardUI_entry(ppc_u32_t user_index, ppc_u32_t flags,
       } else {
         // Zero the output buffer.
         auto text = rex::string::to_utf16(dialog->text());
-        rex::string::util_copy_and_swap_truncating(buffer, text, buffer_length);
+        rex::string::util_copy_and_swap_truncating(buffer, text, buffer_length_value);
         extended_error = X_ERROR_SUCCESS;
         length = 0;
         return X_ERROR_SUCCESS;
@@ -479,18 +549,21 @@ ppc_u32_result_t XamShowKeyboardUI_entry(ppc_u32_t user_index, ppc_u32_t flags,
                      : "";
 
     if (imgui_drawer) {
-      uint32_t buffer_length_safe = buffer_length + 1;  // +1 for null terminator, just in case
+      uint32_t buffer_length_safe =
+          buffer_length_value + 1;  // +1 for null terminator, just in case
       result = xeXamDispatchDialogEx<KeyboardInputDialog>(
           new KeyboardInputDialog(imgui_drawer, title_str, desc_str, def_text_str,
                                   buffer_length_safe),
           close, overlapped.guest_address());
     } else {
       // Fallback to headless
-      auto run = [default_text, buffer, buffer_length, buffer_size]() -> X_RESULT {
-        if (!default_text) {
+      auto run = [has_default_text, default_text_value, buffer, buffer_length_value,
+                  buffer_size]() -> X_RESULT {
+        if (!has_default_text) {
           std::memset(buffer, 0, buffer_size);
         } else {
-          rex::string::util_copy_and_swap_truncating(buffer, default_text.value(), buffer_length);
+          rex::string::util_copy_and_swap_truncating(
+              buffer, std::u16string_view(default_text_value), buffer_length_value);
         }
         return X_ERROR_SUCCESS;
       };

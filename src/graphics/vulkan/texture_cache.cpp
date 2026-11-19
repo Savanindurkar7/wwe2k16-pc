@@ -33,6 +33,8 @@
 #include <rex/ui/vulkan/ui_samplers.h>
 #include <rex/ui/vulkan/util.h>
 
+#include "gpu_timing.h"
+
 REXCVAR_DEFINE_BOOL(non_seamless_cube_map, false, "GPU", "Use non-seamless cube map sampling");
 
 namespace rex::graphics::vulkan {
@@ -669,6 +671,26 @@ VkImageView VulkanTextureCache::GetActiveBindingOrNullImageView(uint32_t fetch_c
 
 VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParameters(
     const VulkanShader::SamplerBinding& binding) const {
+  const uint32_t binding_filters =
+      uint32_t(binding.mag_filter) | uint32_t(binding.min_filter) << 8 |
+      uint32_t(binding.mip_filter) << 16 | uint32_t(binding.aniso_filter) << 24;
+  const int32_t anisotropic_override = REXCVAR_GET(anisotropic_override);
+  const uint32_t* fetch =
+      &register_file()[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + binding.fetch_constant * 6];
+  SamplerParametersMemo& memo = sampler_parameters_memo_[binding.fetch_constant & 31];
+  if (memo.binding_filters == binding_filters && memo.anisotropic_override == anisotropic_override &&
+      !std::memcmp(memo.fetch, fetch, sizeof(memo.fetch))) {
+    return memo.parameters;
+  }
+  memo.parameters = ComputeSamplerParameters(binding);
+  std::memcpy(memo.fetch, fetch, sizeof(memo.fetch));
+  memo.binding_filters = binding_filters;
+  memo.anisotropic_override = anisotropic_override;
+  return memo.parameters;
+}
+
+VulkanTextureCache::SamplerParameters VulkanTextureCache::ComputeSamplerParameters(
+    const VulkanShader::SamplerBinding& binding) const {
   const auto& regs = register_file();
   xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(binding.fetch_constant);
 
@@ -702,6 +724,12 @@ VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParameters(
   xenos::AnisoFilter aniso_filter = binding.aniso_filter == xenos::AnisoFilter::kUseFetchConst
                                         ? fetch.aniso_filter
                                         : binding.aniso_filter;
+  // anisotropic_override (as in the D3D12 path): force a level for mipmapped, linearly filtered textures.
+  const int32_t aniso_override = REXCVAR_GET(anisotropic_override);
+  if (aniso_override > -1 && aniso_override < 6 && parameters.mag_linear && parameters.min_linear &&
+      mip_filter != xenos::TextureFilter::kBaseMap) {
+    aniso_filter = xenos::AnisoFilter(aniso_override);
+  }
   aniso_filter = std::min(aniso_filter, max_anisotropy_);
   if (parameters.mag_linear || parameters.min_linear || parameters.mip_linear ||
       aniso_filter != xenos::AnisoFilter::kDisabled) {
@@ -758,10 +786,21 @@ VkSampler VulkanTextureCache::UseSampler(SamplerParameters parameters, bool& has
   assert_true(command_processor_.submission_open());
   uint64_t submission_current = command_processor_.GetCurrentSubmission();
 
+  UsedSamplerMemo& used_memo =
+      used_sampler_memo_[(parameters.value ^ (parameters.value >> 11)) % used_sampler_memo_.size()];
+  if (used_memo.submission == submission_current && used_memo.parameters == parameters &&
+      used_memo.sampler != VK_NULL_HANDLE) {
+    has_overflown_out = false;
+    return used_memo.sampler;
+  }
+
   // Try to find an existing sampler.
   auto it_existing = samplers_.find(parameters);
   if (it_existing != samplers_.end()) {
     std::pair<const SamplerParameters, Sampler>& sampler = *it_existing;
+    used_memo.parameters = parameters;
+    used_memo.sampler = sampler.second.sampler;
+    used_memo.submission = submission_current;
     assert_true(sampler.second.last_usage_submission <= submission_current);
     // This is called very frequently, don't relink unless needed for caching.
     if (sampler.second.last_usage_submission < submission_current) {
@@ -1504,6 +1543,7 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
 
   DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
 
+  command_processor_.SetGpuTimingCategory(GpuTimingCategory::kTextureLoad);
   command_processor_.BindExternalComputePipeline(pipeline);
 
   command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, load_pipeline_layout_,
@@ -2428,7 +2468,7 @@ bool VulkanTextureCache::Initialize() {
   // S3TC.
   // Not checking the textureCompressionBC feature because its availability
   // means that all BC formats are supported, however, the device may expose
-  // some BC formats without this feature. Xenia doesn't use BC6H and BC7 at
+  // some BC formats without this feature. the runtime doesn't use BC6H and BC7 at
   // all, and has fallbacks for each used format.
   // TODO(Triang3l): Raise the host texture memory usage limit if S3TC has to be
   // decompressed.

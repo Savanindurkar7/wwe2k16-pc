@@ -13,15 +13,23 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
+#include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <numeric>
+#include <string>
+#include <thread>
 #include <utility>
 
 #include <rex/cvar.h>
+#include <rex/filesystem.h>
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/flags.h>
+#include <rex/diagnostics/rate_census.h>
 #include <rex/kernel/xboxkrnl/video.h>
 #include <rex/logging.h>
 #include <rex/stream.h>
@@ -39,9 +47,22 @@ REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none, 
     .allowed({"none", "fxaa", "fxaa_extreme"})
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
-namespace {
-constexpr bool kStoreShaders = true;
+REXCVAR_DEFINE_BOOL(store_shaders, true, "GPU", "Persist Vulkan shader and pipeline storage")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_BOOL(display_pacing_stats, false, "GPU",
+                    "Log per second how many new frames reached each host display vblank (Windows)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_INT32(vsync_host_display_phase_percent, 5, "GPU",
+                     "With vsync_host_display: fire the guest vblank this percentage of a display period after the "
+                     "display vblank (0 = at the vblank)");
+
+REXCVAR_DEFINE_BOOL(vsync_host_display, false, "GPU",
+                    "Fire guest vblanks on the host display's vertical blanks when the display refresh is a "
+                    "multiple of the guest refresh (Windows); otherwise a timer is used");
+
+namespace {
 rex::graphics::CommandProcessor::SwapPostEffect ParseSwapPostEffect(
     const std::string& effect_name) {
   std::string lowered = effect_name;
@@ -124,6 +145,14 @@ X_STATUS GraphicsSystem::Setup(runtime::FunctionDispatcher* function_dispatcher,
                                  reinterpret_cast<runtime::MMIOWriteCallback>(WriteRegisterThunk));
 
   // Guest vblank timer based on the configured guest video mode.
+  system::X_VIDEO_MODE census_video_mode;
+  kernel::xboxkrnl::VdQueryVideoMode(&census_video_mode);
+  double census_refresh_rate_hz = std::max(1.0, double(float(census_video_mode.refresh_rate)));
+  uint64_t census_guest_tick_frequency = chrono::Clock::guest_tick_frequency();
+  uint64_t census_vsync_interval_ticks = std::max(
+      uint64_t(1), uint64_t(double(census_guest_tick_frequency) / census_refresh_rate_hz));
+  diagnostics::rate_census::Start(census_vsync_interval_ticks, census_refresh_rate_hz);
+
   vsync_worker_running_ = true;
   vsync_worker_thread_ = system::object_ref<system::XHostThread>(
       new system::XHostThread(kernel_state_, 128 * 1024, 0, [this]() {
@@ -134,21 +163,154 @@ X_STATUS GraphicsSystem::Setup(runtime::FunctionDispatcher* function_dispatcher,
         uint64_t vsync_interval_ticks =
             std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
         uint64_t no_vsync_interval_ticks = std::max(uint64_t(1), guest_tick_frequency / 1000);
-        uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
+        bool vsync_enabled = REXCVAR_GET(vsync);
+        uint64_t interval_ticks = vsync_enabled ? vsync_interval_ticks : no_vsync_interval_ticks;
+        uint64_t next_deadline = chrono::Clock::QueryGuestTickCount() + interval_ticks;
+        // Avoid replaying missed vblanks after a long stall or suspend.
+        constexpr uint64_t kResyncAfterIntervals = 3;
+        // vsync_host_display: distribute the fixed-rate guest vblanks across host display vblanks. Integer-multiple
+        // refreshes emit every Nth host vblank; other rates use a rational accumulator (for example, 4 guest vblanks
+        // per 5 host vblanks at 75 Hz). This avoids a free-running guest timer drifting against the display.
+        // Fall back to the deadline timer if the host wait fails or stalls.
+        using SteadyClock = std::chrono::steady_clock;
+        auto host_refresh_check_time = SteadyClock::time_point();
+        auto host_sync_suspended_until = SteadyClock::time_point();
+        auto last_host_vblank_time = SteadyClock::time_point();
+        uint32_t host_hz = 0;
+        uint32_t host_guest_numerator = 0;
+        uint32_t host_guest_denominator = 0;
+        uint32_t host_guest_accumulator = 0;
+        uint32_t logged_host_guest_numerator = UINT32_MAX;
+        uint32_t logged_host_guest_denominator = UINT32_MAX;
+        uint32_t logged_host_hz = UINT32_MAX;
         while (vsync_worker_running_) {
-          uint64_t current_time = chrono::Clock::QueryGuestTickCount();
-          uint64_t interval_ticks =
-              REXCVAR_GET(vsync) ? vsync_interval_ticks : no_vsync_interval_ticks;
-          if (current_time - last_frame_time >= interval_ticks) {
-            MarkVblank();
-            last_frame_time = current_time;
+          const bool current_vsync_enabled = REXCVAR_GET(vsync);
+          if (current_vsync_enabled != vsync_enabled) {
+            vsync_enabled = current_vsync_enabled;
+            interval_ticks = vsync_enabled ? vsync_interval_ticks : no_vsync_interval_ticks;
+            next_deadline = chrono::Clock::QueryGuestTickCount() + interval_ticks;
+            last_host_vblank_time = SteadyClock::time_point();
+            host_guest_accumulator = 0;
           }
-          rex::thread::Sleep(std::chrono::milliseconds(1));
+
+          if (vsync_enabled && REXCVAR_GET(vsync_host_display) && presenter()) {
+            auto now = SteadyClock::now();
+            if (now >= host_refresh_check_time) {
+              host_refresh_check_time = now + std::chrono::seconds(1);
+              const uint32_t detected_host_hz = presenter()->GetHostDisplayRefreshHz();
+              if (detected_host_hz != host_hz) {
+                host_hz = detected_host_hz;
+                host_guest_accumulator = 0;
+                last_host_vblank_time = SteadyClock::time_point();
+                const uint32_t guest_hz = std::max(1u, uint32_t(std::lround(refresh_rate_hz)));
+                const uint32_t divisor = host_hz ? std::gcd(guest_hz, host_hz) : 1;
+                host_guest_numerator = host_hz ? guest_hz / divisor : 0;
+                host_guest_denominator = host_hz ? host_hz / divisor : 0;
+              }
+              if (host_guest_numerator != logged_host_guest_numerator ||
+                  host_guest_denominator != logged_host_guest_denominator || host_hz != logged_host_hz) {
+                logged_host_guest_numerator = host_guest_numerator;
+                logged_host_guest_denominator = host_guest_denominator;
+                logged_host_hz = host_hz;
+                REXGPU_INFO("[host-vsync] display {} Hz: {}", host_hz,
+                            host_guest_numerator
+                                ? fmt::format("guest vblank ratio {}/{} display vblank(s)", host_guest_numerator,
+                                              host_guest_denominator)
+                                : std::string("unavailable, deadline timer vblank"));
+              }
+            }
+            if (host_sync_suspended_until != SteadyClock::time_point() && now >= host_sync_suspended_until) {
+              host_sync_suspended_until = SteadyClock::time_point();
+              last_host_vblank_time = SteadyClock::time_point();
+              host_guest_accumulator = 0;
+            }
+            if (host_hz && now >= host_sync_suspended_until) {
+              const auto wait_start = SteadyClock::now();
+              const bool waited = presenter()->WaitForHostDisplayVBlank();
+              now = SteadyClock::now();
+              const auto host_period = std::chrono::duration_cast<SteadyClock::duration>(
+                  std::chrono::duration<double>(1.0 / double(host_hz)));
+              if (waited && now - wait_start > host_period * 4) {
+                // Display asleep or the output is stalling: don't hold the guest to it.
+                REXGPU_WARN("[host-vsync] display vblank wait took {} ms, timer vblank for 5 s",
+                            std::chrono::duration_cast<std::chrono::milliseconds>(now - wait_start).count());
+                host_sync_suspended_until = now + std::chrono::seconds(5);
+              } else if (waited && now - last_host_vblank_time >= host_period / 2) {
+                uint32_t elapsed_host_vblanks = 1;
+                if (last_host_vblank_time != SteadyClock::time_point()) {
+                  const auto elapsed = now - last_host_vblank_time;
+                  const auto estimated_periods = std::chrono::duration<double>(elapsed).count() * double(host_hz);
+                  elapsed_host_vblanks = std::max(1u, uint32_t(std::lround(estimated_periods)));
+                }
+                last_host_vblank_time = now;
+                if (elapsed_host_vblanks > 4) {
+                  REXGPU_WARN("[host-vsync] missed {} display vblanks; deadline timer for 5 s",
+                              elapsed_host_vblanks);
+                  host_sync_suspended_until = now + std::chrono::seconds(5);
+                  host_guest_accumulator = 0;
+                } else {
+                  host_guest_accumulator += host_guest_numerator * elapsed_host_vblanks;
+                }
+                const uint32_t guest_vblanks_due =
+                    host_sync_suspended_until == SteadyClock::time_point()
+                        ? host_guest_accumulator / host_guest_denominator
+                        : 0;
+                if (host_sync_suspended_until == SteadyClock::time_point()) {
+                  host_guest_accumulator %= host_guest_denominator;
+                }
+                if (guest_vblanks_due) {
+                  // Phase offset: the guest frame is handed to the presenter right after the display vblank; firing
+                  // it exactly at the vblank races with the display/compositor latching the image. A fractional
+                  // refresh ratio may make multiple guest ticks due after one delayed wake, so deliver those ticks.
+                  const int32_t phase_percent =
+                      std::clamp(REXCVAR_GET(vsync_host_display_phase_percent), 0, 90);
+                  if (phase_percent) {
+                    std::this_thread::sleep_until(now + host_period * phase_percent / 100);
+                  }
+                  for (uint32_t i = 0; i < guest_vblanks_due; ++i) {
+                    MarkVblank();
+                  }
+                }
+                // Keep the timer path's phase close if the display wait later becomes unavailable.
+                next_deadline = chrono::Clock::QueryGuestTickCount() + interval_ticks;
+                continue;
+              }
+            }
+          }
+          uint64_t current_time = chrono::Clock::QueryGuestTickCount();
+          if (current_time >= next_deadline) {
+            MarkVblank();
+            const uint64_t late_ticks = current_time - next_deadline;
+            if (late_ticks / interval_ticks >= kResyncAfterIntervals) {
+              next_deadline = current_time + interval_ticks;
+            } else {
+              next_deadline += interval_ticks;
+            }
+          }
+
+          if (current_time < next_deadline) {
+            const uint64_t guest_ticks_per_second = std::max(uint64_t(1), guest_tick_frequency);
+            const uint64_t remaining_ticks = next_deadline - current_time;
+            const uint64_t sleep_microseconds =
+                (remaining_ticks / guest_ticks_per_second) * 1000000 +
+                ((remaining_ticks % guest_ticks_per_second) * 1000000) /
+                    guest_ticks_per_second;
+            rex::thread::Sleep(
+                std::chrono::microseconds(std::max(uint64_t(1), sleep_microseconds)));
+          } else {
+            rex::thread::Sleep(std::chrono::microseconds(1));
+          }
         }
         return 0;
       }));
   // TODO: set_can_debugger_suspend not yet ported
   // vsync_worker_thread_->set_can_debugger_suspend(true);
+#if REX_PLATFORM_WIN32
+  if (REXCVAR_GET(display_pacing_stats) && presenter()) {
+    display_pacing_running_ = true;
+    display_pacing_thread_ = std::thread(&GraphicsSystem::DisplayPacingThread, this);
+  }
+#endif  // REX_PLATFORM_WIN32
   vsync_worker_thread_->set_name("GPU VSync");
   vsync_worker_thread_->Create();
 
@@ -160,10 +322,17 @@ X_STATUS GraphicsSystem::Setup(runtime::FunctionDispatcher* function_dispatcher,
 }
 
 void GraphicsSystem::Shutdown() {
+  diagnostics::rate_census::Stop();
+
   if (command_processor_) {
     EndTracing();
     command_processor_->Shutdown();
     command_processor_.reset();
+  }
+
+  if (display_pacing_thread_.joinable()) {
+    display_pacing_running_ = false;
+    display_pacing_thread_.join();
   }
 
   if (vsync_worker_thread_) {
@@ -199,7 +368,36 @@ void GraphicsSystem::OnHostGpuLossFromAnyThread([[maybe_unused]] bool is_respons
   if (host_gpu_loss_reported_.test_and_set(std::memory_order_relaxed)) {
     return;
   }
-  rex::FatalError("Graphics device lost (probably due to an internal error)");
+  std::string log_path = rex::GetLogFilePath();
+  if (log_path.empty()) {
+    log_path = rex::path_to_utf8(rex::filesystem::GetExecutableFolder() / "wwe2k16.log");
+  }
+  const std::string message =
+      "The graphics driver stopped responding, so the game must close.\n\n"
+      "Please update your graphics driver. If you use Intel graphics, download the driver from "
+      "Intel's website, not Windows Update.\n\n"
+      "Please attach this log to your bug report:\n" +
+      log_path;
+  REXLOG_ERROR("Fatal GPU failure: {}", message);
+  rex::FlushLogging();
+
+  // Platform-native message boxes must run on the main/UI thread. A fatal
+  // graphics submission can leave guest threads running while a normal UI-loop
+  // quit is unwinding, so terminate the process with an ordinary exit code as
+  // soon as the user dismisses the dialog rather than allowing a second crash.
+  if (app_context_) {
+    app_context_->CallInUIThreadSynchronous([this, &message] {
+      if (!app_context_->ShowSimpleMessageBox("Graphics error", message.c_str())) {
+        REXLOG_ERROR("Could not display the fatal GPU message box");
+      }
+      rex::FlushLogging();
+      std::_Exit(EXIT_FAILURE);
+    });
+  }
+
+  REXLOG_ERROR("Fatal GPU failure could not be marshaled to the UI thread; exiting normally");
+  rex::FlushLogging();
+  std::_Exit(EXIT_FAILURE);
 }
 
 uint32_t GraphicsSystem::ReadRegisterThunk(void* ppc_context, GraphicsSystem* gs, uint32_t addr) {
@@ -294,11 +492,73 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
   //          interrupt_callback_, source, cpu);
 
   uint64_t args[] = {source, interrupt_callback_data_};
+  diagnostics::rate_census::RecordInterrupt(source);
   function_dispatcher_->ExecuteInterrupt(thread->thread_state(), interrupt_callback_, args,
                                          rex::countof(args));
 }
 
+void GraphicsSystem::DisplayPacingThread() {
+  using Clock = std::chrono::steady_clock;
+  auto window_start = Clock::now();
+  auto last_vblank = Clock::time_point();
+  uint64_t last_frames = presenter()->guest_frames_consumed();
+  uint64_t vblanks = 0, repeats = 0, singles = 0, multiples = 0, long_gaps = 0;
+  double max_gap_ms = 0.0;
+  while (display_pacing_running_) {
+    if (!presenter()->WaitForHostDisplayVBlank()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      last_vblank = Clock::time_point();
+      continue;
+    }
+    // Count half a period away from where guest frames are handed over (right after the display-locked guest
+    // vblank, vsync_host_display_phase_percent after the display vblank); counting at the hand-over itself races
+    // with it and misattributes frames.
+    const uint32_t mid_hz = std::max(1u, last_host_refresh_hz_.load(std::memory_order_relaxed));
+    const int32_t sample_percent =
+        (std::clamp(REXCVAR_GET(vsync_host_display_phase_percent), 0, 90) + 50) % 100;
+    if (sample_percent) {
+      std::this_thread::sleep_for(std::chrono::microseconds(10000 * sample_percent / mid_hz));
+    }
+    const auto now = Clock::now();
+    const uint64_t frames = presenter()->guest_frames_consumed();
+    const uint64_t new_frames = frames - last_frames;
+    last_frames = frames;
+    if (last_vblank != Clock::time_point()) {
+      const double gap_ms = std::chrono::duration<double, std::milli>(now - last_vblank).count();
+      max_gap_ms = std::max(max_gap_ms, gap_ms);
+      // A wake-up more than 1.5 periods after the previous one missed a vblank (this thread was late): its frame
+      // count covers two vblanks, so it is not classified.
+      const uint32_t hz = std::max(1u, last_host_refresh_hz_.load(std::memory_order_relaxed));
+      if (gap_ms > 1500.0 / hz) {
+        ++long_gaps;
+      } else {
+        ++vblanks;
+        if (new_frames == 0) {
+          ++repeats;
+        } else if (new_frames == 1) {
+          ++singles;
+        } else {
+          ++multiples;
+        }
+      }
+    }
+    last_vblank = now;
+    if (now - window_start >= std::chrono::seconds(1)) {
+      last_host_refresh_hz_.store(presenter()->GetHostDisplayRefreshHz(), std::memory_order_relaxed);
+      REXGPU_INFO("[display-pacing] hz={} vblanks={} new0={} new1={} new2p={} late_wakeups={} max_gap_ms={:.2f} "
+                  "presents={} guest_frames={}",
+                  last_host_refresh_hz_.load(std::memory_order_relaxed), vblanks, repeats, singles, multiples,
+                  long_gaps, max_gap_ms, presenter()->host_present_count(), frames);
+      vblanks = repeats = singles = multiples = long_gaps = 0;
+      max_gap_ms = 0.0;
+      window_start = now;
+    }
+  }
+}
+
 void GraphicsSystem::MarkVblank() {
+  diagnostics::rate_census::RecordVblank();
+
   // TODO: Enable profiling once ported
   // SCOPE_profile_cpu_f("gpu");
 
@@ -323,7 +583,7 @@ void GraphicsSystem::InvalidateGpuMemory() {
 
 void GraphicsSystem::InitializeShaderStorage(const std::filesystem::path& cache_root,
                                              uint32_t title_id, bool blocking) {
-  if (!kStoreShaders) {
+  if (!REXCVAR_GET(store_shaders)) {
     return;
   }
   if (blocking) {

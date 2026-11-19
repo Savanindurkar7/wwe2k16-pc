@@ -803,6 +803,17 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // resolve_clear_rectangle is expected to be provided by
   // PrepareHostRenderTargetsResolveClear which should do all the needed size
   // bound checks.
+  struct UpdateFastPathKey {
+    uint32_t registers[17];
+    uint32_t normalized_depth_control;
+    uint32_t normalized_color_mask;
+    uint32_t is_rasterization_done;
+    bool operator==(const UpdateFastPathKey& other) const {
+      return !std::memcmp(this, &other, sizeof(*this));
+    }
+  };
+  UpdateFastPathKey last_update_fast_path_key_ = {};
+
   void PerformTransfersAndResolveClears(
       uint32_t render_target_count, RenderTarget* const* render_targets,
       const std::vector<Transfer>* render_target_transfers,

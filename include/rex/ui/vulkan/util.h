@@ -21,6 +21,12 @@ namespace ui {
 namespace vulkan {
 namespace util {
 
+const char* VkResultName(VkResult result);
+void LogVkResultFailure(const VulkanDevice* vulkan_device, const char* operation, VkResult result);
+void LogVulkanMemoryBudget(const VulkanDevice* vulkan_device, const char* reason);
+VkResult QueueSubmit(const VulkanDevice* vulkan_device, VkQueue queue, uint32_t submit_count,
+                     const VkSubmitInfo* submit_infos, VkFence fence);
+
 template <typename DestroyFunction, typename Object>
 inline bool DestroyAndNullHandle(DestroyFunction* const destroy_function, Object& handle) {
   if (handle != VK_NULL_HANDLE) {

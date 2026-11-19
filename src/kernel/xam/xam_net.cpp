@@ -285,7 +285,7 @@ ppc_u32_result_t NetDll_WSAStartup_entry(ppc_u32_t caller, ppc_u16_t version,
 }
 
 ppc_u32_result_t NetDll_WSACleanup_entry(ppc_u32_t caller) {
-  // This does nothing. Xenia needs WSA running.
+  // This does nothing. the runtime needs WSA running.
   return 0;
 }
 
@@ -771,7 +771,7 @@ struct host_set {
         this->count = i;
         break;
       }
-      // Convert from Xenia -> native
+      // Convert from the runtime -> native
       auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
       assert_not_null(socket);
       this->sockets[i] = socket;

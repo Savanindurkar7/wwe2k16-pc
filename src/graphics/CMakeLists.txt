@@ -1,9 +1,10 @@
-# rexgraphics: GPU emulation core (ported from Xenia)
+# rexgraphics: GPU emulation core
 # Namespace: rex::graphics
 
 # Core GPU types - minimal dependencies, fully ported
 set(REXGRAPHICS_CORE_SOURCES
     flags.cpp
+    util/content_probe.cpp
     xenos.cpp
     pipeline/texture/info.cpp
     pipeline/texture/info_formats.cpp
@@ -19,6 +20,8 @@ set(REXGRAPHICS_SYSTEM_SOURCES
     graphics_system.cpp
     command_processor.cpp
     trace_writer.cpp
+    trace_reader.cpp
+    trace_player.cpp
     pipeline/texture/extent.cpp
     pipeline/texture/util.cpp
     util/draw_extent_estimator.cpp
@@ -49,6 +52,7 @@ set(REXGRAPHICS_SPIRV_SOURCES
 set(REXGRAPHICS_VULKAN_SOURCES
     vulkan/graphics_system.cpp
     vulkan/deferred_command_buffer.cpp
+    vulkan/gpu_timing.cpp
     vulkan/command_processor.cpp
     vulkan/pipeline_cache.cpp
     vulkan/primitive_processor.cpp
@@ -147,4 +151,3 @@ if(REXGLUE_USE_D3D12)
     )
     target_compile_definitions(rexgraphics PUBLIC REX_HAS_D3D12=1)
 endif()
-

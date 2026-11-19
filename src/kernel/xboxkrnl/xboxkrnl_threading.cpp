@@ -14,11 +14,14 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <vector>
 
 #include <rex/chrono/clock.h>
 #include <rex/dbg.h>
+#include <rex/diagnostics/freeze_logger.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/kernel/xboxkrnl/threading.h>
 #include <rex/logging.h>
@@ -41,6 +44,30 @@
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
 using rex::runtime::current_ppc_context;
+namespace freeze_logger = rex::diagnostics::freeze_logger;
+
+// Opt-in kernel event trace (WWE2K16_EVT_TRACE=1). Off by default: used to
+// capture the set/clear/wait order of the Havok-cloth handshake events
+// (StartCloth/EndCloth) and any other named event during an entrance hang.
+namespace {
+bool EvtTraceEnabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("WWE2K16_EVT_TRACE");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+  }();
+  return enabled;
+}
+}  // namespace
+
+namespace {
+// Guest link register of the calling guest thread; 0 on host threads without a
+// bound ThreadState. The recompiled runtime keeps no guest PC, so the caller
+// address at a kernel wait is the best available "where is it blocked".
+uint64_t GuestLr() {
+  auto* state = rex::runtime::ThreadState::Get();
+  return state ? uint64_t(state->context()->lr) : 0;
+}
+}  // namespace
 
 // r13 + 0x100: pointer to thread local state
 // Thread local state:
@@ -530,6 +557,12 @@ ppc_u32_result_t NtCreateEvent_entry(ppc_pu32_t handle_ptr,
   if (handle_ptr) {
     *handle_ptr = ev->handle();
   }
+  freeze_logger::RecordSyncEvent(freeze_logger::SyncType::kEventCreate, ev->handle(),
+                                 (uint32_t)ev->type(), ev->name().c_str());
+  if (EvtTraceEnabled()) {
+    REXLOG_INFO("[evt] create handle=0x{:08X} name={} type={} initial={}", ev->handle(),
+                ev->name(), (uint32_t)event_type, (uint32_t)initial_state);
+  }
   return X_STATUS_SUCCESS;
 }
 
@@ -538,6 +571,11 @@ uint32_t xeNtSetEvent(uint32_t handle, rex::be<uint32_t>* previous_state_ptr) {
 
   auto ev = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(handle);
   if (ev) {
+    freeze_logger::RecordSyncEvent(freeze_logger::SyncType::kEventSet, handle,
+                                   (uint32_t)ev->type(), ev->name().c_str());
+    if (EvtTraceEnabled()) {
+      REXLOG_INFO("[evt] set handle=0x{:08X} name={}", handle, ev->name());
+    }
     int32_t was_signalled = ev->Set(0, false);
     if (previous_state_ptr) {
       *previous_state_ptr = static_cast<uint32_t>(was_signalled);
@@ -558,6 +596,8 @@ ppc_u32_result_t NtPulseEvent_entry(ppc_u32_t handle, ppc_pu32_t previous_state_
 
   auto ev = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(handle);
   if (ev) {
+    freeze_logger::RecordSyncEvent(freeze_logger::SyncType::kEventPulse, handle,
+                                   (uint32_t)ev->type(), ev->name().c_str());
     int32_t was_signalled = ev->Pulse(0, false);
     if (previous_state_ptr) {
       *previous_state_ptr = static_cast<uint32_t>(was_signalled);
@@ -574,6 +614,11 @@ uint32_t xeNtClearEvent(uint32_t handle) {
 
   auto ev = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(handle);
   if (ev) {
+    freeze_logger::RecordSyncEvent(freeze_logger::SyncType::kEventReset, handle,
+                                   (uint32_t)ev->type(), ev->name().c_str());
+    if (EvtTraceEnabled()) {
+      REXLOG_INFO("[evt] clear handle=0x{:08X} name={}", handle, ev->name());
+    }
     ev->Reset();
   } else {
     result = X_STATUS_INVALID_HANDLE;
@@ -669,6 +714,8 @@ ppc_u32_result_t NtReleaseSemaphore_entry(ppc_u32_t sem_handle, ppc_u32_t releas
 
   auto sem = REX_KERNEL_OBJECTS()->LookupObject<XSemaphore>(sem_handle);
   if (sem) {
+    freeze_logger::RecordSyncEvent(freeze_logger::SyncType::kSemaphoreRelease, sem_handle,
+                                   (uint32_t)sem->type(), sem->name().c_str());
     bool success = sem->ReleaseSemaphore(static_cast<int32_t>(release_count), &previous_count);
     if (!success) {
       result = X_STATUS_SEMAPHORE_LIMIT_EXCEEDED;
@@ -840,7 +887,10 @@ uint32_t xeKeWaitForSingleObject(void* object_ptr, uint32_t wait_reason, uint32_
     return X_STATUS_ABANDONED_WAIT_0;
   }
 
+  freeze_logger::RecordWaitBegin(object->handle(), (uint32_t)object->type(),
+                                 object->name().c_str(), GuestLr());
   X_STATUS result = object->Wait(wait_reason, processor_mode, alertable, timeout_ptr);
+  freeze_logger::RecordWaitEnd(object->handle());
 
   if (alertable && result == X_STATUS_USER_APC) {
     XThread::GetCurrentThread()->DeliverAPCs();
@@ -871,7 +921,18 @@ ppc_u32_result_t NtWaitForSingleObjectEx_entry(ppc_u32_t object_handle, ppc_u32_
   auto object = REX_KERNEL_OBJECTS()->LookupObject<XObject>(object_handle);
   if (object) {
     uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
+    freeze_logger::RecordWaitBegin((uint32_t)object_handle, (uint32_t)object->type(),
+                                   object->name().c_str(), GuestLr());
+    if (EvtTraceEnabled()) {
+      REXLOG_INFO("[evt] wait-begin handle=0x{:08X} name={} timeout={}", (uint32_t)object_handle,
+                  object->name(), timeout_ptr ? (int64_t)timeout : -1);
+    }
     result = object->Wait(3, wait_mode, alertable, timeout_ptr ? &timeout : nullptr);
+    freeze_logger::RecordWaitEnd((uint32_t)object_handle);
+    if (EvtTraceEnabled()) {
+      REXLOG_INFO("[evt] wait-end handle=0x{:08X} name={} result=0x{:08X}",
+                  (uint32_t)object_handle, object->name(), (uint32_t)result);
+    }
     if (alertable && result == X_STATUS_USER_APC) {
       XThread::GetCurrentThread()->DeliverAPCs();
     }
@@ -901,9 +962,14 @@ ppc_u32_result_t KeWaitForMultipleObjects_entry(ppc_u32_t count, ppc_pu32_t obje
   }
 
   uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
+  const uint32_t first_handle = objects.empty() ? 0 : objects[0]->handle();
+  freeze_logger::RecordWaitBegin(first_handle,
+                                 objects.empty() ? 0 : (uint32_t)objects[0]->type(),
+                                 objects.empty() ? "" : objects[0]->name().c_str(), GuestLr());
   X_STATUS result = XObject::WaitMultiple(
       uint32_t(objects.size()), reinterpret_cast<XObject**>(objects.data()), wait_type, wait_reason,
       processor_mode, alertable, timeout_ptr ? &timeout : nullptr);
+  freeze_logger::RecordWaitEnd(first_handle);
   if (alertable && result == X_STATUS_USER_APC) {
     XThread::GetCurrentThread()->DeliverAPCs();
   }
@@ -925,8 +991,13 @@ uint32_t xeNtWaitForMultipleObjectsEx(uint32_t count, rex::be<uint32_t>* handles
     objects.push_back(std::move(object));
   }
 
+  const uint32_t first_handle = objects.empty() ? 0 : objects[0]->handle();
+  freeze_logger::RecordWaitBegin(first_handle,
+                                 objects.empty() ? 0 : (uint32_t)objects[0]->type(),
+                                 objects.empty() ? "" : objects[0]->name().c_str(), GuestLr());
   auto result = XObject::WaitMultiple(count, reinterpret_cast<XObject**>(objects.data()), wait_type,
                                       6, wait_mode, alertable, timeout_ptr);
+  freeze_logger::RecordWaitEnd(first_handle);
   if (alertable && result == X_STATUS_USER_APC) {
     XThread::GetCurrentThread()->DeliverAPCs();
   }
@@ -950,8 +1021,14 @@ ppc_u32_result_t NtSignalAndWaitForSingleObjectEx_entry(ppc_u32_t signal_handle,
   auto wait_object = REX_KERNEL_OBJECTS()->LookupObject<XObject>(wait_handle);
   if (signal_object && wait_object) {
     uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
+    freeze_logger::RecordSyncEvent(freeze_logger::SyncType::kEventSet, signal_handle,
+                                   (uint32_t)signal_object->type(),
+                                   signal_object->name().c_str());
+    freeze_logger::RecordWaitBegin(wait_handle, (uint32_t)wait_object->type(),
+                                   wait_object->name().c_str(), GuestLr());
     result = XObject::SignalAndWait(signal_object.get(), wait_object.get(), 3, 1, alertable,
                                     timeout_ptr ? &timeout : nullptr);
+    freeze_logger::RecordWaitEnd(wait_handle);
   } else {
     result = X_STATUS_INVALID_HANDLE;
   }
@@ -980,7 +1057,7 @@ static void xeKfLowerIrql(PPCContext* ctx, unsigned char new_irql) {
   pcr->current_irql = new_irql;
 }
 
-// Guest-memory spinlock helpers - store PCR address as owner (matching xenia).
+// Guest-memory spinlock helpers - store PCR address as owner (matching runtime).
 // PPCContext* provides r13 (PCR address) without needing XThread::GetCurrentThread().
 uint32_t xeKeKfAcquireSpinLock(PPCContext* ctx, X_KSPINLOCK* lock, bool change_irql) {
   uint32_t old_irql = change_irql ? xeKfRaiseIrql(ctx, IRQL_DISPATCH) : 0;
@@ -1144,7 +1221,7 @@ void NtQueueApcThread_entry(ppc_u32_t thread_handle, ppc_pvoid_t apc_routine,
     mem->SystemHeapFree(apc_ptr);
     return;
   }
-  // Match Edge/Canary behavior: callback is only a wakeup hint.
+  // Match the reference behavior: callback is only a wakeup hint.
   // APC delivery happens via alertable wait handling.
   thread->thread()->QueueUserCallback([]() {});
 }

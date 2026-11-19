@@ -266,7 +266,7 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
       desired_access & FileAccess::kFileWriteData || desired_access & FileAccess::kFileAppendData;
   if (wants_write &&
       ((parent_entry && parent_entry->is_read_only()) || (entry && entry->is_read_only()))) {
-    // Match Xenia behavior: downgrade to read access instead of failing.
+    // Match console behavior: downgrade to read access instead of failing.
     REXFS_WARN("Attempted to open read-only file/dir for write: {}", path);
     desired_access = FileAccess::kGenericRead | FileAccess::kFileReadData;
   }

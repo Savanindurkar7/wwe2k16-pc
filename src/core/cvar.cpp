@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -17,6 +18,7 @@
 #include <CLI/CLI.hpp>
 
 #include <rex/cvar.h>
+#include <rex/filesystem.h>
 #include <rex/logging.h>
 
 #include <toml++/toml.hpp>
@@ -345,7 +347,8 @@ void UnregisterChangeCallbacks(std::string_view name) {
 // Initialization
 //=============================================================================
 
-std::vector<std::string> Init(int argc, char** argv) {
+InitResult Init(int argc, char** argv) {
+  InitResult result;
   CLI::App app{"", ""};
   app.allow_extras();
 
@@ -357,34 +360,57 @@ std::vector<std::string> Init(int argc, char** argv) {
           entry.description);
     } else {
       app.add_option_function<std::string>(
-          "--" + entry.name, [&entry](const std::string& val) { entry.setter(val); },
+          "--" + entry.name,
+          [&entry](const std::string& val) {
+            if (!entry.setter(val)) {
+              throw CLI::ConversionError("Invalid value '" + val + "' for --" + entry.name);
+            }
+          },
           entry.description);
     }
   }
 
   try {
     app.parse(argc, argv);
+    result.remaining = app.remaining();
+  } catch (const CLI::Success& e) {
+    app.exit(e);
+    result.exit_requested = true;
   } catch (const CLI::ParseError& e) {
-    // TODO(tomc): dumb workaround for the stupid chicken and its egg.
-    //             dont call rex logging funcs here for now.
-    fprintf(stderr, "cvar: CLI11  parse error: %s\n", e.what());
+    result.parse_error = e.what();
   }
 
-  return app.remaining();
+  return result;
 }
 
 void LoadConfig(const std::filesystem::path& config_path) {
   if (!std::filesystem::exists(config_path)) {
-    REXLOG_DEBUG("Config file not found: {}", config_path.string());
+    REXLOG_DEBUG("Config file not found: {}", rex::path_to_utf8(config_path));
     return;
   }
 
   try {
-    auto config = toml::parse_file(config_path.string());
+    // Read through rex::filesystem::OpenFile so a config file under a
+    // non-ANSI directory works on Windows (toml::parse_file opens the name
+    // with narrow stdio).  The bytes are parsed as UTF-8.
+    FILE* file = rex::filesystem::OpenFile(config_path, "rb");
+    if (!file) {
+      REXLOG_ERROR("Failed to open config {}", rex::path_to_utf8(config_path));
+      return;
+    }
+    std::string contents;
+    char buffer[65536];
+    size_t read_count;
+    while ((read_count = std::fread(buffer, 1, sizeof(buffer), file)) > 0) {
+      contents.append(buffer, read_count);
+    }
+    std::fclose(file);
+
+    auto config = toml::parse(contents, rex::path_to_utf8(config_path));
     ApplyTomlTable(config, "");
-    REXLOG_INFO("Loaded config from {}", config_path.string());
+    REXLOG_INFO("Loaded config from {}", rex::path_to_utf8(config_path));
   } catch (const toml::parse_error& err) {
-    REXLOG_ERROR("Failed to parse config {}: {}", config_path.string(), err.what());
+    REXLOG_ERROR("Failed to parse config {}: {}", rex::path_to_utf8(config_path), err.what());
   }
 }
 
@@ -428,12 +454,12 @@ void SaveConfig(const std::filesystem::path& config_path) {
   try {
     std::ofstream file(config_path);
     if (!file) {
-      REXLOG_ERROR("SaveConfig: failed to open {}", config_path.string());
+      REXLOG_ERROR("SaveConfig: failed to open {}", rex::path_to_utf8(config_path));
       return;
     }
     file << "# Auto-generated cvar configuration\n";
     file << content;
-    REXLOG_INFO("Saved config to {}", config_path.string());
+    REXLOG_INFO("Saved config to {}", rex::path_to_utf8(config_path));
   } catch (const std::exception& e) {
     REXLOG_ERROR("SaveConfig: {}", e.what());
   }

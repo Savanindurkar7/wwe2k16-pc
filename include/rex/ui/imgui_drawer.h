@@ -55,6 +55,13 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
 
   void Draw(UIDrawContext& ui_draw_context) override;
 
+  // For dialogs that draw images: textures come from the immediate drawer (an ImmediateTexture* is the
+  // ImTextureID). Null until the presenter is attached.
+  ImmediateDrawer* immediate_drawer() const { return immediate_drawer_; }
+
+  // Re-uploads the font atlas after fonts were added with GetIO().Fonts (UI thread).
+  void RebuildFontTexture();
+
  protected:
   void OnKeyDown(KeyEvent& e) override;
   void OnKeyUp(KeyEvent& e) override;

@@ -40,7 +40,8 @@ namespace rex {
  * Initialize the logging system with full configuration.
  *
  * Creates shared sinks and loggers for all built-in categories.
- * Safe to call multiple times; subsequent calls update levels only.
+ * Safe to call multiple times; subsequent calls update levels, may add a
+ * requested console sink, and replace the file sink when its path changes.
  *
  * @param config  Logging configuration.
  */
@@ -59,6 +60,12 @@ void InitLogging(const char* log_file = nullptr,
  * Flush all loggers and shut down the logging system.
  */
 void ShutdownLogging();
+
+/** Flush all active logger sinks without shutting the logging system down. */
+void FlushLogging();
+
+/** Return the active file sink path, or an empty string if file logging is disabled. */
+std::string GetLogFilePath();
 
 /**
  * Register a new log category at runtime.

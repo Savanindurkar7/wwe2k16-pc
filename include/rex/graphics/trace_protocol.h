@@ -113,10 +113,12 @@ struct MemoryCommand {
   uint32_t decoded_length;
 };
 
-// Represents a full 10 MB snapshot of EDRAM contents, for trace initialization
-// (since replaying the trace will reconstruct its state at any point later) as
-// a sequence of tiles with row-major samples (2x multisampling as 1x2 samples,
-// 4x as 2x2 samples).
+// Represents a full snapshot of the configured EDRAM contents (10 MiB by
+// default; up to 20 MiB for the explicit 4096-tile model), for trace
+// initialization (since replaying the trace will reconstruct its state at any
+// point later) as a sequence of tiles with row-major samples (2x multisampling
+// as 1x2 samples, 4x as 2x2 samples). encoded_length lets old 10 MiB traces be
+// distinguished from snapshots captured with the larger model.
 struct EdramSnapshotCommand {
   TraceCommandType type;
   // Encoding format of the data in the trace file.

@@ -211,7 +211,7 @@ int XSocket::Send(const uint8_t* buf, uint32_t buf_len, uint32_t flags) {
 int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_IN* to,
                     uint32_t to_len) {
   // Send 2 copies of the packet: One to XNet (for network security) and an
-  // unencrypted copy for other Xenia hosts.
+  // unencrypted copy for other the runtime hosts.
   // TODO(DrChat): Enable when I commit XNet.
   /*
   auto xam = kernel_state()->GetKernelModule<xam::XamModule>("xam.xex");

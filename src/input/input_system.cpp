@@ -41,6 +41,7 @@ void InputSystem::Shutdown() {
 }
 
 void InputSystem::AddDriver(std::unique_ptr<InputDriver> driver) {
+  driver->SetTextEntryTarget(GetTextEntryTarget());
   drivers_.push_back(std::move(driver));
 }
 
@@ -54,6 +55,13 @@ void InputSystem::AttachWindow(rex::ui::Window* window) {
 void InputSystem::SetActiveCallback(std::function<bool()> callback) {
   for (auto& driver : drivers_) {
     driver->set_is_active_callback(callback);
+  }
+}
+
+void InputSystem::SetTextEntryTarget(TextEntryTarget* target) {
+  text_entry_target_.store(target, std::memory_order_release);
+  for (auto& driver : drivers_) {
+    driver->SetTextEntryTarget(target);
   }
 }
 
@@ -152,7 +160,7 @@ X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
     if (result != X_ERROR_DEVICE_NOT_CONNECTED) {
       any_connected = true;
     }
-    if (result == X_ERROR_SUCCESS || result == X_ERROR_EMPTY) {
+    if (result == X_ERROR_SUCCESS) {
       return result;
     }
   }

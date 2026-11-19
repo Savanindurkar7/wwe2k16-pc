@@ -10,6 +10,11 @@
  */
 
 #include <algorithm>
+#include <map>
+#include <string>
+#include <tuple>
+#include <vector>
+#include <atomic>
 #include <cstdint>
 #include <utility>
 
@@ -261,6 +266,7 @@ void TextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_inde
       REXCVAR_GET(texture_cache_memory_limit_hard) + limit_scaled_resolve_add_mb;
   uint32_t limit_soft_lifetime = REXCVAR_GET(texture_cache_memory_limit_soft_lifetime) * 1000;
   bool destroyed_any = false;
+  uint32_t destroyed_over_hard = 0;
   while (texture_used_first_ != nullptr) {
     uint64_t total_host_memory_usage_mb =
         (textures_total_host_memory_usage_ + ((UINT32_C(1) << 20) - 1)) >> 20;
@@ -274,6 +280,9 @@ void TextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_inde
     }
     if (!limit_hard_exceeded && (texture->last_usage_time() + limit_soft_lifetime) > current_time) {
       break;
+    }
+    if (limit_hard_exceeded) {
+      ++destroyed_over_hard;
     }
     if (!destroyed_any) {
       destroyed_any = true;
@@ -296,6 +305,20 @@ void TextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_inde
   if (destroyed_any) {
     COUNT_profile_set("gpu/texture_cache/textures", textures_.size());
   }
+  // Textures destroyed because the hard limit was exceeded are reloaded as soon as they are used again: at a high
+  // resolution scale this can mean reloading render-to-texture targets every frame. Logged every 5 s at most.
+  if (destroyed_over_hard) {
+    static uint64_t last_log_ms = 0;
+    static uint32_t pending = 0;
+    pending += destroyed_over_hard;
+    if (current_time - last_log_ms >= 5000) {
+      REXGPU_WARN("[texture-cache] {} textures evicted over the hard limit in {} s (usage {} MB, hard limit {} MB)",
+                  pending, last_log_ms ? (current_time - last_log_ms) / 1000 : 0,
+                  (textures_total_host_memory_usage_ + ((UINT32_C(1) << 20) - 1)) >> 20, limit_hard_mb);
+      pending = 0;
+      last_log_ms = current_time;
+    }
+  }
 }
 
 void TextureCache::BeginSubmission(uint64_t new_submission_index) {
@@ -311,19 +334,32 @@ void TextureCache::BeginFrame() {
   ResetTextureBindings();
 }
 
-void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_unscaled) {
+void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_unscaled,
+                                       uint32_t pixel_size_log2, bool scaled) {
   if (length_unscaled == 0) {
     return;
   }
   start_unscaled &= 0x1FFFFFFF;
   length_unscaled = std::min(length_unscaled, 0x20000000 - start_unscaled);
 
-  if (IsDrawResolutionScaled()) {
+  if (!IsDrawResolutionScaled()) {
+    shared_memory().RangeWrittenByGpu(start_unscaled, length_unscaled);
+    return;
+  }
+  if (!scaled || pixel_size_log2 > 3) {
+    MarkRangeAsUnscaledGpuWrite(start_unscaled, length_unscaled);
+    return;
+  }
+  // Keep invalidation and replacement of the scaled-resolve metadata atomic
+  // with respect to CPU memory writes and range queries.
+  auto global_lock = global_critical_region_.Acquire();
+  shared_memory().RangeWrittenByGpu(start_unscaled, length_unscaled);
+
+  {
     uint32_t page_first = start_unscaled >> 12;
     uint32_t page_last = (start_unscaled + length_unscaled - 1) >> 12;
     uint32_t block_first = page_first >> 5;
     uint32_t block_last = page_last >> 5;
-    auto global_lock = global_critical_region_.Acquire();
     for (uint32_t i = block_first; i <= block_last; ++i) {
       uint32_t add_bits = UINT32_MAX;
       if (i == block_first) {
@@ -335,11 +371,210 @@ void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_
       scaled_resolve_pages_[i] |= add_bits;
       scaled_resolve_pages_l2_[i >> 6] |= UINT64_C(1) << (i & 63);
     }
+
+    const uint32_t end_unscaled = start_unscaled + length_unscaled;
+    RemoveUnscaledGpuWriteRanges(start_unscaled, end_unscaled - 1);
+    std::vector<ScaledResolveRange> updated_ranges;
+    updated_ranges.reserve(scaled_resolve_ranges_.size() + 1);
+    for (const ScaledResolveRange& range : scaled_resolve_ranges_) {
+      const uint32_t range_end = range.start + range.length;
+      if (range_end <= start_unscaled || range.start >= end_unscaled) {
+        updated_ranges.push_back(range);
+        continue;
+      }
+      if (range.start < start_unscaled) {
+        updated_ranges.push_back(
+            {range.start, start_unscaled - range.start, range.pixel_size_log2});
+      }
+      if (range_end > end_unscaled) {
+        updated_ranges.push_back(
+            {end_unscaled, range_end - end_unscaled, range.pixel_size_log2});
+      }
+    }
+    auto insertion = std::lower_bound(
+        updated_ranges.begin(), updated_ranges.end(), start_unscaled,
+        [](const ScaledResolveRange& range, uint32_t start) { return range.start < start; });
+    updated_ranges.insert(insertion, {start_unscaled, length_unscaled, pixel_size_log2});
+
+    scaled_resolve_ranges_.clear();
+    scaled_resolve_ranges_.reserve(updated_ranges.size());
+    for (const ScaledResolveRange& range : updated_ranges) {
+      if (!scaled_resolve_ranges_.empty()) {
+        ScaledResolveRange& previous = scaled_resolve_ranges_.back();
+        if (previous.start + previous.length == range.start &&
+            previous.pixel_size_log2 == range.pixel_size_log2) {
+          previous.length += range.length;
+          continue;
+        }
+      }
+      scaled_resolve_ranges_.push_back(range);
+    }
+  }
+}
+
+void TextureCache::GetScaledResolveRanges(uint32_t start_unscaled, uint32_t length_unscaled,
+                                          std::vector<ScaledResolveRange>& ranges_out) {
+  ranges_out.clear();
+  if (!IsDrawResolutionScaled() || !length_unscaled ||
+      start_unscaled >= SharedMemory::kBufferSize) {
+    return;
+  }
+  length_unscaled = std::min(length_unscaled, SharedMemory::kBufferSize - start_unscaled);
+  const uint64_t end_unscaled = uint64_t(start_unscaled) + length_unscaled;
+  auto global_lock = global_critical_region_.Acquire();
+  for (const ScaledResolveRange& range : scaled_resolve_ranges_) {
+    const uint64_t range_end = uint64_t(range.start) + range.length;
+    if (range_end <= start_unscaled) {
+      continue;
+    }
+    if (range.start >= end_unscaled) {
+      break;
+    }
+    uint32_t intersection_start = std::max(start_unscaled, range.start);
+    uint32_t intersection_end = uint32_t(std::min(end_unscaled, range_end));
+    ranges_out.push_back(
+        {intersection_start, intersection_end - intersection_start, range.pixel_size_log2});
+  }
+}
+
+void TextureCache::GetUnscaledGpuWriteRanges(
+    uint32_t start_unscaled, uint32_t length_unscaled,
+    std::vector<std::pair<uint32_t, uint32_t>>& ranges_out) {
+  ranges_out.clear();
+  if (!IsDrawResolutionScaled() || !length_unscaled ||
+      start_unscaled >= SharedMemory::kBufferSize) {
+    return;
+  }
+  length_unscaled = std::min(length_unscaled, SharedMemory::kBufferSize - start_unscaled);
+  const uint64_t end_unscaled = uint64_t(start_unscaled) + length_unscaled;
+  auto global_lock = global_critical_region_.Acquire();
+  for (const auto& range : unscaled_gpu_write_ranges_) {
+    const uint64_t range_end = uint64_t(range.first) + range.second;
+    if (range_end <= start_unscaled) {
+      continue;
+    }
+    if (range.first >= end_unscaled) {
+      break;
+    }
+    uint32_t intersection_start = std::max(start_unscaled, range.first);
+    uint32_t intersection_end = uint32_t(std::min(end_unscaled, range_end));
+    ranges_out.emplace_back(intersection_start, intersection_end - intersection_start);
+  }
+}
+
+void TextureCache::RemoveScaledResolveRanges(uint32_t address_first, uint32_t address_last) {
+  const uint64_t invalidation_end = uint64_t(address_last) + 1;
+  std::vector<ScaledResolveRange> updated_ranges;
+  updated_ranges.reserve(scaled_resolve_ranges_.size());
+  for (const ScaledResolveRange& range : scaled_resolve_ranges_) {
+    const uint64_t range_end = uint64_t(range.start) + range.length;
+    if (range_end <= address_first || range.start >= invalidation_end) {
+      updated_ranges.push_back(range);
+      continue;
+    }
+    if (range.start < address_first) {
+      updated_ranges.push_back(
+          {range.start, address_first - range.start, range.pixel_size_log2});
+    }
+    if (range_end > invalidation_end) {
+      updated_ranges.push_back({uint32_t(invalidation_end),
+                                uint32_t(range_end - invalidation_end), range.pixel_size_log2});
+    }
+  }
+  scaled_resolve_ranges_.swap(updated_ranges);
+}
+
+void TextureCache::RemoveUnscaledGpuWriteRanges(uint32_t address_first, uint32_t address_last) {
+  const uint64_t invalidation_end = uint64_t(address_last) + 1;
+  std::vector<std::pair<uint32_t, uint32_t>> updated_ranges;
+  updated_ranges.reserve(unscaled_gpu_write_ranges_.size());
+  for (const auto& range : unscaled_gpu_write_ranges_) {
+    const uint64_t range_end = uint64_t(range.first) + range.second;
+    if (range_end <= address_first || range.first >= invalidation_end) {
+      updated_ranges.push_back(range);
+      continue;
+    }
+    if (range.first < address_first) {
+      updated_ranges.emplace_back(range.first, address_first - range.first);
+    }
+    if (range_end > invalidation_end) {
+      updated_ranges.emplace_back(uint32_t(invalidation_end),
+                                  uint32_t(range_end - invalidation_end));
+    }
+  }
+  unscaled_gpu_write_ranges_.swap(updated_ranges);
+}
+
+void TextureCache::MarkRangeAsUnscaledGpuWrite(uint32_t start_unscaled,
+                                               uint32_t length_unscaled) {
+  if (!IsDrawResolutionScaled() || !length_unscaled ||
+      start_unscaled >= SharedMemory::kBufferSize) {
+    if (!IsDrawResolutionScaled()) {
+      shared_memory().RangeWrittenByGpu(start_unscaled, length_unscaled);
+    }
+    return;
+  }
+  length_unscaled = std::min(length_unscaled, SharedMemory::kBufferSize - start_unscaled);
+  uint32_t page_first = start_unscaled >> 12;
+  uint32_t page_last = (start_unscaled + length_unscaled - 1) >> 12;
+  auto global_lock = global_critical_region_.Acquire();
+  shared_memory().RangeWrittenByGpu(start_unscaled, length_unscaled);
+
+  if (!start_unscaled && length_unscaled == SharedMemory::kBufferSize) {
+    scaled_resolve_ranges_.clear();
+    unscaled_gpu_write_ranges_.clear();
+    unscaled_gpu_write_ranges_.emplace_back(0, SharedMemory::kBufferSize);
+    std::memset(scaled_resolve_pages_.get(), 0,
+                (SharedMemory::kBufferSize / 4096 / 32) * sizeof(uint32_t));
+    std::memset(scaled_resolve_pages_l2_, 0, sizeof(scaled_resolve_pages_l2_));
+    return;
   }
 
-  // Invalidate textures. Toggling individual textures between scaled and
-  // unscaled also relies on invalidation through shared memory.
-  shared_memory().RangeWrittenByGpu(start_unscaled, length_unscaled);
+  RemoveScaledResolveRanges(start_unscaled, start_unscaled + length_unscaled - 1);
+  RemoveUnscaledGpuWriteRanges(start_unscaled, start_unscaled + length_unscaled - 1);
+  for (uint32_t page = page_first; page <= page_last; ++page) {
+    uint32_t block = page >> 5;
+    scaled_resolve_pages_[block] &= ~(UINT32_C(1) << (page & 31));
+    if (!scaled_resolve_pages_[block]) {
+      scaled_resolve_pages_l2_[block >> 6] &= ~(UINT64_C(1) << (block & 63));
+    }
+  }
+
+  uint64_t page_range_start = uint64_t(page_first) << 12;
+  uint64_t page_range_end = (uint64_t(page_last) + 1) << 12;
+  for (const ScaledResolveRange& range : scaled_resolve_ranges_) {
+    uint64_t range_end = uint64_t(range.start) + range.length;
+    if (range_end <= page_range_start || range.start >= page_range_end) {
+      continue;
+    }
+    uint32_t surviving_page_first = std::max(page_first, range.start >> 12);
+    uint32_t surviving_page_last =
+        std::min(page_last, uint32_t((range_end - 1) >> 12));
+    for (uint32_t page = surviving_page_first; page <= surviving_page_last; ++page) {
+      uint32_t block = page >> 5;
+      scaled_resolve_pages_[block] |= UINT32_C(1) << (page & 31);
+      scaled_resolve_pages_l2_[block >> 6] |= UINT64_C(1) << (block & 63);
+    }
+  }
+
+  uint32_t end_unscaled = start_unscaled + length_unscaled;
+  auto insertion = std::lower_bound(
+      unscaled_gpu_write_ranges_.begin(), unscaled_gpu_write_ranges_.end(), start_unscaled,
+      [](const std::pair<uint32_t, uint32_t>& range, uint32_t start) {
+        return range.first < start;
+      });
+  unscaled_gpu_write_ranges_.insert(insertion, {start_unscaled, length_unscaled});
+  std::vector<std::pair<uint32_t, uint32_t>> merged_ranges;
+  merged_ranges.reserve(unscaled_gpu_write_ranges_.size());
+  for (const auto& range : unscaled_gpu_write_ranges_) {
+    if (!merged_ranges.empty() &&
+        uint64_t(merged_ranges.back().first) + merged_ranges.back().second == range.first) {
+      merged_ranges.back().second += range.second;
+    } else {
+      merged_ranges.push_back(range);
+    }
+  }
+  unscaled_gpu_write_ranges_.swap(merged_ranges);
 }
 
 uint32_t TextureCache::GuestToHostSwizzle(uint32_t guest_swizzle, uint32_t host_format_swizzle) {
@@ -439,6 +674,43 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
   // not up to date anymore.
   texture.MakeUpToDateAndWatch(global_critical_region_.Acquire());
   texture.LogAction("Loaded");
+
+  // Diagnostic (WWE2K16_GPU_STATS=1): every 5 s, how many textures were (re)loaded and which ones most often.
+  static const bool gpu_stats = [] {
+    const char* v = std::getenv("WWE2K16_GPU_STATS");
+    return v && v[0] == '1';
+  }();
+  if (gpu_stats) {
+    static std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>, uint32_t> loads;
+    static uint64_t window_start = 0;
+    static uint64_t bytes = 0;
+    loads[{uint32_t(texture_key.width_minus_1) + 1, uint32_t(texture_key.height_minus_1) + 1, uint32_t(texture_key.format),
+           uint32_t(texture_key.scaled_resolve), uint32_t(texture_key.base_page)}]++;
+    bytes += texture.GetGuestBaseSize();
+    const uint64_t now = rex::chrono::Clock::QueryHostUptimeMillis();
+    if (!window_start) window_start = now;
+    if (now - window_start >= 5000) {
+      std::vector<std::pair<uint32_t, std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>>> top;
+      uint32_t total = 0, scaled = 0;
+      for (auto& [k, c] : loads) {
+        top.push_back({c, k});
+        total += c;
+        if (std::get<3>(k)) scaled += c;
+      }
+      std::sort(top.begin(), top.end(), [](auto& a, auto& b) { return a.first > b.first; });
+      std::string s;
+      for (size_t i = 0; i < top.size() && i < 8; ++i) {
+        auto& [c, k] = top[i];
+        s += fmt::format(" {}x{} fmt{}{} @{:05X}:{}", std::get<0>(k), std::get<1>(k), std::get<2>(k),
+                         std::get<3>(k) ? " scaled" : "", std::get<4>(k), c);
+      }
+      REXGPU_INFO("[gpu-stats] texture loads in {} s: {} ({} scaled resolve, {} MB guest){}", (now - window_start) / 1000,
+                  total, scaled, bytes >> 20, s);
+      loads.clear();
+      bytes = 0;
+      window_start = now;
+    }
+  }
 
   return true;
 }
@@ -892,6 +1164,80 @@ bool TextureCache::LoadTextureData(Texture& texture) {
   return CommitPreparedTextureLoad(pending_load);
 }
 
+namespace {
+
+// The real Xenos hardware binds texture fetch constants with the "invalid"
+// type if the rest of the descriptor is usable - the game writes such
+// descriptors, but the type field doesn't stop the hardware from sampling
+// them. Accept them only when they are self-consistent, so garbage descriptors
+// are still rejected by BindingInfoFromFetchConstant below.
+bool IsSelfConsistentInvalidTextureFetch(const xenos::xe_gpu_texture_fetch_t& fetch) {
+  // The base address must point somewhere.
+  if (fetch.base_address == 0) {
+    return false;
+  }
+  // The size fields are stored with 1 subtracted from each component. Reject
+  // zero dimensions and dimensions beyond the hardware limits of the
+  // dimension. The 1D width limit mirrors the check in
+  // BindingInfoFromFetchConstant.
+  uint32_t width;
+  switch (fetch.dimension) {
+    case xenos::DataDimension::k1D:
+      width = fetch.size_1d.width + 1;
+      if (width == 0 || width > xenos::kTexture1DMaxWidth) {
+        return false;
+      }
+      break;
+    case xenos::DataDimension::k2DOrStacked: {
+      width = fetch.size_2d.width + 1;
+      uint32_t height = fetch.size_2d.height + 1;
+      uint32_t depth_or_array_size = fetch.stacked ? fetch.size_2d.stack_depth + 1 : 1;
+      if (width == 0 || height == 0 || width > xenos::kTexture2DCubeMaxWidthHeight ||
+          height > xenos::kTexture2DCubeMaxWidthHeight ||
+          depth_or_array_size > xenos::kTexture2DMaxStackDepth) {
+        return false;
+      }
+    } break;
+    case xenos::DataDimension::k3D: {
+      width = fetch.size_3d.width + 1;
+      uint32_t height = fetch.size_3d.height + 1;
+      uint32_t depth = fetch.size_3d.depth + 1;
+      if (width == 0 || height == 0 || depth == 0 ||
+          width > xenos::kTexture3DMaxWidthHeight || height > xenos::kTexture3DMaxWidthHeight ||
+          depth > xenos::kTexture3DMaxDepth) {
+        return false;
+      }
+    } break;
+    case xenos::DataDimension::kCube: {
+      width = fetch.size_2d.width + 1;
+      uint32_t height = fetch.size_2d.height + 1;
+      if (width == 0 || height == 0 || width > xenos::kTexture2DCubeMaxWidthHeight ||
+          height > xenos::kTexture2DCubeMaxWidthHeight) {
+        return false;
+      }
+    } break;
+    default:
+      return false;
+  }
+  // The format must be one that the texture system knows about (the 6-bit
+  // field always has a table entry, but keep the guard).
+  const FormatInfo* format_info = FormatInfo::Get(fetch.format);
+  if (format_info == nullptr) {
+    return false;
+  }
+  // The pitch is in pixels >> 5, and may legitimately exceed the aligned
+  // width, but it must be able to cover at least the block-aligned width, and
+  // the field is 9 bits wide.
+  uint32_t pitch = fetch.pitch;
+  if (pitch > ((UINT32_C(1) << 9) - 1) ||
+      (pitch << 5) < rex::align(width, format_info->block_width)) {
+    return false;
+  }
+  return true;
+}
+
+}  // namespace
+
 void TextureCache::BindingInfoFromFetchConstant(const xenos::xe_gpu_texture_fetch_t& fetch,
                                                 TextureKey& key_out, uint8_t* swizzled_signs_out) {
   // Reset the key and the signedness.
@@ -907,10 +1253,21 @@ void TextureCache::BindingInfoFromFetchConstant(const xenos::xe_gpu_texture_fetc
       if (REXCVAR_GET(gpu_allow_invalid_fetch_constants)) {
         break;
       }
+      if (IsSelfConsistentInvalidTextureFetch(fetch)) {
+        static std::atomic_flag accepted_invalid_texture_logged = ATOMIC_FLAG_INIT;
+        if (!accepted_invalid_texture_logged.test_and_set(std::memory_order_relaxed)) {
+          REXGPU_DEBUG(
+              "Texture fetch constant ({:08X} {:08X} {:08X} {:08X} {:08X} {:08X}) has "
+              "\"invalid\" type, but is self-consistent - accepting it as a texture.",
+              fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_3, fetch.dword_4,
+              fetch.dword_5);
+        }
+        break;
+      }
       REXGPU_WARN(
           "Texture fetch constant ({:08X} {:08X} {:08X} {:08X} {:08X} {:08X}) "
           "has \"invalid\" type! This is incorrect behavior, but you can try "
-          "bypassing this by launching Xenia with "
+          "bypassing this by launching with "
           "--gpu_allow_invalid_fetch_constants=true.",
           fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_3, fetch.dword_4, fetch.dword_5);
       return;
@@ -936,7 +1293,7 @@ void TextureCache::BindingInfoFromFetchConstant(const xenos::xe_gpu_texture_fetc
     // TODO(Triang3l): Support long 1D textures.
     if (width_minus_1 >= xenos::kTexture2DCubeMaxWidthHeight) {
       REXGPU_ERROR(
-          "1D texture is too wide ({}) - ignoring! Report the game to Xenia "
+          "1D texture is too wide ({}) - ignoring! Please report this "
           "developers",
           width_minus_1 + 1);
       is_invalid_1d = true;
@@ -945,7 +1302,7 @@ void TextureCache::BindingInfoFromFetchConstant(const xenos::xe_gpu_texture_fetc
     if (fetch.tiled) {
       REXGPU_ERROR(
           "1D texture has tiling enabled in the fetch constant, but this "
-          "appears to be completely wrong - ignoring! Report the game to Xenia "
+          "appears to be completely wrong - ignoring! Please report this "
           "developers");
       is_invalid_1d = true;
     }
@@ -953,7 +1310,7 @@ void TextureCache::BindingInfoFromFetchConstant(const xenos::xe_gpu_texture_fetc
     if (fetch.packed_mips) {
       REXGPU_ERROR(
           "1D texture has packed mips enabled in the fetch constant, but this "
-          "appears to be completely wrong - ignoring! Report the game to Xenia "
+          "appears to be completely wrong - ignoring! Please report this "
           "developers");
       is_invalid_1d = true;
     }
@@ -1069,10 +1426,11 @@ void TextureCache::ScaledResolveGlobalWatchCallback(
     uint32_t address_last, bool invalidated_by_gpu) {
   assert_true(IsDrawResolutionScaled());
   if (invalidated_by_gpu) {
-    // Resolves themselves do exactly the opposite of what this should do.
+    // GPU writes are tracked explicitly by their call sites - resolve writes
+    // may preserve scaled data, while memexports invalidate it.
     return;
   }
-  // Mark scaled resolve ranges as non-scaled. Textures themselves will be
+  // CPU writes invalidate scaled resolve contents. Textures themselves will be
   // invalidated by their shared memory watches.
   uint32_t resolve_page_first = address_first >> 12;
   uint32_t resolve_page_last = address_last >> 12;
@@ -1106,6 +1464,8 @@ void TextureCache::ScaledResolveGlobalWatchCallback(
       }
     }
   }
+  RemoveScaledResolveRanges(address_first, address_last);
+  RemoveUnscaledGpuWriteRanges(address_first, address_last);
 }
 
 }  // namespace rex::graphics

@@ -12,6 +12,8 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <mutex>
+
 #include <rex/filesystem/device.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
@@ -21,6 +23,7 @@
 #include <rex/system/info/file.h>
 #include <rex/system/info/volume.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/thread_state.h>
 #include <rex/system/util/string_utils.h>
 #include <rex/system/xevent.h>
 #include <rex/system/xfile.h>
@@ -29,6 +32,8 @@
 #include <rex/system/xthread.h>
 #include <rex/system/xtypes.h>
 #include <rex/thread/mutex.h>
+
+#include "xboxkrnl_io_info_helpers.h"
 
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
@@ -151,12 +156,28 @@ ppc_u32_result_t NtQueryInformationFile_entry(ppc_u32_t file_handle,
       break;
     }
     case XFileXctdCompressionInformation: {
-      REXKRNL_ERROR(
-          "NtQueryInformationFile(XFileXctdCompressionInformation) "
-          "unimplemented");
-      // Files that are XCTD compressed begin with the magic 0x0FF512ED but we
-      // shouldn't detect this that way. There's probably a flag somewhere
-      // (attributes?) that defines if it's compressed or not.
+      // Returns INVALID_PARAMETER for this query, the reference behaviour. Keep the
+      // once-per-session warning useful for identifying the indirect guest
+      // caller without changing that reference behavior.
+      static std::once_flag xctd_logged;
+      const auto* thread_state = rex::runtime::ThreadState::Get();
+      const auto* context = thread_state ? thread_state->context() : nullptr;
+      const bool has_guest_context = context != nullptr;
+      const uint32_t guest_lr = has_guest_context ? static_cast<uint32_t>(context->lr) : 0;
+      std::call_once(xctd_logged, [has_guest_context, guest_lr, file] {
+        if (has_guest_context) {
+          REXKRNL_WARN(
+              "NtQueryInformationFile(XFileXctdCompressionInformation) returns "
+              "INVALID_PARAMETER (logged once; guest caller LR/return={:#010x}, path='{}')",
+              guest_lr, file->path());
+        } else {
+          REXKRNL_WARN(
+              "NtQueryInformationFile(XFileXctdCompressionInformation) returns "
+              "INVALID_PARAMETER (logged once; guest caller LR unavailable: no bound "
+              "guest PPCContext; path='{}')",
+              file->path());
+        }
+      });
       status = X_STATUS_INVALID_PARAMETER;
       out_length = 0;
       break;
@@ -435,10 +456,12 @@ ppc_u32_result_t NtQueryVolumeInformationFile_entry(
     }
     case XFileFsDeviceInformation: {
       auto info = info_ptr.as<X_FILE_FS_DEVICE_INFORMATION*>();
-      REXKRNL_WARN("Stub XFileFsDeviceInformation!");
-      info->device_type = FILE_DEVICE_UNKNOWN;
-      info->characteristics = 0;
-      out_length = sizeof(X_FILE_FS_DEVICE_INFORMATION);
+      static std::once_flag device_info_logged;
+      std::call_once(device_info_logged, [] {
+        REXKRNL_DEBUG("XFileFsDeviceInformation: reporting host disk device (logged once)");
+      });
+      internal::PopulateHostDiskFsDeviceInformation(*info);
+      out_length = sizeof(*info);
       break;
     }
     default: {

@@ -83,7 +83,7 @@ enum class PrimitiveType : uint32_t {
   // tessellation factors in the "index buffer" reused for tessellation factors,
   // which is the patch count multiplied by the edge count (if num_indices is
   // multiplied further by 4 for quad patches for the ground in 4D5307F2, for
-  // example, some incorrect patches are drawn, so Xenia shouldn't do that; also
+  // example, some incorrect patches are drawn, so the runtime shouldn't do that; also
   // 4D5307E6 draws water triangle patches with the number of indices that is 3
   // times the invocation count of the memexporting shader that calculates the
   // tessellation factors for a single patch for each "point").
@@ -283,6 +283,9 @@ enum class SurfaceNumberFormat : uint32_t {
 //   buffer), and overwriting the tail of the previously filled depth buffer in
 //   [0, 220).
 // - The lower 1120x144 bin is drawn without the pregenerated depth buffer data.
+// ReXGlue also has an explicit, non-hardware-accurate 4096-tile emulation mode
+// for custom title resolutions whose simultaneously live surfaces exceed the
+// physical Xenos EDRAM capacity. It is disabled by default.
 
 enum class MsaaSamples : uint32_t {
   k1X = 0,
@@ -410,9 +413,14 @@ constexpr uint32_t kRenderTargetFormatBits =
 
 constexpr uint32_t kEdramTileWidthSamples = 80;
 constexpr uint32_t kEdramTileHeightSamples = 16;
-constexpr uint32_t kEdramTileCount = 2048;
-constexpr uint32_t kEdramSizeBytes =
-    kEdramTileCount * kEdramTileHeightSamples * kEdramTileWidthSamples * sizeof(uint32_t);
+constexpr uint32_t kEdramDefaultTileCount = 2048;
+constexpr uint32_t kEdramMaxTileCount = 4096;
+constexpr uint32_t kEdramDefaultSizeBytes =
+    kEdramDefaultTileCount * kEdramTileHeightSamples * kEdramTileWidthSamples * sizeof(uint32_t);
+constexpr uint32_t kEdramMaxSizeBytes =
+    kEdramMaxTileCount * kEdramTileHeightSamples * kEdramTileWidthSamples * sizeof(uint32_t);
+uint32_t GetEdramTileCount();
+uint32_t GetEdramSizeBytes();
 
 // RB_SURFACE_INFO::surface_pitch width.
 constexpr uint32_t kEdramPitchPixelsBits = 14;
@@ -1605,7 +1613,7 @@ enum Type3Opcode {
   PM4_CONTEXT_UPDATE        = 0x5e,   // updates the current context, if needed
   PM4_INTERRUPT             = 0x54,   // generate interrupt from the command stream
 
-  PM4_XE_SWAP               = 0x64,   // Xenia only: VdSwap uses this to trigger a swap.
+  PM4_XE_SWAP               = 0x64,   // the runtime only: VdSwap uses this to trigger a swap.
 
   PM4_IM_STORE              = 0x2c,   // copy sequencer instruction memory to system memory
 

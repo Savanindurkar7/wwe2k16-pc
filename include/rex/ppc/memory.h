@@ -111,7 +111,7 @@
 #define PPC_MEMORY_SIZE 0x100000000ull
 
 //=============================================================================
-// MMIO Address Range (per Xenia memory.cc)
+// MMIO Address Range (per the runtime memory.cc)
 //=============================================================================
 // Xbox 360 memory map:
 //   0x7F000000 - 0x7FFFFFFF - MMIO (GPU registers at 0x7FC80000, audio, etc.)

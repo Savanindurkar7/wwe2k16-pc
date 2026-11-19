@@ -322,7 +322,7 @@ void DxbcShaderTranslator::StartPixelShader_LoadROVParameters() {
   //                             needed
   a_.OpUDiv(dxbc::Dest::Null(), dxbc::Dest::R(system_temp_rov_params_, 0b0010),
             dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kYYYY),
-            dxbc::Src::LU(tile_size * xenos::kEdramTileCount));
+             dxbc::Src::LU(tile_size * xenos::GetEdramTileCount()));
 
   // ***************************************************************************
   // Sample coverage to system_temp_rov_params_.x.
@@ -404,7 +404,7 @@ void DxbcShaderTranslator::ROV_DepthStencilTest() {
     //   scaling of derivatives of barycentric coordinates, therefore there's no
     //   advantage of using it there.
     // - eval_sample_index is (inconsistently, but often) one of the sources of
-    //   the infamous AMD shader compiler crashes when ROV is used in Xenia, in
+    //   the infamous AMD shader compiler crashes when ROV is used in the runtime, in
     //   addition to shader compiler crashes on WARP.
     if (depth_stencil_early) {
       z_ddx_src = dxbc::Src::R(temp, dxbc::Src::kXXXX);
@@ -515,7 +515,7 @@ void DxbcShaderTranslator::ROV_DepthStencilTest() {
           // First sample - off-center for MSAA, in the center without it.
           // Using ForcedSampleCount 4 for both 2x and 4x MSAA because
           // ForcedSampleCount 2 is not supported on Nvidia, thus the position
-          // of the top-left sample (0 in Xenia) is always that of the top-left
+          // of the top-left sample (0 in the runtime) is always that of the top-left
           // sample of host 4x MSAA.
           // Calculate the depth in the sample 0 for 2x or 4x MSAA.
           // temp.x if early = ddx(z)
@@ -543,7 +543,7 @@ void DxbcShaderTranslator::ROV_DepthStencilTest() {
         case 1:
           // - 2x MSAA: Bottom sample -> bottom-right (3) with Direct3D 11's
           //   ForcedSampleCount 4.
-          // - 4x MSAA: Bottom-left Xenia sample -> Direct3D 11 sample 2.
+          // - 4x MSAA: Bottom-left the runtime sample -> Direct3D 11 sample 2.
           // Check if 4x MSAA is used.
           a_.OpIf(true, LoadSystemConstant(SystemConstants::Index::kSampleCountLog2,
                                            offsetof(SystemConstants, sample_count_log2),
@@ -574,7 +574,7 @@ void DxbcShaderTranslator::ROV_DepthStencilTest() {
           a_.OpEndIf();
           break;
         default: {
-          // Xenia samples 2 and 3 (top-right and bottom-right) -> Direct3D 11
+          // the runtime samples 2 and 3 (top-right and bottom-right) -> Direct3D 11
           // samples 1 and 3.
           // temp.x if early = ddx(z)
           // temp.y if early = ddy(z)
@@ -1773,7 +1773,7 @@ void DxbcShaderTranslator::CompletePixelShader_AlphaToMask() {
     // 2x MSAA.
     // With ROV, using guest sample indices.
     // Without ROV:
-    // - Native 2x: top (0 in Xenia) is 1 in D3D10.1+, bottom (1 in Xenia) is 0.
+    // - Native 2x: top (0 in the runtime) is 1 in D3D10.1+, bottom (1 in the runtime) is 0.
     // - 2x as 4x: top is 0, bottom is 3.
     a_.OpElse();
     CompletePixelShader_AlphaToMaskSample(true, (!edram_rov_used_ && msaa_2x_supported_) ? 1 : 0,
@@ -1881,8 +1881,9 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
 
   // Write color values.
   uint32_t shader_writes_color_targets = current_shader().writes_color_targets();
-  uint32_t edram_size_32bpp_samples = (xenos::kEdramTileHeightSamples * draw_resolution_scale_y_) *
-                                      tile_width * xenos::kEdramTileCount;
+  uint32_t edram_size_32bpp_samples =
+      (xenos::kEdramTileHeightSamples * draw_resolution_scale_y_) * tile_width *
+      xenos::GetEdramTileCount();
   for (uint32_t i = 0; i < 4; ++i) {
     if (!(shader_writes_color_targets & (1 << i))) {
       continue;

@@ -14,7 +14,10 @@
 #include <rex/platform.h>
 #include <cstddef>
 
-#if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
+#if REX_PLATFORM_ANDROID
+#include <cstdint>
+#include <vector>
+#elif REX_PLATFORM_LINUX || REX_PLATFORM_MAC
 #include <ucontext.h>
 #include <cstdint>
 #include <vector>
@@ -51,6 +54,19 @@ struct Fiber {
 #if REX_PLATFORM_WIN32
   void* handle_ = nullptr;
   bool is_thread_fiber_ = false;
+#elif REX_PLATFORM_ANDROID
+  struct Context {
+    uint64_t x19_x30[12]{};
+    uint64_t sp = 0;
+    uint64_t d8_d15[8]{};
+  };
+  Context context_{};
+  std::vector<uint8_t> stack_;
+  void (*entry_)(void*) = nullptr;
+  void* arg_ = nullptr;
+  bool is_thread_fiber_ = false;
+
+  static void Trampoline();
 #elif REX_PLATFORM_LINUX
   ucontext_t context_{};
   std::vector<uint8_t> stack_;

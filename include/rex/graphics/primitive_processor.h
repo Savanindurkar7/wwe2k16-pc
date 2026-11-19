@@ -35,7 +35,7 @@
 #if REX_ARCH_AMD64
 // 128-bit SSSE3-level (SSE2+ for integer comparison, SSSE3 for pshufb) or AVX
 // (256-bit AVX only got integer operations such as comparison in AVX2, which is
-// above the minimum requirements of Xenia).
+// above the minimum requirements of the runtime).
 #include <tmmintrin.h>
 #define XE_GPU_PRIMITIVE_PROCESSOR_SIMD_SIZE 16
 #elif REX_ARCH_ARM64
@@ -69,7 +69,7 @@ namespace rex::graphics {
 //   - Converts to triangle lists.
 // - Vulkan requiring 0xFFFF primitive restart index for 16-bit indices and
 //   0xFFFFFFFF for 32-bit (Direct3D 12 slightly relaxes this, allowing 0xFFFF
-//   for 32-bit also, but it's of no use to Xenia since guest indices are
+//   for 32-bit also, but it's of no use to the runtime since guest indices are
 //   big-endian usually. Also, only 24 lower bits of the vertex index being used
 //   on the guest (tested on an Adreno 200 phone with drawing, though not with
 //   primitive restart as OpenGL ES 2.0 doesn't expose it), so the upper 8 bits

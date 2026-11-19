@@ -351,7 +351,7 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
       shader_storage_file_header.magic == shader_storage_magic &&
       rex::byte_swap(shader_storage_file_header.version_swapped) == ShaderStoredHeader::kVersion) {
     uint64_t shader_storage_valid_bytes = sizeof(shader_storage_file_header);
-    // Load and translate shaders written by previous Xenia executions until the
+    // Load and translate shaders written by previous the runtime executions until the
     // end of the file or until a corrupted one is detected.
     ShaderStoredHeader shader_header;
     std::vector<uint32_t> ucode_dwords;
@@ -1657,7 +1657,7 @@ void PipelineCache::CreateDxbcGeometryShader(GeometryShaderKey key,
   // RDEF header - the actual definitions will be written if needed.
   shader_out.resize(rdef_position_dwords + sizeof(dxbc::RdefHeader) / sizeof(uint32_t));
   // Generator name.
-  dxbc::AppendAlignedString(shader_out, "Xenia");
+  dxbc::AppendAlignedString(shader_out, "WWE2K16");
   {
     auto& rdef_header =
         *reinterpret_cast<dxbc::RdefHeader*>(shader_out.data() + rdef_position_dwords);

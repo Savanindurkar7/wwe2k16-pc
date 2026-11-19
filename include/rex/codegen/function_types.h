@@ -238,6 +238,12 @@ struct JumpTable {
   uint32_t bctrAddress;           // Address of bctr instruction
   uint32_t tableAddress;          // Address of jump table data
   uint8_t indexRegister;          // Register holding switch index
+  int32_t indexBias = 0;          // Value ADDED to the switch index before the table lookup;
+                                  // emitted case labels become bias+i. 0 = no bias, and 0 in
+                                  // union mode: when the bias is conditional (a sibling path
+                                  // reaches the shared bctr un-biased), targets[] is read from
+                                  // the un-biased base over the union window [0, bias+count)
+                                  // and the switch emits plain case 0..N-1 labels.
   std::vector<uint32_t> targets;  // Resolved case targets (internal labels)
 };
 

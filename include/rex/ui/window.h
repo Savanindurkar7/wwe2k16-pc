@@ -52,7 +52,7 @@ class Window {
     // OpenImpl is being invoked, the implementation is performing initial
     // setup.
     // External state changes are functionally near-impossible as OpenImpl
-    // mostly isn't able to communicate with external Xenia code that may have
+    // mostly isn't able to communicate with external the runtime code that may have
     // any effect on the Window, to avoid interference during the native window
     // setup which may be pretty complex - and also, this is the phase in which
     // the native window is being created, so there's no guarantee that the
@@ -415,7 +415,7 @@ class Window {
   // but it's too long especially for highly dynamic games.
   // Implementations may use different values according to the platform's UX
   // conventions.
-  static constexpr uint32_t kDefaultCursorAutoHideMilliseconds = 3333;
+  static constexpr uint32_t kDefaultCursorAutoHideMilliseconds = 4000;
 
   Window(WindowedAppContext& app_context, const std::string_view title,
          uint32_t desired_logical_width, uint32_t desired_logical_height);

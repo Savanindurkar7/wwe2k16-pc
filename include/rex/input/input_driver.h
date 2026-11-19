@@ -11,9 +11,11 @@
  */
 
 #include <cstddef>
+#include <atomic>
 #include <functional>
 
 #include <rex/input/input.h>
+#include <rex/input/text_entry.h>
 #include <rex/kernel.h>
 #include <rex/ui/window.h>
 
@@ -40,6 +42,10 @@ class InputDriver {
 
   virtual void OnWindowAvailable(rex::ui::Window* /*window*/) {}
 
+  void SetTextEntryTarget(TextEntryTarget* target) {
+    text_entry_target_.store(target, std::memory_order_release);
+  }
+
   void set_is_active_callback(std::function<bool()> is_active_callback) {
     is_active_callback_ = is_active_callback;
   }
@@ -52,11 +58,15 @@ class InputDriver {
   size_t window_z_order() const { return window_z_order_; }
 
   bool is_active() const { return !is_active_callback_ || is_active_callback_(); }
+  TextEntryTarget* text_entry_target() const {
+    return text_entry_target_.load(std::memory_order_acquire);
+  }
 
  private:
   rex::ui::Window* window_;
   size_t window_z_order_;
   std::function<bool()> is_active_callback_ = nullptr;
+  std::atomic<TextEntryTarget*> text_entry_target_{nullptr};
 };
 
 }  // namespace rex::input

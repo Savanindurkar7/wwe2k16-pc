@@ -66,6 +66,7 @@ bool XNotifyListener::DequeueNotification(XNotificationID* out_id, uint32_t* out
 bool XNotifyListener::DequeueNotification(XNotificationID id, uint32_t* out_data) {
   auto global_lock = global_critical_region_.Acquire();
   if (!notifications_.size()) {
+    wait_handle_->Reset();
     return false;
   }
   bool dequeued = false;
@@ -76,10 +77,24 @@ bool XNotifyListener::DequeueNotification(XNotificationID id, uint32_t* out_data
     dequeued = true;
     *out_data = it->second;
     notifications_.erase(it);
-    if (!notifications_.size()) {
+
+    // A filtered title waiter must not spin on queued notifications it did not request.
+    // Keep those notifications queued for a later unfiltered XNotifyGetNext.
+    bool requested_notification_remains = false;
+    for (const auto& notification : notifications_) {
+      if (notification.first == id) {
+        requested_notification_remains = true;
+        break;
+      }
+    }
+    if (!requested_notification_remains) {
       wait_handle_->Reset();
     }
     break;
+  }
+  if (!dequeued) {
+    // Non-matching entries remain available, but no longer keep this filtered wait signalled.
+    wait_handle_->Reset();
   }
   return dequeued;
 }

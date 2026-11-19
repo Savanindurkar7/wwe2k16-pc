@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <mutex>
 
 namespace rex::thread {
@@ -53,20 +54,33 @@ namespace rex::thread {
 //   xe::global_critical_region global_critical_region_;
 //   std::list<...> my_list_;
 // };
+// Set by the rate census (WWE2K16_RATE_CENSUS=1) to measure global lock
+// contention; Acquire/AcquireDirect then take the lock via AcquireCensused.
+extern std::atomic<bool> g_global_lock_census;
+
 class global_critical_region {
  public:
   static std::recursive_mutex& mutex();
+
+  // try_lock first; on contention records the owner thread and the wait.
+  static std::unique_lock<std::recursive_mutex> AcquireCensused();
 
   // Acquires a lock on the global critical section.
   // Use this when keeping an instance is not possible. Otherwise, prefer
   // to keep an instance of global_critical_region near the members requiring
   // it to keep things readable.
   static std::unique_lock<std::recursive_mutex> AcquireDirect() {
+    if (g_global_lock_census.load(std::memory_order_relaxed)) {
+      return AcquireCensused();
+    }
     return std::unique_lock<std::recursive_mutex>(mutex());
   }
 
   // Acquires a lock on the global critical section.
   inline std::unique_lock<std::recursive_mutex> Acquire() {
+    if (g_global_lock_census.load(std::memory_order_relaxed)) {
+      return AcquireCensused();
+    }
     return std::unique_lock<std::recursive_mutex>(mutex());
   }
 

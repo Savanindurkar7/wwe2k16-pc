@@ -47,7 +47,7 @@ struct XSOCKADDR_IN {
   char x_sin_zero[8];
 };
 
-// Xenia native sockaddr_in
+// the runtime native sockaddr_in
 struct N_XSOCKADDR_IN {
   N_XSOCKADDR_IN() {}
   N_XSOCKADDR_IN(const XSOCKADDR_IN* other) { *this = *other; }

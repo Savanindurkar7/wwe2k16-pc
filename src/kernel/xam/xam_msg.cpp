@@ -20,8 +20,12 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/xevent.h>
 #include <rex/system/xio.h>
+#include <rex/system/thread_state.h>
 #include <rex/system/xthread.h>
 #include <rex/system/xtypes.h>
+
+#include <mutex>
+#include <unordered_set>
 
 namespace rex {
 namespace kernel {
@@ -29,22 +33,66 @@ namespace xam {
 using namespace rex::system;
 using namespace rex::system::xam;
 
+namespace {
+
+struct GuestCaller {
+  bool available;
+  uint32_t lr;
+};
+
+GuestCaller CaptureGuestCaller() {
+  const auto* thread_state = rex::runtime::ThreadState::Get();
+  const auto* context = thread_state ? thread_state->context() : nullptr;
+  return {context != nullptr, context ? static_cast<uint32_t>(context->lr) : 0};
+}
+
+void LogAppMessageDispatchOnce(uint32_t app, uint32_t message, uint32_t buffer_length,
+                               X_HRESULT result, GuestCaller caller) {
+  static std::mutex mutex;
+  static std::unordered_set<uint64_t> seen;
+  const uint64_t key = (static_cast<uint64_t>(app) << 32) | message;
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!seen.insert(key).second) {
+      return;
+    }
+  }
+
+  if (caller.available) {
+    REXKRNL_INFO(
+        "XAM message dispatch app={:08X}, message={:08X}, buffer_length={}, result={:08X}, "
+        "guest caller LR={:08X}",
+        app, message, buffer_length, static_cast<uint32_t>(result), caller.lr);
+  } else {
+    REXKRNL_INFO(
+        "XAM message dispatch app={:08X}, message={:08X}, buffer_length={}, result={:08X}, "
+        "guest caller LR unavailable (no bound guest PPCContext)",
+        app, message, buffer_length, static_cast<uint32_t>(result));
+  }
+}
+
+}  // namespace
+
 ppc_u32_result_t XMsgInProcessCall_entry(ppc_u32_t app, ppc_u32_t message, ppc_u32_t arg1,
                                          ppc_u32_t arg2) {
+  const auto caller = CaptureGuestCaller();
   auto result = REX_KERNEL_STATE()->app_manager()->DispatchMessageSync(app, message, arg1, arg2);
   if (result == X_ERROR_NOT_FOUND) {
     REXKRNL_ERROR("XMsgInProcessCall: app {:08X} undefined", app);
   }
+  LogAppMessageDispatchOnce(app, message, arg2, result, caller);
   return result;
 }
 
 ppc_u32_result_t XMsgSystemProcessCall_entry(ppc_u32_t app, ppc_u32_t message, ppc_u32_t buffer,
                                              ppc_u32_t buffer_length) {
+  const auto caller = CaptureGuestCaller();
   auto result =
       REX_KERNEL_STATE()->app_manager()->DispatchMessageAsync(app, message, buffer, buffer_length);
   if (result == X_ERROR_NOT_FOUND) {
     REXKRNL_ERROR("XMsgSystemProcessCall: app {:08X} undefined", app);
   }
+  LogAppMessageDispatchOnce(app, message, buffer_length, result, caller);
   return result;
 }
 
@@ -56,6 +104,7 @@ struct XMSGSTARTIOREQUEST_UNKNOWNARG {
 X_HRESULT xeXMsgStartIORequestEx(uint32_t app, uint32_t message, uint32_t overlapped_ptr,
                                  uint32_t buffer_ptr, uint32_t buffer_length,
                                  XMSGSTARTIOREQUEST_UNKNOWNARG* unknown) {
+  const auto caller = CaptureGuestCaller();
   auto result = REX_KERNEL_STATE()->app_manager()->DispatchMessageAsync(app, message, buffer_ptr,
                                                                         buffer_length);
   if (result == X_E_NOTFOUND) {
@@ -70,6 +119,7 @@ X_HRESULT xeXMsgStartIORequestEx(uint32_t app, uint32_t message, uint32_t overla
   if (result == X_ERROR_SUCCESS || result == X_ERROR_IO_PENDING) {
     XThread::SetLastError(0);
   }
+  LogAppMessageDispatchOnce(app, message, buffer_length, result, caller);
   return result;
 }
 

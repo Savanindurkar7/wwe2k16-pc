@@ -59,7 +59,7 @@ DWORD ToWin32ProtectFlags(PageAccess access) {
   }
 }
 
-PageAccess ToXeniaProtectFlags(DWORD access) {
+PageAccess ToRexProtectFlags(DWORD access) {
   if (access & PAGE_GUARD) {
     // Strip the page guard flag for now...
     access &= ~PAGE_GUARD;
@@ -149,7 +149,7 @@ bool Protect(void* base_address, size_t length, PageAccess access, PageAccess* o
     return false;
   }
   if (out_old_access) {
-    *out_old_access = ToXeniaProtectFlags(DWORD(old_protect));
+    *out_old_access = ToRexProtectFlags(DWORD(old_protect));
   }
   return true;
 }
@@ -166,7 +166,7 @@ bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
   }
 
   length = info.RegionSize;
-  access_out = ToXeniaProtectFlags(info.Protect);
+  access_out = ToRexProtectFlags(info.Protect);
   return true;
 }
 

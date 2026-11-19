@@ -22,6 +22,7 @@
 #include <rex/ppc/types.h>
 #include <rex/string/util.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/xam/achievements.h>
 #include <rex/system/xam/user_profile.h>
 #include <rex/system/xenumerator.h>
 #include <rex/system/xio.h>
@@ -646,6 +647,9 @@ ppc_u32_result_t XamUserCreateAchievementEnumerator_entry(ppc_u32_t title_id, pp
     const std::vector<util::XdbfAchievementTableEntry> achievement_list = db.GetAchievements();
 
     for (const util::XdbfAchievementTableEntry& entry : achievement_list) {
+      // Unlocks kept by achievements.cpp: FILETIME as (high, low) and XACHIEVEMENT_DETAILS_ACHIEVED.
+      const uint64_t unlocked_at = rex::system::xam::AchievementUnlockTime(entry.id);
+      constexpr uint32_t kAchieved = 0x00020000;
       auto item = XStaticAchievementEnumerator::AchievementDetails{
           entry.id,
           rex::string::to_utf16(db.GetStringTableEntry(language, entry.label_id)),
@@ -653,8 +657,8 @@ ppc_u32_result_t XamUserCreateAchievementEnumerator_entry(ppc_u32_t title_id, pp
           rex::string::to_utf16(db.GetStringTableEntry(language, entry.unachieved_id)),
           entry.image_id,
           entry.gamerscore,
-          {0, 0},
-          entry.flags};
+          {uint32_t(unlocked_at >> 32), uint32_t(unlocked_at)},
+          unlocked_at ? uint32_t(entry.flags) | kAchieved : uint32_t(entry.flags)};
 
       e->AppendItem(item);
     }

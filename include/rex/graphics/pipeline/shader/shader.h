@@ -592,7 +592,7 @@ struct ParsedAluInstruction {
   // effect.
   bool IsNop() const;
 
-  // If this is a "normal" eA write recognized by Xenia (MAD with a stream
+  // If this is a "normal" eA write recognized by the runtime (MAD with a stream
   // constant), returns the index of the stream float constant, otherwise
   // returns UINT32_MAX.
   uint32_t GetMemExportStreamConstant() const;

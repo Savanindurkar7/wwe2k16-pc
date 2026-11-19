@@ -11,12 +11,34 @@
 
 #include <cmath>
 
+#include <rex/cvar.h>
 #include <rex/graphics/xenos.h>
+#include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/memory.h>
 
+REXCVAR_DECLARE(int32_t, edram_tiles);
+
 namespace rex::graphics {
 namespace xenos {
+
+uint32_t GetEdramTileCount() {
+  static const uint32_t tile_count = [] {
+    const int32_t configured = REXCVAR_GET(edram_tiles);
+    const uint32_t selected = configured == int32_t(kEdramMaxTileCount)
+                                  ? kEdramMaxTileCount
+                                  : kEdramDefaultTileCount;
+    REXLOG_INFO("[rex-edram] edram_tiles={} buffer_bytes={} (emulated EDRAM model)", selected,
+                selected * kEdramTileHeightSamples * kEdramTileWidthSamples * sizeof(uint32_t));
+    return selected;
+  }();
+  return tile_count;
+}
+
+uint32_t GetEdramSizeBytes() {
+  return GetEdramTileCount() * kEdramTileHeightSamples * kEdramTileWidthSamples *
+         sizeof(uint32_t);
+}
 
 // Based on X360GammaToLinear and X360LinearToGamma from the Source Engine, with
 // additional logic from Direct3D 9 code in game executable disassembly, located

@@ -95,8 +95,10 @@ struct LogConfig {
   /** spdlog pattern string for the file sink. */
   std::string file_pattern = "[%Y-%m-%d %H:%M:%S.%e] [%l] [%n] [t%t] %v";
 
-  /** Messages at or above this level trigger an immediate flush. */
-  spdlog::level::level_enum flush_level = spdlog::level::warn;
+  /** Messages at or above this level trigger an immediate flush. Lower levels are flushed
+   *  by a once-per-second background flush (InitLogging): flushing on every warning turned
+   *  guest warning bursts (~1000 lines/s) into multi-hundred-ms stalls on Windows. */
+  spdlog::level::level_enum flush_level = spdlog::level::err;
 
   /**
    * Per-category log level overrides.

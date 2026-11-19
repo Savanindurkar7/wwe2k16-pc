@@ -31,6 +31,11 @@ class SDLAudioDriver : public AudioDriver {
   void SubmitFrame(uint32_t frame_ptr) override;
   void Shutdown();
 
+  // Mixes any active custom (XMP) music into the interleaved buffer the driver
+  // just produced. Kept here (rather than in SDLCallback) so the same hook is
+  // available to any future driver; does nothing when no song is playing.
+  void MixCustomMusic(float* interleaved_output, uint32_t frames, uint32_t output_rate);
+
  protected:
   static void SDLCallback(void* userdata, SDL_AudioStream* stream, int additional_amount,
                           int total_amount);
@@ -38,6 +43,9 @@ class SDLAudioDriver : public AudioDriver {
   rex::thread::Semaphore* semaphore_ = nullptr;
 
   SDL_AudioStream* sdl_stream_ = nullptr;
+  bool OpenOutput();
+  void CloseOutput();
+
   bool sdl_initialized_ = false;
   uint8_t sdl_device_channels_ = 0;
 

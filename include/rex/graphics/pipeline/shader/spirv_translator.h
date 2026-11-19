@@ -88,6 +88,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
       uint32_t param_gen_point : 1;
       // For host render targets - depth / stencil output mode.
       DepthStencilMode depth_stencil_mode : 3;
+      // For float24 conversion without a guest depth output, convert pixel-center
+      // FragCoord.z without forcing sample-rate shader execution.
+      uint32_t float24_depth_pixel_rate : 1;
     } pixel;
     uint64_t value = 0;
 
@@ -321,7 +324,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
 
   // The minimum limit for maxPerStageDescriptorStorageBuffers is 4, and for
   // maxStorageBufferRange it's 128 MB. These are the values of those limits on
-  // Arm Mali as of November 2020. Xenia needs 512 MB shared memory to be bound,
+  // Arm Mali as of November 2020. the runtime needs 512 MB shared memory to be bound,
   // therefore SSBOs must only be used for shared memory - all other storage
   // resources must be images or texel buffers.
   enum DescriptorSet : uint32_t {
@@ -369,7 +372,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
                 "PowerVR, Qualcomm Adreno 6xx and older, as well as on old PC Nvidia "
                 "drivers");
 
-  // "Xenia Emulator Microcode Translator".
+  // "the runtime Emulator Microcode Translator".
   // https://github.com/KhronosGroup/SPIRV-Headers/blob/c43a43c7cc3af55910b9bec2a71e3e8a622443cf/include/spirv/spir-v.xml#L79
   static constexpr uint32_t kSpirvMagicToolId = 26;
 
@@ -436,7 +439,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // state of the translator.
   std::vector<uint8_t> CreateDepthOnlyFragmentShader(
       Modification::DepthStencilMode depth_stencil_mode =
-          Modification::DepthStencilMode::kNoModifiers);
+          Modification::DepthStencilMode::kNoModifiers,
+      bool float24_depth_pixel_rate = false);
 
   // Common functions useful not only for the translator, but also for EDRAM
   // emulation via conventional render targets.
@@ -552,7 +556,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
   }
   bool IsSampleRate() const {
     assert_true(is_pixel_shader());
-    return IsWritingFloat24Depth() && !current_shader().writes_depth();
+    return IsWritingFloat24Depth() && !current_shader().writes_depth() &&
+           !GetSpirvShaderModification().pixel.float24_depth_pixel_rate;
   }
 
   uint32_t GetModificationInterpolatorMask() const {
@@ -917,7 +922,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // VS output or PS input, only the ones that are needed (spv::NoResult for the
   // unneeded interpolators), indexed by the guest interpolator index - float4.
   // The Qualcomm Adreno driver has strict requirements for stage linkage - as
-  // Xenia uses separate variables, not an array (so the interpolation
+  // the runtime uses separate variables, not an array (so the interpolation
   // qualifiers can be applied to each element separately), the interpolators
   // must also be separate variables in the other stage, including the geometry
   // shader (not just an array assuming that consecutive locations will be

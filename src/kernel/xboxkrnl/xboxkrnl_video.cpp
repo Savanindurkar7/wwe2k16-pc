@@ -16,6 +16,7 @@
 #include <string>
 
 #include <rex/cvar.h>
+#include <rex/diagnostics/rate_census.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/graphics_system.h>
 #include <rex/graphics/pipeline/texture/info.h>
@@ -446,6 +447,9 @@ ppc_u32_result_t VdRetrainEDRAM_entry(ppc_unknown_t unk0, ppc_unknown_t unk1, pp
   return 0;
 }
 
+// Guest address of the VdGlobalDevice export (the game's D3D device pointer).
+static uint32_t g_vd_global_device_address = 0;
+
 void VdSwap_entry(ppc_pvoid_t buffer_ptr,      // ptr into primary ringbuffer
                   ppc_pvoid_t fetch_ptr,       // frontbuffer Direct3D 9 texture header fetch
                   ppc_pvoid_t unk2,            // system writeback ptr
@@ -454,6 +458,23 @@ void VdSwap_entry(ppc_pvoid_t buffer_ptr,      // ptr into primary ringbuffer
                   ppc_pu32_t frontbuffer_ptr,  // ptr to frontbuffer address
                   ppc_pu32_t texture_format_ptr, ppc_pu32_t color_space_ptr, ppc_pu32_t width,
                   ppc_pu32_t height) {
+  // The census pairs this timestamp with the command-processor presentation
+  // entry point. This is the measurable VdSwap -> presenter handoff latency;
+  // VdSwap itself does not synchronously call the presenter.
+  diagnostics::rate_census::RecordVdSwap();
+  if (diagnostics::rate_census::IsEnabled() && g_vd_global_device_address) {
+    // Census: the presentation interval the game's D3D asks for on this swap
+    // (device +0x36B0, read by the guest swap path sub_82B988D0: 0/1 = every
+    // vblank, 2 = every second vblank). Xbox 360 D3D layout; diagnostic only.
+    auto memory = REX_KERNEL_MEMORY();
+    const uint32_t device =
+        memory::load_and_swap<uint32_t>(memory->TranslateVirtual(g_vd_global_device_address));
+    if (device) {
+      diagnostics::rate_census::RecordPresentInterval(
+          memory::load_and_swap<uint32_t>(memory->TranslateVirtual(device + 0x36B0)));
+    }
+  }
+
   // All of these parameters are REQUIRED.
   assert(buffer_ptr);
   assert(fetch_ptr);
@@ -481,7 +502,7 @@ void VdSwap_entry(ppc_pvoid_t buffer_ptr,      // ptr into primary ringbuffer
       REX_KERNEL_MEMORY()->GetPhysicalAddress(frontbuffer_virtual_address);
   assert_true(frontbuffer_physical_address != UINT32_MAX);
   if (frontbuffer_physical_address == UINT32_MAX) {
-    // Xenia-specific safety check.
+    // the runtime-specific safety check.
     REXKRNL_ERROR("VdSwap: Invalid front buffer virtual address 0x{:08X}",
                   frontbuffer_virtual_address);
     return;
@@ -537,6 +558,7 @@ void RegisterVideoExports(rex::runtime::ExportResolver* export_resolver,
   // Pointer to a global D3D device. Games only seem to set this, so we don't
   // have to do anything. We may want to read it back later, though.
   uint32_t pVdGlobalDevice = memory->SystemHeapAlloc(4, 32, memory::kSystemHeapPhysical);
+  g_vd_global_device_address = pVdGlobalDevice;
   export_resolver->SetVariableMapping("xboxkrnl.exe", 0x01BE, pVdGlobalDevice);
   memory::store_and_swap<uint32_t>(memory->TranslateVirtual(pVdGlobalDevice), 0);
 

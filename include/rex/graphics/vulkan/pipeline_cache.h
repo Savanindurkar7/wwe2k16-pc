@@ -196,12 +196,13 @@ class VulkanPipelineCache {
     xenos::StencilOp stencil_back_depth_fail_op : 3;     // 6
     xenos::CompareFunction stencil_back_compare_op : 3;  // 9
     uint32_t sample_rate_shading : 1;                    // 10
+    uint32_t float24_depth_pixel_rate : 1;               // 11
 
     // Filled only for the attachments present in the render pass object.
     PipelineRenderTarget render_targets[xenos::kMaxColorRenderTargets];
 
     // Including all the padding, for a stable hash.
-    static constexpr uint32_t kVersion = 0x20260228;
+    static constexpr uint32_t kVersion = 0x20260926;
     PipelineDescription() {
       Reset();
     }

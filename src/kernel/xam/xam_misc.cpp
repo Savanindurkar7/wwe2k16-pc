@@ -11,6 +11,56 @@
 #include <rex/kernel/xam/private.h>
 #include <rex/logging.h>
 #include <rex/ppc/function.h>
+#include <rex/ppc/types.h>
+#include <rex/system/thread_state.h>
+
+#include <cstdint>
+#include <mutex>
+#include <unordered_set>
+
+namespace rex {
+namespace kernel {
+namespace xam {
+namespace {
+
+bool ShouldLogXNetLogonGetTitleID(uint32_t guest_lr, uint32_t selector) {
+  static std::mutex mutex;
+  static std::unordered_set<uint64_t> seen;
+  const uint64_t key = (static_cast<uint64_t>(guest_lr) << 32) | selector;
+  std::lock_guard<std::mutex> lock(mutex);
+  return seen.insert(key).second;
+}
+
+}  // namespace
+
+ppc_u32_result_t XNetLogonGetTitleID_entry(ppc_u32_t selector) {
+  const auto* thread_state = rex::runtime::ThreadState::Get();
+  const auto* context = thread_state ? thread_state->context() : nullptr;
+  const bool has_guest_context = context != nullptr;
+  const uint32_t guest_lr = has_guest_context ? static_cast<uint32_t>(context->lr) : 0;
+
+  if (ShouldLogXNetLogonGetTitleID(guest_lr, static_cast<uint32_t>(selector))) {
+    if (has_guest_context) {
+      REXKRNL_WARN(
+          "XNetLogonGetTitleID stub (guest caller LR/return={:#010x}, r3 selector={:#010x}); "
+          "preserving r3",
+          guest_lr, static_cast<uint32_t>(selector));
+    } else {
+      REXKRNL_WARN(
+          "XNetLogonGetTitleID stub (guest caller LR unavailable: no bound guest PPCContext, "
+          "r3 selector={:#010x}); preserving r3",
+          static_cast<uint32_t>(selector));
+    }
+  }
+
+  // PPC_STUB leaves r3 untouched, so the incoming selector is also the value
+  // returned to the guest by this explicit diagnostic entry.
+  return selector;
+}
+
+}  // namespace xam
+}  // namespace kernel
+}  // namespace rex
 
 // kinda gross but oh well
 XAM_EXPORT_STUB(__imp__CancelWaitableTimer);
@@ -243,7 +293,7 @@ XAM_EXPORT_STUB(__imp__XNetLogonGetServiceInfo);
 XAM_EXPORT_STUB(__imp__XNetLogonGetServiceNetworkID);
 XAM_EXPORT_STUB(__imp__XNetLogonGetState);
 XAM_EXPORT_STUB(__imp__XNetLogonGetTicketOpt);
-XAM_EXPORT_STUB(__imp__XNetLogonGetTitleID);
+XAM_EXPORT(__imp__XNetLogonGetTitleID, rex::kernel::xam::XNetLogonGetTitleID_entry)
 XAM_EXPORT_STUB(__imp__XNetLogonGetTitleVersion);
 XAM_EXPORT_STUB(__imp__XNetLogonGetUserPrivileges);
 XAM_EXPORT_STUB(__imp__XNetLogonInitOverrideInfo);

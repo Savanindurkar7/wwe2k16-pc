@@ -38,6 +38,10 @@ struct MMIORange {
   MMIOWriteCallback write;
 };
 
+// Diagnostic: make the guest views of [physical_address, +length) inaccessible and log the first
+// guest access (host PC and call chain), then restore access. Linux only.
+void ReadWatchArm(uint8_t* virtual_membase, uint32_t physical_address, uint32_t length);
+
 // NOTE: only one can exist at a time!
 class MMIOHandler {
  public:

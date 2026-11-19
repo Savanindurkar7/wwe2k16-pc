@@ -42,6 +42,8 @@ class TracePlayer : public TraceReader {
 
   void SeekFrame(int target_frame);
   void SeekCommand(int target_command);
+  // Plays the whole current frame again without clearing caches (benchmark loops).
+  void ReplayCurrentFrame();
 
   void WaitOnPlayback();
 

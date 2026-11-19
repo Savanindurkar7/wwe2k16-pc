@@ -2949,7 +2949,7 @@ XE_GPU_REGISTER(0x5002, kDword, SHADER_CONSTANT_FLUSH_FETCH_2)
 // XE_GPU_REGISTER(0x8D06, kDword, UNKNOWN_8D06)
 // XE_GPU_REGISTER(0x8D07, kDword, UNKNOWN_8D07)
 
-// Registers present in both Xenia Edge and Xenia Canary.
+// Registers present in both reference register sets.
 // Added to keep local register metadata aligned and reduce unknown-register warnings.
 XE_GPU_REGISTER(0x0000, kDword, RBBM_RTL_RELEASE)
 XE_GPU_REGISTER(0x0001, kDword, RBBM_PATCH_RELEASE)

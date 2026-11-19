@@ -9,8 +9,10 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <chrono>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -285,7 +287,7 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
   VkApplicationInfo application_info;
   application_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
   application_info.pNext = nullptr;
-  application_info.pApplicationName = "Xenia";
+  application_info.pApplicationName = "the runtime";
   application_info.applicationVersion = 1;
   application_info.pEngineName = nullptr;
   application_info.engineVersion = 0;
@@ -399,7 +401,7 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
 
   if (with_surface &&
       !VulkanPresenter::GetSurfaceTypesSupportedByInstance(vulkan_instance->extensions_)) {
-    REXLOG_ERROR("The Vulkan instance doesn't support surface types used by Xenia");
+    REXLOG_ERROR("The Vulkan instance doesn't support surface types used by the runtime");
     return nullptr;
   }
 
@@ -480,25 +482,53 @@ VulkanInstance::~VulkanInstance() {
 void VulkanInstance::EnumeratePhysicalDevices(
     std::vector<VkPhysicalDevice>& physical_devices_out) const {
   physical_devices_out.clear();
-  while (true) {
-    uint32_t physical_device_count = 0;
-    const VkResult get_physical_device_count_result =
-        functions_.vkEnumeratePhysicalDevices(instance_, &physical_device_count, nullptr);
-    if ((get_physical_device_count_result != VK_SUCCESS &&
-         get_physical_device_count_result != VK_INCOMPLETE) ||
-        !physical_device_count) {
+  // A GPU that is still waking up (for example the NVIDIA Optimus discrete GPU
+  // on a laptop) can return no devices, or fail, for a moment right after the
+  // instance is created. Retry for a few seconds before giving up. A successful
+  // first attempt returns without any delay.
+  constexpr int kMaxAttempts = 15;
+  constexpr auto kRetryDelay = std::chrono::milliseconds(200);
+  for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
+    if (attempt) {
+      std::this_thread::sleep_for(kRetryDelay);
+    }
+    VkResult failure_result = VK_SUCCESS;
+    uint32_t failure_count = 0;
+    while (true) {
+      uint32_t physical_device_count = 0;
+      const VkResult get_physical_device_count_result =
+          functions_.vkEnumeratePhysicalDevices(instance_, &physical_device_count, nullptr);
+      if (get_physical_device_count_result != VK_SUCCESS &&
+          get_physical_device_count_result != VK_INCOMPLETE) {
+        failure_result = get_physical_device_count_result;
+        failure_count = physical_device_count;
+        break;
+      }
+      if (!physical_device_count) {
+        // VK_SUCCESS with zero devices: not an error code, but still unusable.
+        failure_result = VK_SUCCESS;
+        failure_count = 0;
+        break;
+      }
+      physical_devices_out.resize(physical_device_count);
+      const VkResult get_physical_devices_result = functions_.vkEnumeratePhysicalDevices(
+          instance_, &physical_device_count, physical_devices_out.data());
+      if (get_physical_devices_result == VK_INCOMPLETE) {
+        continue;
+      }
+      if (get_physical_devices_result != VK_SUCCESS) {
+        failure_result = get_physical_devices_result;
+        failure_count = physical_device_count;
+        break;
+      }
+      physical_devices_out.resize(physical_device_count);
       return;
     }
-    physical_devices_out.resize(physical_device_count);
-    const VkResult get_physical_devices_result = functions_.vkEnumeratePhysicalDevices(
-        instance_, &physical_device_count, physical_devices_out.data());
-    if (get_physical_devices_result == VK_INCOMPLETE) {
-      continue;
-    }
-    physical_devices_out.resize(get_physical_devices_result == VK_SUCCESS ? physical_device_count
-                                                                          : 0);
-    return;
+    REXLOG_WARN(
+        "Vulkan physical device enumeration attempt {}/{} found none (VkResult {}, count {})",
+        attempt + 1, kMaxAttempts, vk::to_string(vk::Result(failure_result)), failure_count);
   }
+  physical_devices_out.clear();
 }
 
 VkBool32 VulkanInstance::DebugUtilsMessengerCallback(

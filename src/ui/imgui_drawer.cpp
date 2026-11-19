@@ -304,6 +304,14 @@ std::optional<ImGuiKey> ImGuiDrawer::VirtualKeyToImGuiKey(VirtualKey vkey) {
   }
 }
 
+void ImGuiDrawer::RebuildFontTexture() {
+  ImGuiIO& io = GetIO();
+  io.Fonts->TexID = ImTextureID{};
+  font_texture_.reset();
+  io.Fonts->Build();
+  SetupFontTexture();
+}
+
 void ImGuiDrawer::SetupFontTexture() {
   if (font_texture_ || !immediate_drawer_) {
     return;
@@ -594,7 +602,7 @@ void ImGuiDrawer::OnKey(KeyEvent& e, bool is_down) {
       io.KeyCtrl = is_down;
       break;
     case VirtualKey::kMenu:
-      // FIXME(Triang3l): Doesn't work in xenia-ui-window-demo.
+      // FIXME(Triang3l): Doesn't work in runtime-ui-window-demo.
       io.KeyAlt = is_down;
       break;
     case VirtualKey::kLWin:

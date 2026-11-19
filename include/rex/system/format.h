@@ -7,7 +7,7 @@
  * @license     BSD 3-Clause License
  *              See LICENSE file in the project root for full license text.
  *
- * @remarks     Based on Xenia's format_core
+ * @remarks     Based on the runtime's format_core
  */
 
 #pragma once

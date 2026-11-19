@@ -9,6 +9,9 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
+#include <rex/cvar.h>
+#include <rex/chrono/clock.h>
 #include <rex/input/input.h>
 #include <rex/input/input_system.h>
 #include <rex/kernel/xam/private.h>
@@ -32,6 +35,10 @@ using rex::input::X_INPUT_STATE;
 using rex::input::X_INPUT_VIBRATION;
 
 constexpr uint32_t XINPUT_FLAG_GAMEPAD = 0x01;
+// Any-device keystroke queries (flags low byte 0x02, see the XamInputGetKeystroke
+// comment below). Keyboard-driven front ends query keystrokes this way; the
+// keyboard VKs they expect come from the MnK driver, not from VK_PAD codes.
+constexpr uint32_t XINPUT_FLAG_ANY_DEVICE = 0x02;
 constexpr uint32_t XINPUT_FLAG_ANY_USER = 1 << 30;
 
 rex::input::InputSystem* input_system() {
@@ -136,6 +143,30 @@ ppc_u32_result_t XamInputSetState_entry(ppc_u32_t user_index, ppc_u32_t unk,
   return is->SetState(actual_user_index, vibration);
 }
 
+REXCVAR_DEFINE_BOOL(debug_keystroke_poll_log, false, "Input",
+                    "Diagnostic: once per second, log how often the title polled XamInputGetKeystroke(Ex)");
+
+static void DebugCountKeystrokePoll(uint32_t flags, X_RESULT result) {
+  if (!REXCVAR_GET(debug_keystroke_poll_log)) {
+    return;
+  }
+  static std::atomic<uint32_t> polls{0}, hits{0};
+  static std::atomic<uint64_t> window_start{0};
+  polls.fetch_add(1, std::memory_order_relaxed);
+  if (result == X_ERROR_SUCCESS) {
+    hits.fetch_add(1, std::memory_order_relaxed);
+  }
+  uint64_t now = rex::chrono::Clock::QueryHostUptimeMillis();
+  uint64_t start = window_start.load(std::memory_order_relaxed);
+  if (!start) {
+    window_start.store(now, std::memory_order_relaxed);
+  } else if (now - start >= 1000 &&
+             window_start.compare_exchange_strong(start, now, std::memory_order_relaxed)) {
+    REXKRNL_INFO("[keystroke-poll] t={} polls={} keystrokes={} flags={:X}", now,
+                 polls.exchange(0), hits.exchange(0), flags);
+  }
+}
+
 // https://msdn.microsoft.com/en-us/library/windows/desktop/microsoft.directx_sdk.reference.xinputgetkeystroke(v=vs.85).aspx
 ppc_u32_result_t XamInputGetKeystroke_entry(ppc_u32_t user_index, ppc_u32_t flags,
                                             ppc_ptr_t<X_INPUT_KEYSTROKE> keystroke) {
@@ -147,7 +178,7 @@ ppc_u32_result_t XamInputGetKeystroke_entry(ppc_u32_t user_index, ppc_u32_t flag
     return X_ERROR_BAD_ARGUMENTS;
   }
 
-  if ((flags & 0xFF) && (flags & XINPUT_FLAG_GAMEPAD) == 0) {
+  if ((flags & 0xFF) && (flags & (XINPUT_FLAG_GAMEPAD | XINPUT_FLAG_ANY_DEVICE)) == 0) {
     // Ignore any query for other types of devices.
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
@@ -159,7 +190,9 @@ ppc_u32_result_t XamInputGetKeystroke_entry(ppc_u32_t user_index, ppc_u32_t flag
   }
 
   auto* is = input_system();
-  return is->GetKeystroke(actual_user_index, flags, keystroke);
+  X_RESULT result = is->GetKeystroke(actual_user_index, flags, keystroke);
+  DebugCountKeystrokePoll(flags, result);
+  return result;
 }
 
 // Same as non-ex, just takes a pointer to user index.
@@ -169,7 +202,7 @@ ppc_u32_result_t XamInputGetKeystrokeEx_entry(ppc_pu32_t user_index_ptr, ppc_u32
     return X_ERROR_BAD_ARGUMENTS;
   }
 
-  if ((flags & 0xFF) && (flags & XINPUT_FLAG_GAMEPAD) == 0) {
+  if ((flags & 0xFF) && (flags & (XINPUT_FLAG_GAMEPAD | XINPUT_FLAG_ANY_DEVICE)) == 0) {
     // Ignore any query for other types of devices.
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
@@ -182,6 +215,7 @@ ppc_u32_result_t XamInputGetKeystrokeEx_entry(ppc_pu32_t user_index_ptr, ppc_u32
 
   auto* is = input_system();
   auto result = is->GetKeystroke(user_index, flags, keystroke);
+  DebugCountKeystrokePoll(flags, result);
   if (XSUCCEEDED(result)) {
     *user_index_ptr = keystroke->user_index;
   }

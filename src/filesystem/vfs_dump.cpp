@@ -115,5 +115,5 @@ int vfs_dump_main(const std::vector<std::string>& args) {
 
 }  // namespace rex::filesystem
 
-// TODO: CONSOLE APP - XE_DEFINE_CONSOLE_APP("xenia-vfs-dump", rex::filesystem::vfs_dump_main,
+// TODO: CONSOLE APP - XE_DEFINE_CONSOLE_APP("wwe2k16-vfs-dump", rex::filesystem::vfs_dump_main,
 //                       "[source] [dump_path]", "source", "dump_path");

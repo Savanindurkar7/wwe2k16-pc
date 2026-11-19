@@ -1,0 +1,61 @@
+diff --git a/android-project/app/build.gradle b/android-project/app/build.gradle
+index b9d75b146..0e32ef72e 100644
+--- a/android-project/app/build.gradle
++++ b/android-project/app/build.gradle
+@@ -32,13 +32,14 @@ android {
+             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+         }
+     }
+-    applicationVariants.all { variant ->
+-        tasks["merge${variant.name.capitalize()}Assets"]
+-            .dependsOn("externalNativeBuild${variant.name.capitalize()}")
++    sourceSets.main {
++        jniLibs.srcDir 'libs'
+     }
++
+     if (!project.hasProperty('EXCLUDE_NATIVE_LIBS')) {
+-        sourceSets.main {
+-            jniLibs.srcDir 'libs'
++        applicationVariants.all { variant ->
++            tasks["merge${variant.name.capitalize()}Assets"]
++                .dependsOn("externalNativeBuild${variant.name.capitalize()}")
+         }
+         externalNativeBuild {
+             if (buildWithCMake) {
+@@ -51,8 +52,8 @@ android {
+                 }
+             }
+         }
+-
+     }
++
+     lint {
+         abortOnError = false
+     }
+diff --git a/android-project/app/src/main/AndroidManifest.xml b/android-project/app/src/main/AndroidManifest.xml
+index ab43f76ae..560b40b13 100644
+--- a/android-project/app/src/main/AndroidManifest.xml
++++ b/android-project/app/src/main/AndroidManifest.xml
+@@ -78,7 +78,7 @@
+         <meta-data android:name="SDL_ENV.SDL_ANDROID_TRAP_BACK_BUTTON" android:value="0"/>
+          -->
+ 
+-        <activity android:name="SDLActivity"
++        <activity android:name="org.libsdl.app.WWE2K16Activity"
+             android:label="@string/app_name"
+             android:alwaysRetainTaskState="true"
+             android:launchMode="singleInstance"
+diff --git a/android-project/app/src/main/java/org/libsdl/app/WWE2K16Activity.java b/android-project/app/src/main/java/org/libsdl/app/WWE2K16Activity.java
+new file mode 100644
+index 000000000..662181cd2
+--- /dev/null
++++ b/android-project/app/src/main/java/org/libsdl/app/WWE2K16Activity.java
+@@ -0,0 +1,8 @@
++package org.libsdl.app;
++
++public class WWE2K16Activity extends SDLActivity {
++    @Override
++    protected String[] getLibraries() {
++        return new String[] { "main" };
++    }
++}

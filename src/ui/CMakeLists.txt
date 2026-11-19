@@ -61,6 +61,12 @@ if(WIN32)
         window_win.cpp
         windowed_app_context_win.cpp
     )
+elseif(ANDROID)
+    set(REXUI_PLATFORM_SOURCES
+        window_android.cpp
+        windowed_app_context_android.cpp
+        clipboard_android.cpp
+    )
 else()
     set(REXUI_PLATFORM_SOURCES
         surface_gnulinux.cpp
@@ -101,12 +107,14 @@ target_link_libraries(rexui PUBLIC
     imgui::imgui
 )
 
+# AMD FidelityFX FSR 1 (EASU + RCAS) and CAS shaders are precompiled in bytecode/SPIR-V.
+target_compile_definitions(rexui PUBLIC REX_HAS_FIDELITYFX_SDK=1)
+
 if(REXGLUE_FIDELITYFX_SOURCE_DIR AND EXISTS "${REXGLUE_FIDELITYFX_SOURCE_DIR}/sdk/include")
     target_include_directories(rexui PRIVATE
         "${REXGLUE_FIDELITYFX_SOURCE_DIR}/sdk/include"
         "${REXGLUE_FIDELITYFX_SOURCE_DIR}/ffx-api/include"
     )
-    target_compile_definitions(rexui PRIVATE REX_HAS_FIDELITYFX_SDK=1)
 endif()
 
 set(REXUI_HAS_FIDELITYFX_RUNTIME OFF)
@@ -132,23 +140,15 @@ endif()
 
 # Platform-specific dependencies
 if(WIN32)
-    target_link_libraries(rexui PUBLIC
-        dwmapi
-        Shcore
-    )
+    target_link_libraries(rexui PUBLIC dwmapi shcore dxgi)
+elseif(ANDROID)
+    target_link_libraries(rexui PUBLIC SDL3::SDL3 android log)
 else()
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(GTK3 REQUIRED gtk+-3.0)
     pkg_check_modules(X11_XCB REQUIRED x11-xcb)
-
-    target_include_directories(rexui PRIVATE
-        ${GTK3_INCLUDE_DIRS}
-        ${X11_XCB_INCLUDE_DIRS}
-    )
-    target_link_libraries(rexui PUBLIC
-        ${GTK3_LIBRARIES}
-        ${X11_XCB_LIBRARIES}
-    )
+    target_include_directories(rexui PRIVATE ${GTK3_INCLUDE_DIRS} ${X11_XCB_INCLUDE_DIRS})
+    target_link_libraries(rexui PUBLIC ${GTK3_LIBRARIES} ${X11_XCB_LIBRARIES})
 endif()
 
 # D3D12 backend dependencies
@@ -160,3 +160,7 @@ if(REXGLUE_USE_D3D12)
 endif()
 
 
+
+if(ANDROID)
+    target_link_libraries(rexui PUBLIC SDL3::SDL3 android log)
+endif()

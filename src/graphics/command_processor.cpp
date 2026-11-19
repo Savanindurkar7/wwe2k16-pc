@@ -10,8 +10,11 @@
  */
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <string_view>
 
@@ -24,6 +27,8 @@
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/graphics_system.h>
+#include <rex/diagnostics/rate_census.h>
+#include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/sampler_info.h>
 #include <rex/graphics/xenos.h>
@@ -239,6 +244,56 @@ void CommandProcessor::CallInThread(std::function<void()> fn) {
   }
 }
 
+bool CommandProcessor::MakeGpuWritesVisibleToCpu(uint32_t guest_address, uint32_t length,
+                                                 std::chrono::milliseconds timeout) {
+  if (!length || !worker_running_) {
+    return false;
+  }
+  auto* heap = memory_->LookupHeap(guest_address);
+  if (!heap || heap->heap_type() != memory::HeapType::kGuestPhysical) {
+    return false;
+  }
+  uint32_t physical_address =
+      static_cast<memory::PhysicalHeap*>(heap)->GetPhysicalAddress(guest_address);
+  if (system::XThread::IsInThread(worker_thread_.get())) {
+    return ReadbackGpuWrittenRange(physical_address, length);
+  }
+  std::lock_guard<std::mutex> caller_lock(cpu_visibility_caller_mutex_);
+  std::unique_lock<std::mutex> lock(cpu_visibility_mutex_);
+  cpu_visibility_start_ = physical_address;
+  cpu_visibility_length_ = length;
+  cpu_visibility_done_ = false;
+  cpu_visibility_pending_.store(true, std::memory_order_release);
+  write_ptr_index_event_->Set();
+  if (!cpu_visibility_cv_.wait_for(lock, timeout, [this] { return cpu_visibility_done_; })) {
+    // The worker may be waiting on this thread (e.g. WAIT_REG_MEM); give up rather than
+    // deadlock. A later service of the stale request is harmless.
+    REXGPU_WARN("MakeGpuWritesVisibleToCpu({:08X}, {}) timed out", guest_address, length);
+    return false;
+  }
+  return cpu_visibility_result_;
+}
+
+void CommandProcessor::ServiceCpuVisibilityRequest() {
+  uint32_t start, length;
+  {
+    std::lock_guard<std::mutex> lock(cpu_visibility_mutex_);
+    if (!cpu_visibility_pending_.load(std::memory_order_relaxed)) {
+      return;
+    }
+    start = cpu_visibility_start_;
+    length = cpu_visibility_length_;
+  }
+  bool result = ReadbackGpuWrittenRange(start, length);
+  {
+    std::lock_guard<std::mutex> lock(cpu_visibility_mutex_);
+    cpu_visibility_pending_.store(false, std::memory_order_release);
+    cpu_visibility_result_ = result;
+    cpu_visibility_done_ = true;
+  }
+  cpu_visibility_cv_.notify_all();
+}
+
 void CommandProcessor::ClearCaches() {}
 
 void CommandProcessor::InvalidateGpuMemory() {}
@@ -263,6 +318,12 @@ bool CommandProcessor::IsReadbackMemexportEnabled(bool legacy_backend_flag) cons
   return REXCVAR_GET(readback_memexport);
 }
 
+void CommandProcessor::RefreshReadbackCvarCache(bool legacy_readback_resolve_enabled,
+                                                bool legacy_backend_flag) {
+  readback_resolve_mode_ = GetReadbackResolveMode(legacy_readback_resolve_enabled);
+  readback_memexport_enabled_ = IsReadbackMemexportEnabled(legacy_backend_flag);
+}
+
 void CommandProcessor::SetDesiredSwapPostEffect(SwapPostEffect swap_post_effect) {
   if (swap_post_effect_desired_ == swap_post_effect) {
     return;
@@ -278,6 +339,9 @@ void CommandProcessor::WorkerThreadMain() {
   }
 
   while (worker_running_) {
+    if (cpu_visibility_pending_.load(std::memory_order_acquire)) {
+      ServiceCpuVisibilityRequest();
+    }
     while (!pending_fns_.empty()) {
       auto fn = std::move(pending_fns_.front());
       pending_fns_.pop();
@@ -304,15 +368,18 @@ void CommandProcessor::WorkerThreadMain() {
         loop_count++;
         write_ptr_index = write_ptr_index_.load();
       } while (worker_running_ && pending_fns_.empty() &&
+               !cpu_visibility_pending_.load(std::memory_order_acquire) &&
                (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
       ReturnFromWait();
-      if (!worker_running_ || !pending_fns_.empty()) {
+      if (!worker_running_ || !pending_fns_.empty() ||
+          cpu_visibility_pending_.load(std::memory_order_acquire)) {
         continue;
       }
     }
     assert_true(read_ptr_index_ != write_ptr_index);
 
     // Execute. Note that we handle wraparound transparently.
+    diagnostics::rate_census::RecordGpuBusyStart();
     read_ptr_index_ = ExecutePrimaryBuffer(read_ptr_index_, write_ptr_index);
 
     // TODO(benvanik): use reader->Read_update_freq_ and only issue after moving
@@ -321,6 +388,7 @@ void CommandProcessor::WorkerThreadMain() {
       memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(read_ptr_writeback_ptr_),
                                        read_ptr_index_);
     }
+    diagnostics::rate_census::RecordGpuBusyEnd();
 
     // FIXME: We're supposed to process the WAIT_UNTIL register at this point,
     // but no games seem to actually use it.
@@ -427,9 +495,20 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
     return;
   }
 
+  // Content probe: count guest writes to the RB_COLOR_CLEAR registers (one per
+  // write, regardless of value; a zero value is the clear-to-black signature).
+  // Zero overhead when the gpu_content_probe cvar is off.
+  if (REXCVAR_GET(gpu_content_probe)) {
+    if (index == XE_GPU_REG_RB_COLOR_CLEAR) {
+      content_probe_counters_.OnRbColorClearWrite(value, ContentProbeFrameOrdinal());
+    } else if (index == XE_GPU_REG_RB_COLOR_CLEAR_LO) {
+      content_probe_counters_.OnRbColorClearLoWrite(value, ContentProbeFrameOrdinal());
+    }
+  }
+
   // Volatile for the WAIT_REG_MEM loop.
   const_cast<volatile uint32_t&>(regs.values[index]) = value;
-  if (!regs.GetRegisterInfo(index)) {
+  if (!RegisterFile::IsRegisterKnown(index)) {
     REXGPU_DEBUG("GPU: Write to unknown register ({:04X} = {:08X})", index, value);
   }
 
@@ -807,10 +886,18 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
 
   uint32_t base_index = (packet & 0x7FFF);
   uint32_t write_one_reg = (packet >> 15) & 0x1;
-  for (uint32_t m = 0; m < count; m++) {
-    uint32_t reg_data = reader->ReadAndSwap<uint32_t>();
-    uint32_t target_index = write_one_reg ? base_index : base_index + m;
-    WriteRegister(target_index, reg_data);
+  static const bool type0_bulk_enabled = [] {
+    const char* value = std::getenv("WWE2K16_TYPE0_BULK");
+    return value == nullptr || std::strcmp(value, "0") != 0;
+  }();
+  if (!write_one_reg && type0_bulk_enabled) {
+    WriteRegisterRangeFromRing(reader, base_index, count);
+  } else {
+    for (uint32_t m = 0; m < count; m++) {
+      uint32_t reg_data = reader->ReadAndSwap<uint32_t>();
+      uint32_t target_index = write_one_reg ? base_index : base_index + m;
+      WriteRegister(target_index, reg_data);
+    }
   }
 
   trace_writer_.WritePacketEnd();
@@ -915,12 +1002,16 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
     case PM4_EVENT_WRITE_ZPD:
       result = ExecutePacketType3_EVENT_WRITE_ZPD(reader, packet, count);
       break;
-    case PM4_DRAW_INDX:
+    case PM4_DRAW_INDX: {
+      if (REXCVAR_GET(gpu_content_probe)) { content_probe_counters_.OnDrawPacket(); }
       result = ExecutePacketType3_DRAW_INDX(reader, packet, count);
       break;
-    case PM4_DRAW_INDX_2:
+    }
+    case PM4_DRAW_INDX_2: {
+      if (REXCVAR_GET(gpu_content_probe)) { content_probe_counters_.OnDrawPacket(); }
       result = ExecutePacketType3_DRAW_INDX_2(reader, packet, count);
       break;
+    }
     case PM4_SET_CONSTANT:
       result = ExecutePacketType3_SET_CONSTANT(reader, packet, count);
       break;
@@ -1083,7 +1174,7 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
 #endif
   rex::perf::Profiler::Flip();
 
-  // Xenia-specific VdSwap hook.
+  // the runtime-specific VdSwap hook.
   // VdSwap will post this to tell us we need to swap the screen/fire an
   // interrupt.
   // 63 words here, but only the first has any data.
@@ -1127,6 +1218,27 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
 
   bool is_memory = (wait_info & 0x10) != 0;
 
+  // Census: time unsatisfied waits and retain the poll payload locally. The
+  // counters are updated once, when the wait matches, so the polling loop has
+  // no census lock or map access on each iteration.
+  const bool census_enabled = diagnostics::rate_census::IsEnabled();
+  const uint64_t census_wait_start_ns =
+      census_enabled ? diagnostics::rate_census::NowNs() : 0;
+  const uint64_t census_payload_ms = wait / 0x100;
+  uint64_t census_wait_iterations = 0;
+  uint64_t census_payload_ms_sum = 0;
+  auto census_end_wait = [&]() {
+    if (census_wait_iterations != 0) {
+      const uint64_t now = diagnostics::rate_census::NowNs();
+      diagnostics::rate_census::CpPhaseExit(now);
+      diagnostics::rate_census::RecordWaitRegMem(is_memory, poll_reg_addr,
+                                                 now - census_wait_start_ns,
+                                                 census_payload_ms,
+                                                 census_wait_iterations,
+                                                 census_payload_ms_sum);
+    }
+  };
+
   bool matched = false;
   do {
     uint32_t value = 0;
@@ -1169,6 +1281,15 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         break;
     }
     if (!matched) {
+      if (census_enabled) {
+        if (census_wait_iterations == 0) {
+          const uint64_t now = diagnostics::rate_census::NowNs();
+          diagnostics::rate_census::CpPhaseEnter(
+              diagnostics::rate_census::CpPhase::kWaitRegMem, now);
+        }
+        ++census_wait_iterations;
+        census_payload_ms_sum += census_payload_ms;
+      }
       // Wait.
       if (wait >= 0x100) {
         PrepareForWait();
@@ -1183,6 +1304,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
 
         if (!worker_running_) {
           // Short-circuited exit.
+          census_end_wait();
           return false;
         }
       } else {
@@ -1190,6 +1312,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
       }
     }
   } while (!matched);
+  census_end_wait();
 
   return true;
 }
@@ -1492,7 +1615,7 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
       // TODO(Triang3l): VGT_IMMED_DATA.
       REXGPU_ERROR(
           "{}: Using immediate vertex indices, which are not supported yet. "
-          "Report the game to Xenia developers!",
+          "Please report this.",
           opcode_name, uint32_t(vgt_draw_initiator.source_select));
       draw_succeeded = false;
       assert_always();
@@ -1516,6 +1639,20 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
   if (draw_succeeded) {
     auto viz_query = register_file_->Get<reg::PA_SC_VIZ_QUERY>();
     if (!(viz_query.viz_query_ena && viz_query.kill_pix_post_hi_z)) {
+      const Shader* const pixel_shader = active_pixel_shader();
+      if (REXCVAR_GET(wwe2k16_dof_composite_nop) &&
+          register_file_->Get<reg::RB_MODECONTROL>().edram_mode == EdramMode::kColorDepth &&
+          pixel_shader != nullptr &&
+          pixel_shader->ucode_data_hash() == UINT64_C(0x1233F68C15FDF948)) {
+        static std::atomic_flag logged_dof_composite_skip = ATOMIC_FLAG_INIT;
+        if (!logged_dof_composite_skip.test_and_set(std::memory_order_relaxed)) {
+          REXGPU_INFO(
+              "[wwe2k16-dof] skipped depth-of-field composite PS hash={:016X} (explicit CVar)",
+              pixel_shader->ucode_data_hash());
+        }
+        return true;
+      }
+
       // TODO(Triang3l): Don't drop the draw call completely if the vertex
       // shader has memexport.
       // TODO(Triang3l || JoelLinn): Handle this properly in the render

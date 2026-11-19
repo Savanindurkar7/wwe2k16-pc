@@ -310,6 +310,29 @@ void SharedMemory::FireWatches(uint32_t page_first, uint32_t page_last, bool inv
   }
 }
 
+void SharedMemory::GetGpuWrittenRuns(uint32_t start, uint32_t length,
+                                     std::vector<std::pair<uint32_t, uint32_t>>& runs) {
+  if (length == 0 || start >= kBufferSize) {
+    return;
+  }
+  length = std::min(length, kBufferSize - start);
+  uint32_t page_first = start >> page_size_log2_;
+  uint32_t page_last = (start + length - 1) >> page_size_log2_;
+  auto global_lock = global_critical_region_.Acquire();
+  uint32_t run_first = UINT32_MAX;
+  for (uint32_t page = page_first; page <= page_last + 1; ++page) {
+    bool gpu_written =
+        page <= page_last &&
+        (system_page_flags_valid_and_gpu_written_[page >> 6] >> (page & 63)) & 1;
+    if (gpu_written && run_first == UINT32_MAX) {
+      run_first = page;
+    } else if (!gpu_written && run_first != UINT32_MAX) {
+      runs.emplace_back(run_first << page_size_log2_, (page - run_first) << page_size_log2_);
+      run_first = UINT32_MAX;
+    }
+  }
+}
+
 void SharedMemory::RangeWrittenByGpu(uint32_t start, uint32_t length) {
   if (length == 0 || start >= kBufferSize) {
     return;
@@ -408,8 +431,10 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
   }
 
   // Some texture or buffer is empty, for example - safe to draw in this case.
-  std::vector<std::pair<uint32_t, uint32_t>> merged_ranges;
-  merged_ranges.reserve(count);
+  // Member scratch (like upload_ranges_; requests come from the command processor thread): no heap allocation
+  // per request - this runs for index and vertex buffers on every draw.
+  std::vector<std::pair<uint32_t, uint32_t>>& merged_ranges = request_ranges_scratch_;
+  merged_ranges.clear();
   for (size_t i = 0; i < count; ++i) {
     uint32_t start = ranges[i].first;
     uint32_t length = ranges[i].second;
@@ -427,10 +452,12 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
 
   SCOPE_profile_cpu_f("gpu");
 
-  std::sort(merged_ranges.begin(), merged_ranges.end(),
-            [](const std::pair<uint32_t, uint32_t>& a, const std::pair<uint32_t, uint32_t>& b) {
-              return a.first < b.first;
-            });
+  if (merged_ranges.size() > 1) {
+    std::sort(merged_ranges.begin(), merged_ranges.end(),
+              [](const std::pair<uint32_t, uint32_t>& a, const std::pair<uint32_t, uint32_t>& b) {
+                return a.first < b.first;
+              });
+  }
   size_t merged_write = 0;
   for (size_t i = 1; i < merged_ranges.size(); ++i) {
     std::pair<uint32_t, uint32_t>& range_previous = merged_ranges[merged_write];

@@ -10,8 +10,16 @@
  */
 
 #include <algorithm>
+#include <set>
+#include <tuple>
 #include <array>
+#include <atomic>
+#include <bit>
+#include <charconv>
+#include <chrono>
+#include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iterator>
 #include <mutex>
@@ -26,14 +34,18 @@
 #include <rex/assert.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
+#include <rex/diagnostics/rate_census.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+#include <rex/graphics/util/content_probe.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/vulkan/command_processor.h>
+#include "gpu_timing.h"
+#include <rex/system/mmio_handler.h>
 #include <rex/graphics/vulkan/pipeline_cache.h>
 #include <rex/graphics/vulkan/render_target_cache.h>
 #include <rex/graphics/vulkan/shader.h>
@@ -45,6 +57,17 @@
 #include <rex/ui/flags.h>
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/util.h>
+
+REXCVAR_DEFINE_STRING(debug_periodic_cache_clear, "", "GPU/Vulkan",
+                      "Diagnostic: every debug_periodic_cache_clear_frames frames, clear one "
+                      "cache: texture, descriptors (transient descriptor pools only), "
+                      "render_target, or memory (shared-memory watches, primitive cache, "
+                      "vertex residency)")
+    .allowed({"", "texture", "descriptors", "render_target", "memory"});
+REXCVAR_DEFINE_STRING(wwe2k16_ui_c0_remap, "", "GPU/Vulkan",
+                      "Default-off per-draw UI vertex c0 remap set by the app's internal resolution selection");
+REXCVAR_DEFINE_INT32(debug_periodic_cache_clear_frames, 30, "GPU/Vulkan",
+                     "Frame period for debug_periodic_cache_clear");
 
 // Legacy backend compatibility aliases for shared readback controls.
 REXCVAR_DEFINE_BOOL(vulkan_readback_resolve, false, "GPU/Vulkan",
@@ -72,6 +95,330 @@ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
 namespace rex::graphics::vulkan {
 
 namespace {
+
+bool TextureDescriptorSetReuseEnabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("WWE2K16_DESC_REUSE");
+    return value == nullptr || std::string_view(value) != "0";
+  }();
+  return enabled;
+}
+
+bool AsyncSubmissionEnabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("WWE2K16_ASYNC_SUBMIT");
+    return value == nullptr || std::string_view(value) != "0";
+  }();
+  return enabled;
+}
+
+bool DescriptorImageInfoEqual(const VkDescriptorImageInfo& left,
+                              const VkDescriptorImageInfo& right) {
+  return left.sampler == right.sampler && left.imageView == right.imageView &&
+         left.imageLayout == right.imageLayout;
+}
+
+uint64_t HashDescriptorImageInfos(const VkDescriptorImageInfo* infos, size_t count) {
+  uint64_t hash = 0xCBF29CE484222325ull ^ count;
+  auto mix = [&hash](uint64_t value) {
+    hash ^= value;
+    hash *= 0x100000001B3ull;
+    hash ^= hash >> 29;
+  };
+  for (size_t i = 0; i < count; ++i) {
+    mix(uint64_t(infos[i].sampler));
+    mix(uint64_t(infos[i].imageView));
+    mix(uint64_t(infos[i].imageLayout));
+  }
+  return hash;
+}
+
+bool DescriptorImageInfosEqual(const std::vector<VkDescriptorImageInfo>& left,
+                               const VkDescriptorImageInfo* right, size_t right_count) {
+  if (left.size() != right_count) {
+    return false;
+  }
+  for (size_t i = 0; i < right_count; ++i) {
+    if (!DescriptorImageInfoEqual(left[i], right[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+struct UiC0RemapConfig {
+  bool enabled = false;
+  uint32_t from_x = 0;
+  uint32_t from_y = 0;
+  uint32_t to_x = 0;
+  uint32_t to_y = 0;
+  uint32_t scene_width = 0;
+  uint32_t scene_height = 0;
+  std::array<uint64_t, 8> vertex_shader_hashes{};
+  size_t vertex_shader_hash_count = 0;
+};
+
+constexpr uint32_t kUiWidth = 1280;
+constexpr uint32_t kUiHeight = 720;
+
+bool DecodeUiC0SceneExtent(uint32_t c0_bits, uint32_t& extent) {
+  const float c0 = std::bit_cast<float>(c0_bits);
+  if (!std::isfinite(c0) || c0 <= 0.0f) {
+    return false;
+  }
+  const double extent_value = 2.0 / double(c0);
+  if (!std::isfinite(extent_value) || extent_value < 1.0 || extent_value > 8192.0) {
+    return false;
+  }
+  const long rounded_extent = std::lround(extent_value);
+  if (std::abs(extent_value - double(rounded_extent)) > 0.01) {
+    return false;
+  }
+  extent = uint32_t(rounded_extent);
+  return true;
+}
+
+constexpr uint32_t ScaleUiScissorFloor(uint32_t value, uint32_t target,
+                                       uint32_t source) {
+  return uint32_t((uint64_t(value) * target) / source);
+}
+
+constexpr uint32_t ScaleUiScissorCeil(uint32_t value, uint32_t target,
+                                     uint32_t source) {
+  return uint32_t((uint64_t(value) * target + source - 1) / source);
+}
+
+constexpr uint32_t ScaleUiScissorBR(uint32_t value, uint32_t target,
+                                    uint32_t source, uint32_t target_extent) {
+  return value == target_extent ? target_extent
+                                : ScaleUiScissorCeil(value, target, source);
+}
+
+static_assert(ScaleUiScissorFloor(258, 640, 1280) == 129);
+static_assert(ScaleUiScissorFloor(230, 480, 720) == 153);
+static_assert(ScaleUiScissorBR(640, 640, 1280, 640) == 640);
+static_assert(ScaleUiScissorBR(390, 480, 720, 480) == 260);
+static_assert(ScaleUiScissorFloor(258, 1024, 1280) == 206);
+static_assert(ScaleUiScissorFloor(230, 576, 720) == 184);
+static_assert(ScaleUiScissorBR(1024, 1024, 1280, 1024) == 1024);
+static_assert(ScaleUiScissorBR(390, 576, 720, 576) == 312);
+
+void ScaleUiScissorToScene(const UiC0RemapConfig& config, draw_util::Scissor& scissor) {
+  const uint32_t left = scissor.offset[0];
+  const uint32_t top = scissor.offset[1];
+  const uint32_t right = left + scissor.extent[0];
+  const uint32_t bottom = top + scissor.extent[1];
+  // A guest BR that is already clamped to the selected scene edge is a target
+  // pixel extent, not a UI-space coordinate. Preserve that edge; scale all
+  // other BR values outward so fractional coverage remains included.
+  const uint32_t scaled_left = std::min(
+      config.scene_width, ScaleUiScissorFloor(left, config.scene_width, kUiWidth));
+  const uint32_t scaled_top = std::min(
+      config.scene_height, ScaleUiScissorFloor(top, config.scene_height, kUiHeight));
+  const uint32_t scaled_right = right == config.scene_width
+                                    ? config.scene_width
+                                    : std::min(config.scene_width,
+                                               ScaleUiScissorBR(right, config.scene_width,
+                                                                kUiWidth, config.scene_width));
+  const uint32_t scaled_bottom = bottom == config.scene_height
+                                     ? config.scene_height
+                                     : std::min(config.scene_height,
+                                                ScaleUiScissorBR(bottom, config.scene_height,
+                                                                 kUiHeight,
+                                                                 config.scene_height));
+  scissor.offset[0] = scaled_left;
+  scissor.offset[1] = scaled_top;
+  scissor.extent[0] = std::max(scaled_right, scaled_left) - scaled_left;
+  scissor.extent[1] = std::max(scaled_bottom, scaled_top) - scaled_top;
+}
+
+bool ParseUiC0RemapHex(std::string_view value, uint64_t& parsed) {
+  if (value.empty()) {
+    return false;
+  }
+  const char* const begin = value.data();
+  const char* const end = begin + value.size();
+  const auto result = std::from_chars(begin, end, parsed, 16);
+  return result.ec == std::errc{} && result.ptr == end;
+}
+
+const UiC0RemapConfig& GetUiC0RemapConfig() {
+  static const UiC0RemapConfig config = [] {
+    UiC0RemapConfig result;
+    const std::string setting = REXCVAR_GET(wwe2k16_ui_c0_remap);
+    if (setting.empty()) {
+      REXGPU_INFO("[wwe2k16-ui-c0-remap] inactive (SDK cvar is empty)");
+      return result;
+    }
+
+    std::array<std::string_view, 6> fields{};
+    std::string_view remaining(setting);
+    for (size_t i = 0; i + 1 < fields.size(); ++i) {
+      const size_t separator = remaining.find(':');
+      if (separator == std::string_view::npos) {
+        REXGPU_WARN("[wwe2k16-ui-c0-remap] invalid configuration; remap remains inactive");
+        return result;
+      }
+      fields[i] = remaining.substr(0, separator);
+      remaining.remove_prefix(separator + 1);
+    }
+    fields.back() = remaining;
+
+    uint64_t from_x = 0, from_y = 0, to_x = 0, to_y = 0;
+    if (fields[0] != "v1" || !ParseUiC0RemapHex(fields[1], from_x) ||
+        !ParseUiC0RemapHex(fields[2], from_y) || !ParseUiC0RemapHex(fields[3], to_x) ||
+        !ParseUiC0RemapHex(fields[4], to_y) || from_x > UINT32_MAX || from_y > UINT32_MAX ||
+        to_x > UINT32_MAX || to_y > UINT32_MAX) {
+      REXGPU_WARN("[wwe2k16-ui-c0-remap] invalid configuration; remap remains inactive");
+      return result;
+    }
+
+    std::string_view hashes = fields[5];
+    while (!hashes.empty()) {
+      if (result.vertex_shader_hash_count == result.vertex_shader_hashes.size()) {
+        REXGPU_WARN("[wwe2k16-ui-c0-remap] too many shader hashes; remap remains inactive");
+        return UiC0RemapConfig{};
+      }
+      const size_t separator = hashes.find(',');
+      const std::string_view hash_text = hashes.substr(0, separator);
+      uint64_t hash = 0;
+      if (!ParseUiC0RemapHex(hash_text, hash) || hash == 0) {
+        REXGPU_WARN("[wwe2k16-ui-c0-remap] invalid shader hash; remap remains inactive");
+        return UiC0RemapConfig{};
+      }
+      result.vertex_shader_hashes[result.vertex_shader_hash_count++] = hash;
+      if (separator == std::string_view::npos) {
+        hashes = {};
+      } else {
+        hashes.remove_prefix(separator + 1);
+      }
+    }
+    if (result.vertex_shader_hash_count == 0) {
+      REXGPU_WARN("[wwe2k16-ui-c0-remap] no shader hashes; remap remains inactive");
+      return UiC0RemapConfig{};
+    }
+
+    result.from_x = static_cast<uint32_t>(from_x);
+    result.from_y = static_cast<uint32_t>(from_y);
+    result.to_x = static_cast<uint32_t>(to_x);
+    result.to_y = static_cast<uint32_t>(to_y);
+    if (!DecodeUiC0SceneExtent(result.from_x, result.scene_width) ||
+        !DecodeUiC0SceneExtent(result.from_y, result.scene_height)) {
+      REXGPU_WARN("[wwe2k16-ui-c0-remap] invalid source c0 extents; remap remains inactive");
+      return UiC0RemapConfig{};
+    }
+    result.enabled = true;
+    // One line reports the exact active from/to pair and all stable shader
+    // hashes. The string is the startup-supplied v1 configuration.
+    REXGPU_INFO("[wwe2k16-ui-c0-remap] active config='{}'", setting);
+    return result;
+  }();
+  return config;
+}
+
+bool GetUiC0RemapTarget(const UiC0RemapConfig& config, uint64_t vertex_shader_hash,
+                        uint32_t c0_x, uint32_t c0_y, uint32_t& target_x,
+                        uint32_t& target_y) {
+  if (!config.enabled || c0_x != config.from_x || c0_y != config.from_y) {
+    return false;
+  }
+  for (size_t i = 0; i < config.vertex_shader_hash_count; ++i) {
+    if (config.vertex_shader_hashes[i] == vertex_shader_hash) {
+      target_x = config.to_x;
+      target_y = config.to_y;
+      return true;
+    }
+  }
+  return false;
+}
+
+// A UI-shader draw whose fetch-0 texture has exactly the scene size is a full-screen scene
+// copy/fade. Real 480p/576p modes draw these in scene units, so leave them unchanged to avoid
+// shrinking them into the top-left (a dark 320x320 box at 480p). The custom 1080p
+// scene keeps 1280x720 UI units, so its scene-sized copies still need the remap.
+bool UiC0DrawSamplesSceneSizedTexture(const UiC0RemapConfig& config, const RegisterFile& regs) {
+  if (!config.scene_width || !config.scene_height ||
+      (config.scene_width >= kUiWidth && config.scene_height >= kUiHeight)) {
+    return false;
+  }
+  const uint32_t fetch0 = regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0];
+  if ((fetch0 & 3) != 2) {
+    return false;
+  }
+  const uint32_t size = regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 2];
+  const uint32_t width = (size & 0x1FFF) + 1;
+  const uint32_t height = ((size >> 13) & 0x1FFF) + 1;
+  return width == config.scene_width && height == config.scene_height;
+}
+
+constexpr size_t kFloatConstantBytes = sizeof(float) * 4;
+
+void CopyFloatConstantMapEntry(uint8_t*& mapping, const uint32_t* regs,
+                               uint64_t float_constant_map_entry) {
+  uint32_t float_constant_index;
+  while (rex::bit_scan_forward(float_constant_map_entry, &float_constant_index)) {
+    const uint64_t run_start_bits = float_constant_map_entry >> float_constant_index;
+    uint32_t run_length;
+    if (!rex::bit_scan_forward(~run_start_bits, &run_length)) {
+      run_length = 64 - float_constant_index;
+    }
+
+    const size_t run_bytes = size_t(run_length) * kFloatConstantBytes;
+    std::memcpy(mapping, &regs[float_constant_index * 4], run_bytes);
+    mapping += run_bytes;
+
+    const uint64_t run_mask =
+        run_length == 64 ? ~uint64_t(0) : (UINT64_C(1) << run_length) - 1;
+    float_constant_map_entry &= ~(run_mask << float_constant_index);
+  }
+}
+
+#if !defined(NDEBUG)
+void CheckFloatConstantMapEntryCopy() {
+  constexpr size_t kFloatConstantCount = 64;
+  constexpr size_t kMaximumOutputBytes = kFloatConstantCount * kFloatConstantBytes;
+  std::array<uint32_t, kFloatConstantCount * 4> source_regs;
+  for (size_t i = 0; i < source_regs.size(); ++i) {
+    source_regs[i] = uint32_t(i * UINT32_C(0x9E3779B9)) ^
+                     (UINT32_C(0xA5A5A5A5) + uint32_t(i));
+  }
+
+  const auto verify = [&](uint64_t map) {
+    std::array<uint8_t, kMaximumOutputBytes> expected;
+    std::array<uint8_t, kMaximumOutputBytes> actual;
+    size_t expected_bytes = 0;
+    for (uint32_t index = 0; index < kFloatConstantCount; ++index) {
+      if (map & (UINT64_C(1) << index)) {
+        std::memcpy(expected.data() + expected_bytes, &source_regs[index * 4],
+                    kFloatConstantBytes);
+        expected_bytes += kFloatConstantBytes;
+      }
+    }
+
+    uint8_t* actual_end = actual.data();
+    CopyFloatConstantMapEntry(actual_end, source_regs.data(), map);
+    const size_t actual_bytes = size_t(actual_end - actual.data());
+    if (actual_bytes != expected_bytes ||
+        std::memcmp(expected.data(), actual.data(), expected_bytes) != 0) {
+      std::abort();
+    }
+  };
+
+  for (uint64_t map : std::array<uint64_t, 4>{
+           UINT64_C(0), ~uint64_t(0), UINT64_C(0x5555555555555555),
+           UINT64_C(0xAAAAAAAAAAAAAAAA)}) {
+    verify(map);
+  }
+
+  uint64_t random_state = UINT64_C(0xD1B54A32D192ED03);
+  for (uint32_t i = 0; i < 1024; ++i) {
+    random_state ^= random_state >> 12;
+    random_state ^= random_state << 25;
+    random_state ^= random_state >> 27;
+    verify(random_state * UINT64_C(0x2545F4914F6CDD1D));
+  }
+}
+#endif  // !defined(NDEBUG)
 
 // glslang default built-in resource limits.
 constexpr TBuiltInResource kGlslangDefaultTBuiltInResource = {
@@ -194,16 +541,9 @@ layout(push_constant) uniform XeApplyGammaRampConstants {
 layout(set = 0, binding = 0) uniform sampler2D xe_fxaa_source;
 layout(set = 1, binding = 0, rgb10_a2) writeonly uniform image2D xe_fxaa_dest;
 
-const vec3 kLumaWeights = vec3(0.299, 0.587, 0.114);
 const float kEdgeThreshold = 0.063;
 const float kEdgeThresholdMin = 0.0312;
-const float kSpanMax = 12.0;
-const float kDirReduceMul = 0.125;
-const float kDirReduceMin = 1.0 / 128.0;
-
-float SampleLuma(vec2 uv) {
-  return textureLod(xe_fxaa_source, uv, 0.0).a;
-}
+const float kSubpixQuality = 0.75;
 
 void main() {
   uvec2 pixel = gl_GlobalInvocationID.xy;
@@ -214,42 +554,105 @@ void main() {
   vec2 uv = (vec2(pixel) + vec2(0.5)) * xe_fxaa_size_inv;
   vec2 texel = xe_fxaa_size_inv;
   vec4 rgbm = textureLod(xe_fxaa_source, uv, 0.0);
-
   float lumaM = rgbm.a;
-  float lumaNW = SampleLuma(uv + vec2(-texel.x, -texel.y));
-  float lumaNE = SampleLuma(uv + vec2( texel.x, -texel.y));
-  float lumaSW = SampleLuma(uv + vec2(-texel.x,  texel.y));
-  float lumaSE = SampleLuma(uv + vec2( texel.x,  texel.y));
 
-  float lumaMin = min(lumaM, min(min(lumaNW, lumaNE), min(lumaSW, lumaSE)));
-  float lumaMax = max(lumaM, max(max(lumaNW, lumaNE), max(lumaSW, lumaSE)));
+  float lumaN = textureLod(xe_fxaa_source, uv + vec2(0.0, -texel.y), 0.0).a;
+  float lumaS = textureLod(xe_fxaa_source, uv + vec2(0.0,  texel.y), 0.0).a;
+  float lumaW = textureLod(xe_fxaa_source, uv + vec2(-texel.x, 0.0), 0.0).a;
+  float lumaE = textureLod(xe_fxaa_source, uv + vec2( texel.x, 0.0), 0.0).a;
+
+  float lumaMin = min(lumaM, min(min(lumaN, lumaW), min(lumaS, lumaE)));
+  float lumaMax = max(lumaM, max(max(lumaN, lumaW), max(lumaS, lumaE)));
   float lumaRange = lumaMax - lumaMin;
 
-  vec3 result = rgbm.rgb;
-  if (lumaRange >= max(kEdgeThresholdMin, lumaMax * kEdgeThreshold)) {
-    vec2 dir;
-    dir.x = -((lumaNW + lumaNE) - (lumaSW + lumaSE));
-    dir.y =  ((lumaNW + lumaSW) - (lumaNE + lumaSE));
-
-    float dirReduce = max(
-        (lumaNW + lumaNE + lumaSW + lumaSE) * (0.25 * kDirReduceMul),
-        kDirReduceMin);
-    float rcpDirMin = 1.0 / (min(abs(dir.x), abs(dir.y)) + dirReduce);
-    dir = clamp(dir * rcpDirMin, vec2(-kSpanMax), vec2(kSpanMax)) * texel;
-
-    vec3 rgbA =
-        0.5 *
-        (textureLod(xe_fxaa_source, uv + dir * (1.0 / 3.0 - 0.5), 0.0).rgb +
-         textureLod(xe_fxaa_source, uv + dir * (2.0 / 3.0 - 0.5), 0.0).rgb);
-    vec3 rgbB =
-        rgbA * 0.5 +
-        0.25 *
-            (textureLod(xe_fxaa_source, uv + dir * -0.5, 0.0).rgb +
-             textureLod(xe_fxaa_source, uv + dir * 0.5, 0.0).rgb);
-    float lumaB = dot(rgbB, kLumaWeights);
-    result = (lumaB < lumaMin || lumaB > lumaMax) ? rgbA : rgbB;
+  if (lumaRange < max(kEdgeThresholdMin, lumaMax * kEdgeThreshold)) {
+    imageStore(xe_fxaa_dest, ivec2(pixel), vec4(rgbm.rgb, 1.0));
+    return;
   }
 
+  float lumaNW = textureLod(xe_fxaa_source, uv + vec2(-texel.x, -texel.y), 0.0).a;
+  float lumaNE = textureLod(xe_fxaa_source, uv + vec2( texel.x, -texel.y), 0.0).a;
+  float lumaSW = textureLod(xe_fxaa_source, uv + vec2(-texel.x,  texel.y), 0.0).a;
+  float lumaSE = textureLod(xe_fxaa_source, uv + vec2( texel.x,  texel.y), 0.0).a;
+
+  float lumaL = (lumaN + lumaS + lumaE + lumaW) * 2.0 + (lumaNW + lumaNE + lumaSW + lumaSE);
+  float subpix = abs(lumaL * (1.0 / 12.0) - lumaM);
+  float subpixFilter = clamp(subpix / lumaRange, 0.0, 1.0);
+  float subpixBlend = (-2.0 * subpixFilter + 3.0) * subpixFilter * subpixFilter;
+  float subpixOffset = clamp(subpixBlend * subpixBlend * kSubpixQuality, 0.0, 0.5);
+
+  float edgeHorz = abs(-2.0 * lumaM + lumaN + lumaS) * 2.0 +
+                   abs(-2.0 * lumaW + lumaNW + lumaSW) +
+                   abs(-2.0 * lumaE + lumaNE + lumaSE);
+  float edgeVert = abs(-2.0 * lumaM + lumaW + lumaE) * 2.0 +
+                   abs(-2.0 * lumaN + lumaNW + lumaNE) +
+                   abs(-2.0 * lumaS + lumaSW + lumaSE);
+  bool isHorz = (edgeHorz >= edgeVert);
+
+  float lumaNeg = isHorz ? lumaN : lumaW;
+  float lumaPos = isHorz ? lumaS : lumaE;
+  float gradientNeg = abs(lumaNeg - lumaM);
+  float gradientPos = abs(lumaPos - lumaM);
+
+  bool isNegSteeper = (gradientNeg >= gradientPos);
+  float gradientScaled = 0.25 * max(gradientNeg, gradientPos);
+
+  vec2 stepDir = isHorz ? vec2(texel.x, 0.0) : vec2(0.0, texel.y);
+  vec2 edgePos = uv;
+  if (isHorz) {
+    edgePos.y += (isNegSteeper ? -0.5 : 0.5) * texel.y;
+  } else {
+    edgePos.x += (isNegSteeper ? -0.5 : 0.5) * texel.x;
+  }
+
+  float lumaTarget = 0.5 * (lumaM + (isNegSteeper ? lumaNeg : lumaPos));
+
+  vec2 posNeg = edgePos - stepDir;
+  vec2 posPos = edgePos + stepDir;
+
+  float lumaEndNeg = textureLod(xe_fxaa_source, posNeg, 0.0).a - lumaTarget;
+  float lumaEndPos = textureLod(xe_fxaa_source, posPos, 0.0).a - lumaTarget;
+
+  bool doneNeg = abs(lumaEndNeg) >= gradientScaled;
+  bool donePos = abs(lumaEndPos) >= gradientScaled;
+
+  const float kSteps[10] = float[10](1.5, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 4.0, 8.0);
+  for (int i = 0; i < 10; ++i) {
+    if (!doneNeg) {
+      posNeg -= stepDir * kSteps[i];
+      lumaEndNeg = textureLod(xe_fxaa_source, posNeg, 0.0).a - lumaTarget;
+      doneNeg = abs(lumaEndNeg) >= gradientScaled;
+    }
+    if (!donePos) {
+      posPos += stepDir * kSteps[i];
+      lumaEndPos = textureLod(xe_fxaa_source, posPos, 0.0).a - lumaTarget;
+      donePos = abs(lumaEndPos) >= gradientScaled;
+    }
+    if (doneNeg && donePos) break;
+  }
+
+  float dstNeg = isHorz ? (uv.x - posNeg.x) : (uv.y - posNeg.y);
+  float dstPos = isHorz ? (posPos.x - uv.x) : (posPos.y - uv.y);
+
+  bool isCloserToNeg = (dstNeg < dstPos);
+  float dstMin = min(dstNeg, dstPos);
+  float spanLength = dstNeg + dstPos;
+  float pixelOffset = clamp(0.5 - (dstMin / spanLength), 0.0, 0.5);
+
+  float lumaEndCloser = isCloserToNeg ? lumaEndNeg : lumaEndPos;
+  bool isGoodSpan = (lumaEndCloser < 0.0) == (lumaM < lumaTarget);
+  float edgeOffset = isGoodSpan ? 0.0 : pixelOffset;
+
+  float finalOffset = max(edgeOffset, subpixOffset);
+
+  vec2 finalUv = uv;
+  if (isHorz) {
+    finalUv.y += (isNegSteeper ? -finalOffset : finalOffset) * texel.y;
+  } else {
+    finalUv.x += (isNegSteeper ? -finalOffset : finalOffset) * texel.x;
+  }
+
+  vec3 result = textureLod(xe_fxaa_source, finalUv, 0.0).rgb;
   imageStore(xe_fxaa_dest, ivec2(pixel), vec4(result, 1.0));
 }
 )"
@@ -264,16 +667,9 @@ layout(push_constant) uniform XeApplyGammaRampConstants {
 layout(set = 0, binding = 0) uniform sampler2D xe_fxaa_source;
 layout(set = 1, binding = 0, rgb10_a2) writeonly uniform image2D xe_fxaa_dest;
 
-const vec3 kLumaWeights = vec3(0.299, 0.587, 0.114);
 const float kEdgeThreshold = 0.166;
 const float kEdgeThresholdMin = 0.0833;
-const float kSpanMax = 8.0;
-const float kDirReduceMul = 0.125;
-const float kDirReduceMin = 1.0 / 128.0;
-
-float SampleLuma(vec2 uv) {
-  return textureLod(xe_fxaa_source, uv, 0.0).a;
-}
+const float kSubpixQuality = 0.75;
 
 void main() {
   uvec2 pixel = gl_GlobalInvocationID.xy;
@@ -284,42 +680,105 @@ void main() {
   vec2 uv = (vec2(pixel) + vec2(0.5)) * xe_fxaa_size_inv;
   vec2 texel = xe_fxaa_size_inv;
   vec4 rgbm = textureLod(xe_fxaa_source, uv, 0.0);
-
   float lumaM = rgbm.a;
-  float lumaNW = SampleLuma(uv + vec2(-texel.x, -texel.y));
-  float lumaNE = SampleLuma(uv + vec2( texel.x, -texel.y));
-  float lumaSW = SampleLuma(uv + vec2(-texel.x,  texel.y));
-  float lumaSE = SampleLuma(uv + vec2( texel.x,  texel.y));
 
-  float lumaMin = min(lumaM, min(min(lumaNW, lumaNE), min(lumaSW, lumaSE)));
-  float lumaMax = max(lumaM, max(max(lumaNW, lumaNE), max(lumaSW, lumaSE)));
+  float lumaN = textureLod(xe_fxaa_source, uv + vec2(0.0, -texel.y), 0.0).a;
+  float lumaS = textureLod(xe_fxaa_source, uv + vec2(0.0,  texel.y), 0.0).a;
+  float lumaW = textureLod(xe_fxaa_source, uv + vec2(-texel.x, 0.0), 0.0).a;
+  float lumaE = textureLod(xe_fxaa_source, uv + vec2( texel.x, 0.0), 0.0).a;
+
+  float lumaMin = min(lumaM, min(min(lumaN, lumaW), min(lumaS, lumaE)));
+  float lumaMax = max(lumaM, max(max(lumaN, lumaW), max(lumaS, lumaE)));
   float lumaRange = lumaMax - lumaMin;
 
-  vec3 result = rgbm.rgb;
-  if (lumaRange >= max(kEdgeThresholdMin, lumaMax * kEdgeThreshold)) {
-    vec2 dir;
-    dir.x = -((lumaNW + lumaNE) - (lumaSW + lumaSE));
-    dir.y =  ((lumaNW + lumaSW) - (lumaNE + lumaSE));
-
-    float dirReduce = max(
-        (lumaNW + lumaNE + lumaSW + lumaSE) * (0.25 * kDirReduceMul),
-        kDirReduceMin);
-    float rcpDirMin = 1.0 / (min(abs(dir.x), abs(dir.y)) + dirReduce);
-    dir = clamp(dir * rcpDirMin, vec2(-kSpanMax), vec2(kSpanMax)) * texel;
-
-    vec3 rgbA =
-        0.5 *
-        (textureLod(xe_fxaa_source, uv + dir * (1.0 / 3.0 - 0.5), 0.0).rgb +
-         textureLod(xe_fxaa_source, uv + dir * (2.0 / 3.0 - 0.5), 0.0).rgb);
-    vec3 rgbB =
-        rgbA * 0.5 +
-        0.25 *
-            (textureLod(xe_fxaa_source, uv + dir * -0.5, 0.0).rgb +
-             textureLod(xe_fxaa_source, uv + dir * 0.5, 0.0).rgb);
-    float lumaB = dot(rgbB, kLumaWeights);
-    result = (lumaB < lumaMin || lumaB > lumaMax) ? rgbA : rgbB;
+  if (lumaRange < max(kEdgeThresholdMin, lumaMax * kEdgeThreshold)) {
+    imageStore(xe_fxaa_dest, ivec2(pixel), vec4(rgbm.rgb, 1.0));
+    return;
   }
 
+  float lumaNW = textureLod(xe_fxaa_source, uv + vec2(-texel.x, -texel.y), 0.0).a;
+  float lumaNE = textureLod(xe_fxaa_source, uv + vec2( texel.x, -texel.y), 0.0).a;
+  float lumaSW = textureLod(xe_fxaa_source, uv + vec2(-texel.x,  texel.y), 0.0).a;
+  float lumaSE = textureLod(xe_fxaa_source, uv + vec2( texel.x,  texel.y), 0.0).a;
+
+  float lumaL = (lumaN + lumaS + lumaE + lumaW) * 2.0 + (lumaNW + lumaNE + lumaSW + lumaSE);
+  float subpix = abs(lumaL * (1.0 / 12.0) - lumaM);
+  float subpixFilter = clamp(subpix / lumaRange, 0.0, 1.0);
+  float subpixBlend = (-2.0 * subpixFilter + 3.0) * subpixFilter * subpixFilter;
+  float subpixOffset = clamp(subpixBlend * subpixBlend * kSubpixQuality, 0.0, 0.5);
+
+  float edgeHorz = abs(-2.0 * lumaM + lumaN + lumaS) * 2.0 +
+                   abs(-2.0 * lumaW + lumaNW + lumaSW) +
+                   abs(-2.0 * lumaE + lumaNE + lumaSE);
+  float edgeVert = abs(-2.0 * lumaM + lumaW + lumaE) * 2.0 +
+                   abs(-2.0 * lumaN + lumaNW + lumaNE) +
+                   abs(-2.0 * lumaS + lumaSW + lumaSE);
+  bool isHorz = (edgeHorz >= edgeVert);
+
+  float lumaNeg = isHorz ? lumaN : lumaW;
+  float lumaPos = isHorz ? lumaS : lumaE;
+  float gradientNeg = abs(lumaNeg - lumaM);
+  float gradientPos = abs(lumaPos - lumaM);
+
+  bool isNegSteeper = (gradientNeg >= gradientPos);
+  float gradientScaled = 0.25 * max(gradientNeg, gradientPos);
+
+  vec2 stepDir = isHorz ? vec2(texel.x, 0.0) : vec2(0.0, texel.y);
+  vec2 edgePos = uv;
+  if (isHorz) {
+    edgePos.y += (isNegSteeper ? -0.5 : 0.5) * texel.y;
+  } else {
+    edgePos.x += (isNegSteeper ? -0.5 : 0.5) * texel.x;
+  }
+
+  float lumaTarget = 0.5 * (lumaM + (isNegSteeper ? lumaNeg : lumaPos));
+
+  vec2 posNeg = edgePos - stepDir;
+  vec2 posPos = edgePos + stepDir;
+
+  float lumaEndNeg = textureLod(xe_fxaa_source, posNeg, 0.0).a - lumaTarget;
+  float lumaEndPos = textureLod(xe_fxaa_source, posPos, 0.0).a - lumaTarget;
+
+  bool doneNeg = abs(lumaEndNeg) >= gradientScaled;
+  bool donePos = abs(lumaEndPos) >= gradientScaled;
+
+  const float kSteps[6] = float[6](1.5, 2.0, 2.0, 2.0, 2.0, 4.0);
+  for (int i = 0; i < 6; ++i) {
+    if (!doneNeg) {
+      posNeg -= stepDir * kSteps[i];
+      lumaEndNeg = textureLod(xe_fxaa_source, posNeg, 0.0).a - lumaTarget;
+      doneNeg = abs(lumaEndNeg) >= gradientScaled;
+    }
+    if (!donePos) {
+      posPos += stepDir * kSteps[i];
+      lumaEndPos = textureLod(xe_fxaa_source, posPos, 0.0).a - lumaTarget;
+      donePos = abs(lumaEndPos) >= gradientScaled;
+    }
+    if (doneNeg && donePos) break;
+  }
+
+  float dstNeg = isHorz ? (uv.x - posNeg.x) : (uv.y - posNeg.y);
+  float dstPos = isHorz ? (posPos.x - uv.x) : (posPos.y - uv.y);
+
+  bool isCloserToNeg = (dstNeg < dstPos);
+  float dstMin = min(dstNeg, dstPos);
+  float spanLength = dstNeg + dstPos;
+  float pixelOffset = clamp(0.5 - (dstMin / spanLength), 0.0, 0.5);
+
+  float lumaEndCloser = isCloserToNeg ? lumaEndNeg : lumaEndPos;
+  bool isGoodSpan = (lumaEndCloser < 0.0) == (lumaM < lumaTarget);
+  float edgeOffset = isGoodSpan ? 0.0 : pixelOffset;
+
+  float finalOffset = max(edgeOffset, subpixOffset);
+
+  vec2 finalUv = uv;
+  if (isHorz) {
+    finalUv.y += (isNegSteeper ? -finalOffset : finalOffset) * texel.y;
+  } else {
+    finalUv.x += (isNegSteeper ? -finalOffset : finalOffset) * texel.x;
+  }
+
+  vec3 result = textureLod(xe_fxaa_source, finalUv, 0.0).rgb;
   imageStore(xe_fxaa_dest, ivec2(pixel), vec4(result, 1.0));
 }
 )";
@@ -593,10 +1052,237 @@ VulkanCommandProcessor::VulkanCommandProcessor(VulkanGraphicsSystem* graphics_sy
               ->vulkan_device(),
           kDescriptorPoolSizeTextures, uint32_t(rex::countof(kDescriptorPoolSizeTextures)),
           kLinkedTypeDescriptorPoolSetCount) {
+  gpu_timing_ = std::make_unique<GpuTiming>();
+  async_submission_enabled_ = AsyncSubmissionEnabled();
   legacy_readback_memexport_cvar_name_ = "vulkan_readback_memexport";
 }
 
-VulkanCommandProcessor::~VulkanCommandProcessor() = default;
+VulkanCommandProcessor::~VulkanCommandProcessor() { StopSubmissionWorker(); }
+
+void VulkanCommandProcessor::StartSubmissionWorker() {
+  if (!async_submission_enabled_ || submission_worker_.joinable()) {
+    return;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(submission_worker_mutex_);
+    submission_worker_jobs_.clear();
+    submission_worker_deferred_command_buffers_free_.clear();
+    submission_worker_deferred_command_buffers_free_.reserve(
+        kSubmissionWorkerDeferredCommandBufferCount);
+    for (size_t i = 0; i < kSubmissionWorkerDeferredCommandBufferCount; ++i) {
+      submission_worker_deferred_command_buffers_free_.push_back(
+          std::make_unique<DeferredCommandBuffer>(*this));
+    }
+    submission_worker_stop_requested_ = false;
+    submission_worker_failure_reported_ = false;
+    submission_worker_error_ = VK_SUCCESS;
+    submission_worker_failed_.store(false, std::memory_order_release);
+    submission_worker_submitted_.store(submission_completed_, std::memory_order_release);
+    submission_worker_last_enqueued_.store(submission_completed_, std::memory_order_release);
+  }
+
+  submission_worker_ = std::thread(&VulkanCommandProcessor::SubmissionWorkerMain, this);
+}
+
+void VulkanCommandProcessor::StopSubmissionWorker() {
+  if (!submission_worker_.joinable()) {
+    return;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(submission_worker_mutex_);
+    submission_worker_stop_requested_ = true;
+  }
+  submission_worker_condition_.notify_all();
+  submission_worker_.join();
+
+  std::lock_guard<std::mutex> lock(submission_worker_mutex_);
+  submission_worker_jobs_.clear();
+  submission_worker_deferred_command_buffers_free_.clear();
+}
+
+bool VulkanCommandProcessor::DrainSubmissionWorker(uint64_t await_submission) {
+  if (!async_submission_enabled_ || !submission_worker_.joinable()) {
+    ObserveSubmissionWorkerFailure();
+    return !submission_failed_;
+  }
+
+  diagnostics::rate_census::ScopedCpPhase census_phase(
+      diagnostics::rate_census::CpPhase::kSubmitDrain);
+
+  const uint64_t last_enqueued =
+      submission_worker_last_enqueued_.load(std::memory_order_acquire);
+  const uint64_t target_submission =
+      await_submission == UINT64_MAX ? last_enqueued
+                                     : std::min(await_submission, last_enqueued);
+  if (target_submission > submission_worker_submitted_.load(std::memory_order_acquire)) {
+    std::unique_lock<std::mutex> lock(submission_worker_mutex_);
+    submission_worker_condition_.wait(lock, [this, target_submission] {
+      return submission_worker_submitted_.load(std::memory_order_acquire) >= target_submission ||
+             submission_worker_failed_.load(std::memory_order_acquire) ||
+             submission_worker_stop_requested_;
+    });
+  }
+
+  ObserveSubmissionWorkerFailure();
+  return !submission_failed_ &&
+         submission_worker_submitted_.load(std::memory_order_acquire) >= target_submission;
+}
+
+void VulkanCommandProcessor::ReturnSubmissionWorkerCommandBuffer(
+    std::unique_ptr<DeferredCommandBuffer> deferred_command_buffer) {
+  if (!deferred_command_buffer) {
+    return;
+  }
+  deferred_command_buffer->Reset();
+  {
+    std::lock_guard<std::mutex> lock(submission_worker_mutex_);
+    submission_worker_deferred_command_buffers_free_.push_back(
+        std::move(deferred_command_buffer));
+  }
+  submission_worker_condition_.notify_all();
+}
+
+void VulkanCommandProcessor::SetGpuTimingCategory(GpuTimingCategory category) {
+  if (gpu_timing_ && gpu_timing_->enabled() && submission_open_) {
+    deferred_command_buffer_.CmdGpuTimingCategory(category);
+  }
+}
+
+void VulkanCommandProcessor::SetGpuTimingSceneDrawCategory(uint32_t render_target_width) {
+  if (gpu_timing_ && gpu_timing_->enabled() && submission_open_) {
+    deferred_command_buffer_.CmdGpuTimingCategory(
+        GpuTiming::SceneDrawCategory(render_target_width));
+  }
+}
+
+void VulkanCommandProcessor::GpuTimingBeginRecording(VkCommandBuffer command_buffer,
+                                                     uint64_t frame,
+                                                     uint64_t submission) const {
+  if (gpu_timing_) {
+    gpu_timing_->BeginRecording(command_buffer, frame, submission);
+  }
+}
+
+void VulkanCommandProcessor::GpuTimingChangeCategory(VkCommandBuffer command_buffer,
+                                                     GpuTimingCategory category) const {
+  if (gpu_timing_) {
+    gpu_timing_->ChangeCategory(command_buffer, category);
+  }
+}
+
+void VulkanCommandProcessor::GpuTimingEndRecording(VkCommandBuffer command_buffer) const {
+  if (gpu_timing_) {
+    gpu_timing_->EndRecording(command_buffer);
+  }
+}
+
+void VulkanCommandProcessor::SubmissionWorkerMain() {
+  for (;;) {
+    SubmissionJob job;
+    {
+      std::unique_lock<std::mutex> lock(submission_worker_mutex_);
+      submission_worker_condition_.wait(lock, [this] {
+        return submission_worker_stop_requested_ || !submission_worker_jobs_.empty();
+      });
+      if (submission_worker_jobs_.empty()) {
+        if (submission_worker_stop_requested_) {
+          break;
+        }
+        continue;
+      }
+      job = std::move(submission_worker_jobs_.front());
+      submission_worker_jobs_.pop_front();
+    }
+
+    if (submission_worker_failed_.load(std::memory_order_acquire)) {
+      ReturnSubmissionWorkerCommandBuffer(std::move(job.deferred_command_buffer));
+      continue;
+    }
+
+    diagnostics::rate_census::RecordSubmissionWorkerBusyStart();
+    diagnostics::rate_census::RecordSubmissionWorkerJob();
+
+    const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+    const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+    const VkDevice device = vulkan_device->device();
+    VkResult submit_result = dfn.vkResetCommandPool(device, job.command_buffer.pool, 0);
+    if (submit_result == VK_SUCCESS) {
+      VkCommandBufferBeginInfo command_buffer_begin_info = {};
+      command_buffer_begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+      command_buffer_begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+      submit_result = dfn.vkBeginCommandBuffer(job.command_buffer.buffer,
+                                                &command_buffer_begin_info);
+    }
+    if (submit_result == VK_SUCCESS) {
+      job.deferred_command_buffer->Execute(job.command_buffer.buffer, job.frame,
+                                           job.submission);
+      submit_result = dfn.vkEndCommandBuffer(job.command_buffer.buffer);
+    }
+    if (submit_result == VK_SUCCESS) {
+      VkSubmitInfo submit_info = {};
+      submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+      submit_info.waitSemaphoreCount = uint32_t(job.wait_semaphores.size());
+      submit_info.pWaitSemaphores = job.wait_semaphores.empty()
+                                        ? nullptr
+                                        : job.wait_semaphores.data();
+      submit_info.pWaitDstStageMask = job.wait_stage_masks.empty()
+                                          ? nullptr
+                                          : job.wait_stage_masks.data();
+      submit_info.commandBufferCount = 1;
+      submit_info.pCommandBuffers = &job.command_buffer.buffer;
+      {
+        ui::vulkan::VulkanDevice::Queue::Acquisition queue_acquisition =
+            vulkan_device->AcquireQueue(vulkan_device->queue_family_graphics_compute(), 0);
+        submit_result = ui::vulkan::util::QueueSubmit(
+            vulkan_device, queue_acquisition.queue(), 1, &submit_info, job.fence);
+      }
+    }
+
+    diagnostics::rate_census::RecordSubmissionWorkerBusyEnd();
+
+    if (submit_result != VK_SUCCESS) {
+      ui::vulkan::util::LogVkResultFailure(vulkan_device, "vkQueueSubmit (async guest work)",
+                                           submit_result);
+      {
+        std::lock_guard<std::mutex> lock(submission_worker_mutex_);
+        if (!submission_worker_failed_.load(std::memory_order_relaxed)) {
+          submission_worker_error_ = submit_result;
+          submission_worker_failed_.store(true, std::memory_order_release);
+        }
+      }
+      submission_worker_condition_.notify_all();
+    } else {
+      submission_worker_submitted_.store(job.submission, std::memory_order_release);
+      submission_worker_condition_.notify_all();
+    }
+
+    ReturnSubmissionWorkerCommandBuffer(std::move(job.deferred_command_buffer));
+  }
+}
+
+void VulkanCommandProcessor::ObserveSubmissionWorkerFailure() {
+  if (!submission_worker_failed_.load(std::memory_order_acquire) ||
+      submission_worker_failure_reported_) {
+    return;
+  }
+
+  VkResult error = VK_ERROR_UNKNOWN;
+  {
+    std::lock_guard<std::mutex> lock(submission_worker_mutex_);
+    error = submission_worker_error_;
+  }
+  submission_worker_failure_reported_ = true;
+  submission_failed_ = true;
+  REXGPU_ERROR("Asynchronous Vulkan submission worker stopped after the failure reported above");
+  if (error == VK_ERROR_DEVICE_LOST) {
+    device_lost_ = true;
+  }
+  if (graphics_system_) {
+    graphics_system_->OnHostGpuLossFromAnyThread(true);
+  }
+}
 
 void VulkanCommandProcessor::ClearCaches() {
   CommandProcessor::ClearCaches();
@@ -792,6 +1478,7 @@ bool VulkanCommandProcessor::SetupContext() {
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
   const ui::vulkan::VulkanDevice::Properties& device_properties = vulkan_device->properties();
+  gpu_timing_->Initialize(vulkan_device, vulkan_device->queue_family_graphics_compute());
 
   // The unconditional inclusion of the vertex shader stage also covers the case
   // of manual index / factor buffer fetch (the system constants and the shared
@@ -812,7 +1499,7 @@ bool VulkanCommandProcessor::SetupContext() {
     guest_shader_vertex_stages_ |= VK_SHADER_STAGE_COMPUTE_BIT;
   }
 
-  // 16384 is bigger than any single uniform buffer that Xenia needs, but is the
+  // 16384 is bigger than any single uniform buffer that the runtime needs, but is the
   // minimum maxUniformBufferRange, thus the safe minimum amount.
   uniform_buffer_pool_ = std::make_unique<ui::vulkan::VulkanUploadBufferPool>(
       vulkan_device, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
@@ -1906,11 +2593,15 @@ bool VulkanCommandProcessor::SetupContext() {
   // Just not to expose uninitialized memory.
   std::memset(&system_constants_, 0, sizeof(system_constants_));
 
+  StartSubmissionWorker();
   return true;
 }
 
 void VulkanCommandProcessor::ShutdownContext() {
   AwaitAllQueueOperationsCompletion();
+  StopSubmissionWorker();
+  gpu_timing_->ProcessCompleted(submission_completed_);
+  gpu_timing_->Shutdown();
   InvalidateAllVertexBufferResidency();
   ShutdownOcclusionQueryResources();
 
@@ -2031,6 +2722,7 @@ void VulkanCommandProcessor::ShutdownContext() {
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device,
                                          shared_memory_and_edram_descriptor_pool_);
 
+  InvalidateTextureDescriptorSetReuse();
   texture_cache_.reset();
 
   pipeline_cache_.reset();
@@ -2132,6 +2824,7 @@ void VulkanCommandProcessor::ShutdownContext() {
   fences_free_.clear();
 
   device_lost_ = false;
+  submission_failed_ = false;
 
   CommandProcessor::ShutdownContext();
 }
@@ -2282,9 +2975,58 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
   gamma_ramp_pwl_current_frame_ = UINT32_MAX;
 }
 
+// Content probe emission helpers (cycle-161 sub-second ordering fields).
+namespace {
+
+// Builds the per-write frame-stamp emission string for one clear-register
+// ring: "<frame>:<value>" entries comma-separated, at most 32 printed (first
+// 31 + the latest; the latest is the onset-adjacent write and is always
+// retained). Returns the empty string when there were no writes in the
+// interval (the register count is the presence flag). Sets truncated_out when
+// more than 32 entries existed and the middle was not printed.
+std::string FormatClearWriteRing(const content_probe::ProbeCounters::ClearWriteEntry* entries,
+                                 uint32_t count, bool& truncated_out) {
+  truncated_out = false;
+  if (count == 0) {
+    return {};
+  }
+  constexpr uint32_t kPrintCap = 32;
+  const uint32_t kMaxEntries = content_probe::ProbeCounters::kMaxClearWriteEntries;
+  truncated_out = count > kPrintCap;
+  const uint32_t latest_index = count > kMaxEntries ? kMaxEntries - 1 : count - 1;
+  const uint32_t head_count = std::min<uint32_t>(count, kPrintCap - 1);
+  std::string out;
+  for (uint32_t i = 0; i < head_count; ++i) {
+    if (!out.empty()) {
+      out += ",";
+    }
+    out += fmt::format("{}:{:08X}", entries[i].frame, entries[i].value);
+  }
+  if (latest_index >= head_count) {
+    out += ",";
+    out += fmt::format("{}:{:08X}", entries[latest_index].frame, entries[latest_index].value);
+  }
+  return out;
+}
+
+// Builds the per-target full-surface resolve summary string "first:last:count"
+// (decimal). Empty when the target had no full-surface resolve in the
+// interval (count is the presence flag).
+std::string FormatResolveSummary(const content_probe::ProbeCounters::ResolveSummary& summary) {
+  if (summary.count == 0) {
+    return {};
+  }
+  return fmt::format("{}:{}:{}", summary.first_frame, summary.last_frame, summary.count);
+}
+
+}  // namespace
+
 void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                        uint32_t frontbuffer_height) {
+  diagnostics::rate_census::ScopedCpPhase census_phase(
+      diagnostics::rate_census::CpPhase::kSwap);
   SCOPE_profile_cpu_f("gpu");
+  diagnostics::rate_census::RecordPresent();
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
 
@@ -2425,7 +3167,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
       guest_output_width, guest_output_height, display_width, display_height,
       [this, guest_output_width, guest_output_height, frontbuffer_format, swap_texture_view,
        swap_post_effect,
-       swap_source_needs_rb_swap](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
+       swap_source_needs_rb_swap, presenter](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
         // In case the swap command is the only one in the frame.
         if (!BeginSubmission(true)) {
           return false;
@@ -2525,6 +3267,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
           }
         }
         bool use_compute_gamma = swap_apply_gamma_compute_pipeline != VK_NULL_HANDLE;
+        SetGpuTimingCategory(GpuTimingCategory::kPresent);
 
         // TODO(Triang3l): FXAA can result in more than 8 bits of precision.
         context.SetIs8bpc(!use_pwl_gamma_ramp && !use_fxaa);
@@ -2928,18 +3671,163 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
                                  ui::vulkan::VulkanPresenter::kGuestOutputInternalAccessMask,
                                  VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                                  ui::vulkan::VulkanPresenter::kGuestOutputInternalLayout);
-        }
+         }
 
-        // Need to submit all the commands before giving the image back to the
-        // presenter so it can submit its own commands for displaying it to the
-        // queue, and also need to submit the release barrier.
-        EndSubmission(true);
-        return true;
-      });
+         // Need to submit all the commands before giving the image back to the
+         // presenter so it can submit its own commands for displaying it to the
+         // queue, and also need to submit the release barrier.
+         EndSubmission(true);
+         return true;
+       });
 
   // End the frame even if did not present for any reason (the image refresher
   // was not called), to prevent leaking per-frame resources.
   EndSubmission(true);
+
+  // Content probe: per-second deferred content samples + clear/draw counters.
+  // Everything here is behind the default-off gpu_content_probe cvar.
+  if (REXCVAR_GET(gpu_content_probe)) {
+    auto now = std::chrono::steady_clock::now();
+    if (!content_probe_first_enabled_) {
+      content_probe_first_enabled_ = true;
+      content_probe_last_wall_ = now;
+      auto* gpu_logger = ::rex::GetLoggerRaw(::rex::log::GPU);
+      if (gpu_logger && gpu_logger->should_log(spdlog::level::trace)) {
+        gpu_logger->log(spdlog::source_loc{__FILE__, __LINE__, __FUNCTION__},
+                        spdlog::level::trace, "CONTENT_PROBE_START frame={}", frame_current_);
+      }
+    }
+    auto elapsed =
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - content_probe_last_wall_)
+            .count();
+    if (content_probe::ShouldEmitSample(elapsed, false)) {
+      // Deferred read of the slots written in the previous interval (the
+      // memexport readback pattern: no queue drain, readiness by submission
+      // index). A not-yet-ready slot keeps the previous snapshot.
+      CheckSubmissionFenceAndDeviceLoss(0);
+      const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+      const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+      const VkDevice device = vulkan_device->device();
+      for (uint32_t i = 0; i < content_probe::kProbeTargetCount; ++i) {
+        ContentProbeTargetState& target = content_probe_targets_[i];
+        ContentProbeSnapshot& snapshot = content_probe_snapshots_[i];
+        const uint32_t read_index = 1u - target.readback.current_index;
+        ContentProbeSlotInfo& slot = target.slots[read_index];
+        if (!slot.recorded) {
+          // No matching resolve in the interval: explicitly distinguishable
+          // from a black-but-present target (base stays 0).
+          snapshot = ContentProbeSnapshot{};
+        } else if (!slot.sampled) {
+          // Identity seen, but the resolve was not a full-surface
+          // (0,0)-origin one - base-only line, no content.
+          snapshot = ContentProbeSnapshot{};
+          snapshot.base = slot.base;
+          snapshot.width = slot.width;
+          snapshot.height = slot.height;
+          snapshot.pitch = slot.pitch;
+          snapshot.bpp = 1u << slot.bpp_log2;
+        } else {
+          bool slot_ready = target.readback.buffers[read_index] != VK_NULL_HANDLE &&
+                            target.readback.memories[read_index] != VK_NULL_HANDLE &&
+                            target.readback.mapped_data[read_index] != nullptr &&
+                            slot.length <= target.readback.sizes[read_index] &&
+                            slot.length <= target.readback.written_size[read_index] &&
+                            target.readback.submission_written[read_index] != 0 &&
+                            target.readback.submission_written[read_index] <=
+                                submission_completed_;
+          if (slot_ready) {
+            VkMappedMemoryRange readback_memory_range = {};
+            readback_memory_range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+            readback_memory_range.memory = target.readback.memories[read_index];
+            readback_memory_range.offset = 0;
+            readback_memory_range.size = VK_WHOLE_SIZE;
+            dfn.vkInvalidateMappedMemoryRanges(device, 1, &readback_memory_range);
+            const uint8_t* sampled =
+                reinterpret_cast<const uint8_t*>(target.readback.mapped_data[read_index]);
+            snapshot = ContentProbeSnapshot{};
+            snapshot.base = slot.base;
+            snapshot.width = slot.width;
+            snapshot.height = slot.height;
+            snapshot.pitch = slot.pitch;
+            snapshot.bpp = 1u << slot.bpp_log2;
+            snapshot.frame = slot.frame;
+            content_probe::SampleTiled(slot.bpp_log2, sampled, 0, 0, slot.width, slot.height,
+                                       slot.pitch, content_probe::kDefaultStride, snapshot.luma,
+                                       snapshot.hash);
+            // Reviewer F3: never sample the clock box past the end of a
+            // smaller readback (with the F2 full-surface gate the front slot
+            // is always 1280x720, but the guard keeps the read bounded).
+            if (i == 0 && content_probe::IsClockBoxSampleable(slot.width, slot.height)) {
+              content_probe::SampleTiled(slot.bpp_log2, sampled, content_probe::kClockBoxX,
+                                         content_probe::kClockBoxY, content_probe::kClockBoxWidth,
+                                         content_probe::kClockBoxHeight, slot.pitch,
+                                         content_probe::kDefaultStride, snapshot.clock_luma,
+                                         snapshot.clock_hash);
+            }
+          }
+          // Not ready (unexpected at 30-60 fps with a >= 1 s old slot): keep
+          // the previous snapshot instead of blocking.
+        }
+        // Consume the read slot (Reviewer F1): clearing recorded/sampled and
+        // zeroing the metadata makes an interval with no full-surface record
+        // emit the documented base=0/w=h=0/luma=hash=0 no-sample line instead
+        // of re-emitting this snapshot. Then advance the double buffer and
+        // re-arm the interval sample.
+        slot.Reset();
+        target.readback.current_index = read_index;
+        target.sample_due = true;
+      }
+
+      auto* gpu_logger = ::rex::GetLoggerRaw(::rex::log::GPU);
+      if (gpu_logger && gpu_logger->should_log(spdlog::level::trace)) {
+        const ContentProbeSnapshot& fb = content_probe_snapshots_[0];
+        const ContentProbeSnapshot& s0 = content_probe_snapshots_[1];
+        const ContentProbeSnapshot& s1 = content_probe_snapshots_[2];
+        // Sub-second ordering fields (cycle-161): per-write clear frame
+        // stamps from the bounded rings (the latest write is always retained)
+        // and the per-target full-surface resolve summaries.
+        bool rbcc_f_truncated = false;
+        bool rbcc_lo_f_truncated = false;
+        const std::string rbcc_f = FormatClearWriteRing(
+            content_probe_counters_.rbcc_writes, content_probe_counters_.rbcc_writes_count,
+            rbcc_f_truncated);
+        const std::string rbcc_lo_f = FormatClearWriteRing(
+            content_probe_counters_.rbcc_lo_writes, content_probe_counters_.rbcc_lo_writes_count,
+            rbcc_lo_f_truncated);
+        const std::string fb_rf =
+            FormatResolveSummary(content_probe_counters_.resolve_summary[0]);
+        const std::string s0_rf =
+            FormatResolveSummary(content_probe_counters_.resolve_summary[1]);
+        const std::string s1_rf =
+            FormatResolveSummary(content_probe_counters_.resolve_summary[2]);
+        std::string log_msg = fmt::format(
+            "CONTENT_PROBE t={:.1f} frame={:06d} fb_base={:08X} fb_w={} fb_h={} "
+            "fb_pitch={} fb_bpp={} fb_luma={:5} fb_hash={:08x} clock_luma={:5} "
+            "clock_hash={:08x} s0_base={:08X} s0_w={} s0_h={} s0_pitch={} s0_bpp={} "
+            "s0_luma={:5} s0_hash={:08x} s1_base={:08X} s1_w={} s1_h={} s1_pitch={} "
+            "s1_bpp={} s1_luma={:5} s1_hash={:08x} clears={} rbcc={} rbcc_lo={} "
+            "rbcc_zero={} draws={} rbcc_val={:08X} rbcc_lo_val={:08X} fb_frame={} "
+            "s0_frame={} s1_frame={} rbcc_f={} rbcc_lo_f={} rbcc_f_ov={} "
+            "rbcc_lo_f_ov={} fb_rf={} s0_rf={} s1_rf={}",
+            static_cast<double>(elapsed) / 1000.0, frame_current_, fb.base, fb.width, fb.height,
+            fb.pitch, fb.bpp, fb.luma, fb.hash, fb.clock_luma, fb.clock_hash, s0.base, s0.width,
+            s0.height, s0.pitch, s0.bpp, s0.luma, s0.hash, s1.base, s1.width, s1.height, s1.pitch,
+            s1.bpp, s1.luma, s1.hash, content_probe_counters_.clears,
+            content_probe_counters_.rbcc, content_probe_counters_.rbcc_lo,
+            content_probe_counters_.rbcc_zero, content_probe_counters_.draws,
+            content_probe_counters_.rbcc_val, content_probe_counters_.rbcc_lo_val, fb.frame,
+            s0.frame, s1.frame, rbcc_f, rbcc_lo_f,
+            (content_probe_counters_.rbcc_writes_overflow || rbcc_f_truncated) ? 1 : 0,
+            (content_probe_counters_.rbcc_lo_writes_overflow || rbcc_lo_f_truncated) ? 1 : 0,
+            fb_rf, s0_rf, s1_rf);
+        gpu_logger->log(spdlog::source_loc{__FILE__, __LINE__, __FUNCTION__},
+                        spdlog::level::trace, "{}", log_msg);
+      }
+
+      ResetContentProbeCounters();
+      content_probe_last_wall_ = now;
+    }
+  }
 }
 
 bool VulkanCommandProcessor::PushBufferMemoryBarrier(
@@ -3603,6 +4491,8 @@ Shader* VulkanCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32
 bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                                        IndexBufferInfo* index_buffer_info,
                                        bool major_mode_explicit) {
+  diagnostics::rate_census::ScopedCpPhase census_phase(
+      diagnostics::rate_census::CpPhase::kDraw);
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -3907,6 +4797,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         descriptor_sets_kept = std::min(
             descriptor_sets_kept, uint32_t(SpirvShaderTranslator::kDescriptorSetTexturesPixel));
       }
+      current_graphics_descriptor_set_values_up_to_date_ &=
+          descriptor_sets_kept >= sizeof(current_graphics_descriptor_set_values_up_to_date_) * CHAR_BIT
+              ? UINT32_MAX
+              : (UINT32_C(1) << descriptor_sets_kept) - 1;
     } else {
       // No or unknown pipeline layout previously bound - all bindings are in an
       // indeterminate state.
@@ -3945,8 +4839,48 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       host_render_targets_used && render_target_cache_->depth_float24_convert_in_pixel_shader(),
       host_render_targets_used, pixel_shader && pixel_shader->writes_depth(), viewport_info);
 
+  // Determine this once before dynamic-state setup so the matching scissor
+  // adjustment and the copied c0 substitution use the identical draw predicate.
+  uint32_t ui_c0_target_x = 0;
+  uint32_t ui_c0_target_y = 0;
+  const Shader::ConstantRegisterMap& float_constant_map_vertex =
+      vertex_shader->constant_register_map();
+  const bool ui_c0_remap_this_draw =
+      (float_constant_map_vertex.float_bitmap[0] & UINT64_C(1)) != 0 &&
+      GetUiC0RemapTarget(GetUiC0RemapConfig(), vertex_shader->ucode_data_hash(),
+                         regs[XE_GPU_REG_SHADER_CONSTANT_000_X],
+                         regs[XE_GPU_REG_SHADER_CONSTANT_000_X + 1], ui_c0_target_x,
+                         ui_c0_target_y) &&
+      !UiC0DrawSamplesSceneSizedTexture(GetUiC0RemapConfig(), regs);
+  // WWE2K16_UI_C0_LOG=1: log each distinct (UI vertex shader, fetch-0 texture size, remapped?) once, to
+  // see which full-screen copies/fades the remap shrinks at a given internal resolution.
+  static const bool ui_c0_log = std::getenv("WWE2K16_UI_C0_LOG") != nullptr;
+  if (ui_c0_log && (float_constant_map_vertex.float_bitmap[0] & UINT64_C(1)) != 0) {
+    uint32_t probe_x = 0;
+    uint32_t probe_y = 0;
+    if (GetUiC0RemapTarget(GetUiC0RemapConfig(), vertex_shader->ucode_data_hash(),
+                           regs[XE_GPU_REG_SHADER_CONSTANT_000_X],
+                           regs[XE_GPU_REG_SHADER_CONSTANT_000_X + 1], probe_x, probe_y)) {
+      static std::set<std::tuple<uint64_t, uint32_t, uint32_t, uint32_t, bool>> seen;
+      const uint32_t fetch0 = regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0];
+      const uint32_t size = regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 2];
+      const uint32_t fw = (fetch0 & 3) == 2 ? (size & 0x1FFF) + 1 : 0;
+      const uint32_t fh = (fetch0 & 3) == 2 ? ((size >> 13) & 0x1FFF) + 1 : 0;
+      const uint32_t base = (fetch0 & 3) == 2 ? (regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 1] & 0xFFFFF000) : 0;
+      if (seen.size() < 256 &&
+          seen.emplace(vertex_shader->ucode_data_hash(), fw, fh, fetch0 & 3, ui_c0_remap_this_draw).second) {
+        REXGPU_INFO("[wwe2k16-ui-c0-log] vs={:016X} fetch0_type={} tex={}x{} base={:08X} c0=({:08X},{:08X}) "
+                    "viewport_scissor_from_regs remapped={}",
+                    vertex_shader->ucode_data_hash(), fetch0 & 3, fw, fh, base,
+                    regs[XE_GPU_REG_SHADER_CONSTANT_000_X], regs[XE_GPU_REG_SHADER_CONSTANT_000_X + 1],
+                    ui_c0_remap_this_draw);
+      }
+    }
+  }
+
   // Update dynamic graphics pipeline state.
-  UpdateDynamicState(viewport_info, primitive_polygonal, normalized_depth_control);
+  UpdateDynamicState(viewport_info, primitive_polygonal, normalized_depth_control,
+                     ui_c0_remap_this_draw);
 
   auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
 
@@ -3986,7 +4920,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
 
   // Update uniform buffers and descriptor sets after binding the pipeline with
   // the new layout.
-  if (!UpdateBindings(vertex_shader, pixel_shader)) {
+  if (!UpdateBindings(vertex_shader, pixel_shader, ui_c0_remap_this_draw, ui_c0_target_x,
+                      ui_c0_target_y)) {
     return draw_fail("update_bindings");
   }
 
@@ -4014,7 +4949,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
               "Vertex fetch constant {} ({:08X} {:08X}) has \"invalid\" type! "
               "This "
               "is incorrect behavior, but you can try bypassing this by "
-              "launching Xenia with --gpu_allow_invalid_fetch_constants=true.",
+              "launching with --gpu_allow_invalid_fetch_constants=true.",
               vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1);
           return false;
         default:
@@ -4091,6 +5026,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       guest_dma_index_copy_region.srcOffset = primitive_processing_result.guest_index_base;
       guest_dma_index_copy_region.dstOffset = 0;
       guest_dma_index_copy_region.size = guest_dma_index_size;
+      SetGpuTimingCategory(GpuTimingCategory::kSharedMemoryUploadCopy);
       deferred_command_buffer_.CmdVkCopyBuffer(shared_memory_->buffer(),
                                                guest_dma_index_scratch_buffer.buffer(), 1,
                                                &guest_dma_index_copy_region);
@@ -4129,6 +5065,13 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       render_target_cache_->last_update_framebuffer());
 
   // Draw.
+  const VulkanRenderTargetCache::Framebuffer* draw_framebuffer =
+      render_target_cache_->last_update_framebuffer();
+  uint32_t draw_target_width =
+      draw_framebuffer ? draw_framebuffer->host_extent.width
+                       : regs.Get<reg::RB_SURFACE_INFO>().surface_pitch *
+                             xenos::kEdramTileWidthSamples;
+  SetGpuTimingSceneDrawCategory(draw_target_width);
   if (primitive_processing_result.index_buffer_type ==
           PrimitiveProcessor::ProcessedIndexBufferType::kNone ||
       shader_32bit_index_dma) {
@@ -4166,20 +5109,23 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     deferred_command_buffer_.CmdVkDrawIndexed(primitive_processing_result.host_draw_vertex_count, 1,
                                               0, 0, 0);
   }
+  SetGpuTimingCategory(GpuTimingCategory::kOther);
 
   // Invalidate textures in memexported memory and watch for changes.
   if (!memexport_ranges_.empty()) {
     for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
-      shared_memory_->RangeWrittenByGpu(memexport_range.base_address_dwords << 2,
-                                        memexport_range.size_bytes);
+      uint32_t start = memexport_range.base_address_dwords << 2;
+      texture_cache_->MarkRangeAsUnscaledGpuWrite(start, memexport_range.size_bytes);
     }
   } else if (memexport_writes_possible) {
     // Stream constants can be invalid or dynamic, so exact destinations may be
-    // unknown. Keep invalidation conservative in this case.
+    // unknown. Keep texture invalidation conservative, but don't classify the
+    // entire shared memory as unscaled: that would discard scaled-resolve
+    // metadata for destinations the draw may not have written.
     shared_memory_->RangeWrittenByGpu(0, SharedMemory::kBufferSize);
   }
 
-  if (IsReadbackMemexportEnabled(REXCVAR_GET(vulkan_readback_memexport)) &&
+  if (IsReadbackMemexportEnabled() &&
       !memexport_ranges_.empty()) {
     uint32_t memexport_total_size = 0;
     for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
@@ -4201,6 +5147,7 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFullPath(uint32_t total_
   if (!total_size || memexport_ranges_.empty()) {
     return true;
   }
+  SetGpuTimingCategory(GpuTimingCategory::kSharedMemoryUploadCopy);
 
   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
@@ -4278,6 +5225,7 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
   if (!total_size || memexport_ranges_.empty()) {
     return true;
   }
+  SetGpuTimingCategory(GpuTimingCategory::kSharedMemoryUploadCopy);
 
   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
@@ -4394,7 +5342,161 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
   return true;
 }
 
+bool VulkanCommandProcessor::EnsureContentProbeReadbackSlot(ReadbackBuffer& readback, uint32_t index,
+                                                            uint32_t size) {
+  if (readback.buffers[index] != VK_NULL_HANDLE && readback.memories[index] != VK_NULL_HANDLE &&
+      readback.mapped_data[index] != nullptr && size <= readback.sizes[index]) {
+    return true;
+  }
+
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+
+  VkBuffer new_buffer = VK_NULL_HANDLE;
+  VkDeviceMemory new_memory = VK_NULL_HANDLE;
+  if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+          vulkan_device, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+          ui::vulkan::util::MemoryPurpose::kReadback, new_buffer, new_memory)) {
+    return false;
+  }
+
+  void* new_mapping = nullptr;
+  if (dfn.vkMapMemory(device, new_memory, 0, VK_WHOLE_SIZE, 0, &new_mapping) != VK_SUCCESS) {
+    dfn.vkDestroyBuffer(device, new_buffer, nullptr);
+    dfn.vkFreeMemory(device, new_memory, nullptr);
+    return false;
+  }
+
+  if (readback.buffers[index] != VK_NULL_HANDLE || readback.memories[index] != VK_NULL_HANDLE) {
+    if (!AwaitAllQueueOperationsCompletion()) {
+      dfn.vkUnmapMemory(device, new_memory);
+      dfn.vkDestroyBuffer(device, new_buffer, nullptr);
+      dfn.vkFreeMemory(device, new_memory, nullptr);
+      return false;
+    }
+    if (readback.mapped_data[index] != nullptr && readback.memories[index] != VK_NULL_HANDLE) {
+      dfn.vkUnmapMemory(device, readback.memories[index]);
+    }
+    if (readback.buffers[index] != VK_NULL_HANDLE) {
+      dfn.vkDestroyBuffer(device, readback.buffers[index], nullptr);
+    }
+    if (readback.memories[index] != VK_NULL_HANDLE) {
+      dfn.vkFreeMemory(device, readback.memories[index], nullptr);
+    }
+  }
+
+  readback.buffers[index] = new_buffer;
+  readback.memories[index] = new_memory;
+  readback.mapped_data[index] = new_mapping;
+  readback.sizes[index] = size;
+  readback.submission_written[index] = 0;
+  readback.written_size[index] = 0;
+  return true;
+}
+
+void VulkanCommandProcessor::ContentProbeRecordResolveSample(
+    const draw_util::ResolveInfo& resolve_info) {
+  content_probe::ProbeTargetId target_id =
+      content_probe::MatchProbeTarget(resolve_info.copy_dest_extent_start,
+                                      resolve_info.copy_dest_extent_start +
+                                          resolve_info.copy_dest_extent_length);
+  if (target_id == content_probe::ProbeTargetId::kNone) {
+    return;
+  }
+  const uint32_t target_index = uint32_t(target_id) - 1u;
+  assert_true(target_index < content_probe::kProbeTargetCount);
+  ContentProbeTargetState& target = content_probe_targets_[target_index];
+
+  // The bytes-per-pixel log2 comes from the recorded resolve info, not from
+  // hard-coded target assumptions. (Computed ahead of the sample_due gate so
+  // the full-surface summary below sees every full-surface resolve; the
+  // extra work when sample_due is false is a few compares, cvar-gated.)
+  const FormatInfo* dest_format_info =
+      FormatInfo::Get(xenos::TextureFormat(resolve_info.copy_dest_info.copy_dest_format));
+  if (!dest_format_info || dest_format_info->bits_per_pixel < 8) {
+    return;
+  }
+  const uint32_t bpp_log2 = rex::log2_floor(dest_format_info->bits_per_pixel >> 3);
+
+  const uint32_t width = resolve_info.coordinate_info.width_div_8 * 8u;
+  const uint32_t height = resolve_info.height_div_8 * 8u;
+
+  // Content sampling requires the steady-state full-surface (0,0)-origin
+  // resolve: the copy must start at the matched target base, the destination
+  // region must start at the first 8-aligned pixel of the target (the
+  // offset_div_8 fields catch 8-aligned non-zero origins inside the first
+  // tile), and the region must cover the full surface (Reviewer F2: the
+  // cycle-157 smoke showed 168x280 / 152x296 scene-1 partials whose luma/hash
+  // baseline would not be comparable to the full-surface one). A rejected
+  // resolve is not recorded at all, so the emitted base stays 0 (the
+  // documented no-sample sentinel) for a partial-only interval.
+  const bool full_surface_resolve =
+      resolve_info.copy_dest_extent_start == content_probe::ProbeTargetBase(target_id) &&
+      resolve_info.copy_dest_coordinate_info.offset_x_div_8 == 0 &&
+      resolve_info.copy_dest_coordinate_info.offset_y_div_8 == 0 &&
+      content_probe::IsFullSurfaceResolve(width, height, target_id);
+  if (!full_surface_resolve) {
+    return;
+  }
+
+  // Sub-second ordering: EVERY full-surface resolve appends its frame ordinal
+  // to the per-target summary, independent of the sample_due gate below (the
+  // gate only controls the content copy path; consumption semantics are
+  // unchanged - only a recorded full-surface resolve consumes sample_due, so
+  // a partial resolve cannot starve a later full-surface resolve).
+  content_probe_counters_.AppendResolveFrame(target_index, frame_current_);
+
+  // One recorded sample per target per emission interval: a copy of the front
+  // buffer alone is ~4 MB, and the targets resolve many times per frame.
+  if (!target.sample_due) {
+    return;
+  }
+
+  target.sample_due = false;
+
+  const uint32_t write_index = target.readback.current_index;
+  ContentProbeSlotInfo& slot = target.slots[write_index];
+  slot.recorded = true;
+  slot.sampled = false;
+  slot.base = resolve_info.copy_dest_extent_start;
+  slot.width = width;
+  slot.height = height;
+  slot.pitch = resolve_info.copy_dest_coordinate_info.pitch_aligned_div_32 * 32u;
+  slot.bpp_log2 = bpp_log2;
+  slot.length = resolve_info.copy_dest_extent_length;
+  // Ordering anchor: monotonic frame counter at sample-record time (same
+  // source as the emission line's frame=).
+  slot.frame = frame_current_;
+
+  const uint32_t readback_size = AlignReadbackBufferSize(resolve_info.copy_dest_extent_length);
+  if (!EnsureContentProbeReadbackSlot(target.readback, write_index, readback_size)) {
+    slot.Reset();
+    return;
+  }
+
+  shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
+  SubmitBarriers(true);
+
+  VkBufferCopy readback_region = {};
+  readback_region.srcOffset = resolve_info.copy_dest_extent_start;
+  readback_region.dstOffset = 0;
+  readback_region.size = resolve_info.copy_dest_extent_length;
+  deferred_command_buffer_.CmdVkCopyBuffer(shared_memory_->buffer(),
+                                           target.readback.buffers[write_index], 1,
+                                           &readback_region);
+  PushBufferMemoryBarrier(target.readback.buffers[write_index], 0,
+                          resolve_info.copy_dest_extent_length, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                          VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                          VK_ACCESS_HOST_READ_BIT);
+  target.readback.submission_written[write_index] = GetCurrentSubmission();
+  target.readback.written_size[write_index] = resolve_info.copy_dest_extent_length;
+  slot.sampled = true;
+}
+
 bool VulkanCommandProcessor::IssueCopy() {
+  diagnostics::rate_census::ScopedCpPhase census_phase(
+      diagnostics::rate_census::CpPhase::kCopy);
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -4403,14 +5505,50 @@ bool VulkanCommandProcessor::IssueCopy() {
     return false;
   }
 
-  ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
+  SetGpuTimingCategory(GpuTimingCategory::kResolve);
+
+  ReadbackResolveMode readback_mode = GetReadbackResolveMode();
   if (readback_mode == ReadbackResolveMode::kDisabled) {
-    uint32_t written_address, written_length;
-    return render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
-                                         written_address, written_length);
+    uint32_t written_address = 0, written_length = 0;
+    bool result = render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
+                                                written_address, written_length);
+    LogResolveDiagnostic(written_address, written_length);
+    // Diagnostic (WWE2K16_READWATCH_MIN=bytes): find the guest code that reads large resolves.
+    static const uint32_t read_watch_min = [] {
+      const char* v = std::getenv("WWE2K16_READWATCH_MIN");
+      return v ? uint32_t(std::strtoul(v, nullptr, 10)) : 0u;
+    }();
+    if (read_watch_min && written_length >= read_watch_min) {
+      runtime::ReadWatchArm(memory_->virtual_membase(), written_address, written_length);
+    }
+    return result;
   }
 
   return IssueCopy_ReadbackResolvePath();
+}
+
+// Diagnostic (WWE2K16_RESOLVE_LOG=1): one line per resolve with its destination and format, to
+// tell per-frame render-to-texture resolves from ones the CPU consumes.
+void VulkanCommandProcessor::LogResolveDiagnostic(uint32_t written_address,
+                                                  uint32_t written_length) {
+  static const bool enabled = [] {
+    const char* v = std::getenv("WWE2K16_RESOLVE_LOG");
+    return v && v[0] == '1';
+  }();
+  if (!enabled || !written_length) {
+    return;
+  }
+  auto dest_info = register_file_->Get<reg::RB_COPY_DEST_INFO>();
+  auto dest_pitch = register_file_->Get<reg::RB_COPY_DEST_PITCH>();
+  auto copy_control = register_file_->Get<reg::RB_COPY_CONTROL>();
+  REXGPU_INFO(
+      "[resolve] frame={} dest={:08X} len={} base={:08X} fmt={} pitch={} height={} array={} "
+      "src_select={}",
+      frame_current_, written_address, written_length,
+      (*register_file_)[XE_GPU_REG_RB_COPY_DEST_BASE],
+      uint32_t(dest_info.copy_dest_format), uint32_t(dest_pitch.copy_dest_pitch),
+      uint32_t(dest_pitch.copy_dest_height), uint32_t(dest_info.copy_dest_array),
+      uint32_t(copy_control.copy_src_select));
 }
 
 bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
@@ -4423,8 +5561,24 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
                                      written_length)) {
     return false;
   }
+  LogResolveDiagnostic(written_address, written_length);
 
   if (!written_length) {
+    return true;
+  }
+
+  // Diagnostic (WWE2K16_READBACK_RANGE=lo-hi, hex physical addresses): read back only resolves
+  // whose destination intersects [lo, hi), to find which resolves the CPU consumes.
+  static const std::pair<uint32_t, uint32_t> readback_range = [] {
+    const char* v = std::getenv("WWE2K16_READBACK_RANGE");
+    if (!v) return std::pair<uint32_t, uint32_t>(0, UINT32_MAX);
+    char* end = nullptr;
+    uint32_t lo = uint32_t(std::strtoul(v, &end, 16));
+    uint32_t hi = (end && *end == '-') ? uint32_t(std::strtoul(end + 1, nullptr, 16)) : UINT32_MAX;
+    return std::pair<uint32_t, uint32_t>(lo, hi);
+  }();
+  if (written_address + written_length <= readback_range.first ||
+      written_address >= readback_range.second) {
     return true;
   }
 
@@ -4432,7 +5586,7 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
     return true;
   }
 
-  ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
+  ReadbackResolveMode readback_mode = GetReadbackResolveMode();
   if (readback_mode == ReadbackResolveMode::kDisabled) {
     return true;
   }
@@ -4702,6 +5856,469 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
   return true;
 }
 
+bool VulkanCommandProcessor::ReadbackScaledGpuWrittenRanges(
+    const std::vector<std::pair<uint32_t, uint32_t>>& runs,
+    const std::vector<TextureCache::ScaledResolveRange>& scaled_ranges,
+    const std::vector<std::pair<uint32_t, uint32_t>>& unscaled_ranges) {
+  struct ReadbackJob {
+    uint32_t address;
+    uint32_t length;
+    uint32_t transfer_address;
+    uint32_t transfer_length;
+    uint32_t readback_offset;
+    uint32_t pixel_size_log2;
+    uint32_t tile_count;
+    uint32_t source_offset_bytes;
+    VkDeviceSize source_buffer_offset;
+    VkDeviceSize source_buffer_range;
+  };
+  constexpr uint32_t kUnscaledJob = UINT32_MAX;
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  std::vector<ReadbackJob> jobs;
+  uint64_t readback_size_64 = 0;
+  uint32_t max_downscale_length = 0;
+
+  auto append_unscaled_job = [&](uint32_t start, uint32_t end) -> bool {
+    if (start >= end) {
+      return true;
+    }
+    uint32_t transfer_start = start & ~uint32_t(3);
+    uint64_t transfer_end = (uint64_t(end) + 3) & ~uint64_t(3);
+    if (transfer_end > SharedMemory::kBufferSize ||
+        transfer_end - transfer_start > UINT32_MAX ||
+        readback_size_64 + (transfer_end - transfer_start) > UINT32_MAX) {
+      return false;
+    }
+    uint32_t transfer_length = uint32_t(transfer_end - transfer_start);
+    jobs.push_back({start, end - start, transfer_start, transfer_length,
+                    uint32_t(readback_size_64), kUnscaledJob, 0, 0, 0, 0});
+    readback_size_64 += transfer_length;
+    return true;
+  };
+
+  auto append_scaled_job = [&](uint32_t start, uint32_t end,
+                               uint32_t pixel_size_log2) -> bool {
+    if (start >= end) {
+      return true;
+    }
+    if (pixel_size_log2 > 3) {
+      REXGPU_ERROR("ReadbackGpuWrittenRange: unsupported scaled resolve pixel size {}",
+                   pixel_size_log2);
+      return false;
+    }
+    uint32_t tile_size = 32 * 32 * (uint32_t(1) << pixel_size_log2);
+    uint32_t transfer_start = start & ~(tile_size - 1);
+    uint64_t transfer_end = (uint64_t(end) + tile_size - 1) & ~uint64_t(tile_size - 1);
+    if (transfer_end > SharedMemory::kBufferSize ||
+        transfer_end - transfer_start > UINT32_MAX ||
+        readback_size_64 + (transfer_end - transfer_start) > UINT32_MAX) {
+      REXGPU_ERROR("ReadbackGpuWrittenRange: scaled resolve tile range is out of bounds");
+      return false;
+    }
+    uint32_t transfer_length = uint32_t(transfer_end - transfer_start);
+    if (transfer_length > vulkan_device->properties().maxStorageBufferRange) {
+      REXGPU_ERROR("ReadbackGpuWrittenRange: downscale output exceeds the Vulkan storage range");
+      return false;
+    }
+    uint64_t scaled_start = 0;
+    uint64_t scaled_length = 0;
+    if (!texture_cache_->GetScaledResolveRange(transfer_start, transfer_length, 0,
+                                               scaled_start, scaled_length) ||
+        !scaled_length ||
+        !texture_cache_->CommitScaledResolveRange(transfer_start, transfer_length)) {
+      REXGPU_ERROR("ReadbackGpuWrittenRange: failed to map scaled resolve tiles at {:08X}+{}",
+                   transfer_start, transfer_length);
+      return false;
+    }
+    VkDeviceSize source_alignment = std::max(
+        VkDeviceSize(1), vulkan_device->properties().minStorageBufferOffsetAlignment);
+    VkDeviceSize source_buffer_offset = scaled_start - (scaled_start % source_alignment);
+    uint64_t source_offset_bytes = scaled_start - source_buffer_offset;
+    uint64_t source_buffer_range = source_offset_bytes + scaled_length;
+    if (source_offset_bytes > UINT32_MAX ||
+        source_buffer_range > vulkan_device->properties().maxStorageBufferRange) {
+      REXGPU_ERROR("ReadbackGpuWrittenRange: scaled resolve descriptor range is unsupported");
+      return false;
+    }
+    uint32_t tile_count = transfer_length / tile_size;
+    jobs.push_back({start, end - start, transfer_start, transfer_length,
+                    uint32_t(readback_size_64), pixel_size_log2, tile_count,
+                    uint32_t(source_offset_bytes), source_buffer_offset, source_buffer_range});
+    readback_size_64 += transfer_length;
+    max_downscale_length = std::max(max_downscale_length, transfer_length);
+    return true;
+  };
+
+  // Use exact resolve and unscaled-writer spans inside the shared memory GPU-
+  // written runs. Page-level padding around scaled resolves has no shared-memory
+  // resolve contents and must not be copied to guest memory.
+  size_t scaled_range_index = 0;
+  size_t unscaled_range_index = 0;
+  for (const auto& run : runs) {
+    uint32_t run_end = run.first + run.second;
+    while (scaled_range_index < scaled_ranges.size() ||
+           unscaled_range_index < unscaled_ranges.size()) {
+      bool take_scaled = unscaled_range_index >= unscaled_ranges.size() ||
+                         (scaled_range_index < scaled_ranges.size() &&
+                          scaled_ranges[scaled_range_index].start <=
+                              unscaled_ranges[unscaled_range_index].first);
+      uint32_t range_start = take_scaled ? scaled_ranges[scaled_range_index].start
+                                         : unscaled_ranges[unscaled_range_index].first;
+      uint32_t range_length = take_scaled ? scaled_ranges[scaled_range_index].length
+                                          : unscaled_ranges[unscaled_range_index].second;
+      uint32_t range_end = range_start + range_length;
+      if (range_end <= run.first) {
+        if (take_scaled) {
+          ++scaled_range_index;
+        } else {
+          ++unscaled_range_index;
+        }
+        continue;
+      }
+      if (range_start >= run_end) {
+        break;
+      }
+      uint32_t intersection_start = std::max(run.first, range_start);
+      uint32_t intersection_end = std::min(run_end, range_end);
+      bool job_added = take_scaled
+                           ? append_scaled_job(
+                                 intersection_start, intersection_end,
+                                 scaled_ranges[scaled_range_index].pixel_size_log2)
+                           : append_unscaled_job(intersection_start, intersection_end);
+      if (!job_added) {
+        return false;
+      }
+      if (range_end <= run_end) {
+        if (take_scaled) {
+          ++scaled_range_index;
+        } else {
+          ++unscaled_range_index;
+        }
+      } else {
+        break;
+      }
+    }
+  }
+  if (jobs.empty() || !readback_size_64) {
+    return true;
+  }
+
+  static std::atomic<bool> scaled_readback_logged{false};
+  if (!scaled_readback_logged.exchange(true, std::memory_order_relaxed)) {
+    REXGPU_INFO("ReadbackGpuWrittenRange: scaled resolve readback active ({}x{})",
+                texture_cache_->draw_resolution_scale_x(),
+                texture_cache_->draw_resolution_scale_y());
+  }
+
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  VkBuffer readback_buffer = VK_NULL_HANDLE;
+  VkDeviceMemory readback_memory = VK_NULL_HANDLE;
+  uint32_t readback_size = AlignReadbackBufferSize(uint32_t(readback_size_64));
+  if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+          vulkan_device, readback_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+          ui::vulkan::util::MemoryPurpose::kReadback, readback_buffer, readback_memory)) {
+    REXGPU_ERROR("ReadbackGpuWrittenRange: failed to create a {} KB scaled readback buffer",
+                 readback_size >> 10);
+    return false;
+  }
+
+  void* mapping = nullptr;
+  bool ok = dfn.vkMapMemory(device, readback_memory, 0, VK_WHOLE_SIZE, 0, &mapping) == VK_SUCCESS;
+  if (!ok) {
+    REXGPU_ERROR("ReadbackGpuWrittenRange: failed to map the scaled readback buffer");
+  }
+
+  if (ok && max_downscale_length) {
+    uint32_t downscale_buffer_size = AlignReadbackBufferSize(max_downscale_length);
+    if (downscale_buffer_size > resolve_downscale_buffer_size_) {
+      VkBuffer new_buffer = VK_NULL_HANDLE;
+      VkDeviceMemory new_memory = VK_NULL_HANDLE;
+      if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+              vulkan_device, downscale_buffer_size,
+              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+              ui::vulkan::util::MemoryPurpose::kDeviceLocal, new_buffer, new_memory)) {
+        REXGPU_ERROR("ReadbackGpuWrittenRange: failed to create a {} KB downscale buffer",
+                     downscale_buffer_size >> 10);
+        ok = false;
+      } else if ((resolve_downscale_buffer_ != VK_NULL_HANDLE ||
+                  resolve_downscale_buffer_memory_ != VK_NULL_HANDLE) &&
+                 !AwaitAllQueueOperationsCompletion()) {
+        dfn.vkDestroyBuffer(device, new_buffer, nullptr);
+        dfn.vkFreeMemory(device, new_memory, nullptr);
+        ok = false;
+      } else {
+        if (resolve_downscale_buffer_ != VK_NULL_HANDLE) {
+          dfn.vkDestroyBuffer(device, resolve_downscale_buffer_, nullptr);
+        }
+        if (resolve_downscale_buffer_memory_ != VK_NULL_HANDLE) {
+          dfn.vkFreeMemory(device, resolve_downscale_buffer_memory_, nullptr);
+        }
+        resolve_downscale_buffer_ = new_buffer;
+        resolve_downscale_buffer_memory_ = new_memory;
+        resolve_downscale_buffer_size_ = downscale_buffer_size;
+      }
+    }
+    if (resolve_downscale_buffer_ == VK_NULL_HANDLE || !resolve_downscale_pipeline_ ||
+        !resolve_downscale_pipeline_layout_) {
+      REXGPU_ERROR("ReadbackGpuWrittenRange: scaled resolve downscale resources are unavailable");
+      ok = false;
+    }
+  }
+
+  bool submission_begun = false;
+  if (ok) {
+    ok = BeginSubmission(true);
+    submission_begun = ok;
+  }
+  if (ok) {
+    shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
+    texture_cache_->UseScaledResolveBufferForRead();
+    SubmitBarriers(true);
+
+    for (const ReadbackJob& job : jobs) {
+      if (job.pixel_size_log2 == kUnscaledJob) {
+        SetGpuTimingCategory(GpuTimingCategory::kSharedMemoryUploadCopy);
+        VkBufferCopy copy = {};
+        copy.srcOffset = job.transfer_address;
+        copy.dstOffset = job.readback_offset;
+        copy.size = job.transfer_length;
+        deferred_command_buffer_.CmdVkCopyBuffer(shared_memory_->buffer(), readback_buffer, 1,
+                                                &copy);
+        continue;
+      }
+
+      VkDescriptorSet descriptor_set = AllocateSingleTransientDescriptor(
+          SingleTransientDescriptorLayout::kStorageBufferPairCompute);
+      if (descriptor_set == VK_NULL_HANDLE) {
+        ok = false;
+        break;
+      }
+      SetGpuTimingCategory(GpuTimingCategory::kResolve);
+      VkDescriptorBufferInfo buffer_infos[2] = {};
+      buffer_infos[0].buffer = texture_cache_->scaled_resolve_buffer();
+      buffer_infos[0].offset = job.source_buffer_offset;
+      buffer_infos[0].range = job.source_buffer_range;
+      buffer_infos[1].buffer = resolve_downscale_buffer_;
+      buffer_infos[1].range = job.transfer_length;
+      VkWriteDescriptorSet descriptor_writes[2] = {};
+      for (uint32_t i = 0; i < 2; ++i) {
+        descriptor_writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        descriptor_writes[i].dstSet = descriptor_set;
+        descriptor_writes[i].dstBinding = i;
+        descriptor_writes[i].descriptorCount = 1;
+        descriptor_writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        descriptor_writes[i].pBufferInfo = &buffer_infos[i];
+      }
+      dfn.vkUpdateDescriptorSets(device, 2, descriptor_writes, 0, nullptr);
+
+      VkBufferMemoryBarrier pre_barrier = {};
+      pre_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+      pre_barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+      pre_barrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+      pre_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      pre_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      pre_barrier.buffer = resolve_downscale_buffer_;
+      pre_barrier.size = job.transfer_length;
+      deferred_command_buffer_.CmdVkPipelineBarrier(
+          VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 1, &pre_barrier, 0, nullptr);
+
+      BindExternalComputePipeline(resolve_downscale_pipeline_);
+      ResolveDownscaleConstants constants;
+      constants.scale_x = texture_cache_->draw_resolution_scale_x();
+      constants.scale_y = texture_cache_->draw_resolution_scale_y();
+      constants.pixel_size_log2 = job.pixel_size_log2;
+      constants.tile_count = job.tile_count;
+      constants.source_offset_bytes = job.source_offset_bytes;
+      constants.half_pixel_offset =
+          (REXCVAR_GET(readback_resolve_half_pixel_offset) &&
+           (constants.scale_x > 1 || constants.scale_y > 1))
+              ? 1u
+              : 0u;
+      deferred_command_buffer_.CmdVkPushConstants(resolve_downscale_pipeline_layout_,
+                                                  VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                                  sizeof(constants), &constants);
+      deferred_command_buffer_.CmdVkBindDescriptorSets(
+          VK_PIPELINE_BIND_POINT_COMPUTE, resolve_downscale_pipeline_layout_, 0, 1,
+          &descriptor_set, 0, nullptr);
+      deferred_command_buffer_.CmdVkDispatch(job.tile_count, 1, 1);
+
+      VkBufferMemoryBarrier downscale_barrier = {};
+      downscale_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+      downscale_barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+      downscale_barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+      downscale_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      downscale_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      downscale_barrier.buffer = resolve_downscale_buffer_;
+      downscale_barrier.size = job.transfer_length;
+      deferred_command_buffer_.CmdVkPipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                                    VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr,
+                                                    1, &downscale_barrier, 0, nullptr);
+      VkBufferCopy copy = {};
+      copy.srcOffset = 0;
+      copy.dstOffset = job.readback_offset;
+      copy.size = job.transfer_length;
+      deferred_command_buffer_.CmdVkCopyBuffer(resolve_downscale_buffer_, readback_buffer, 1,
+                                              &copy);
+    }
+
+    if (ok) {
+      PushBufferMemoryBarrier(readback_buffer, 0, uint32_t(readback_size_64),
+                              VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                              VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+    }
+  }
+  if (submission_begun) {
+    ok = AwaitAllQueueOperationsCompletion() && ok;
+  }
+
+  if (ok) {
+    VkMappedMemoryRange range = {};
+    range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+    range.memory = readback_memory;
+    range.size = VK_WHOLE_SIZE;
+    dfn.vkInvalidateMappedMemoryRanges(device, 1, &range);
+    for (const ReadbackJob& job : jobs) {
+      uint8_t* destination = memory_->TranslatePhysical(job.address);
+      if (destination) {
+        std::memcpy(destination,
+                    static_cast<const uint8_t*>(mapping) + job.readback_offset +
+                        (job.address - job.transfer_address),
+                    job.length);
+      }
+    }
+  }
+
+  if (mapping) {
+    dfn.vkUnmapMemory(device, readback_memory);
+  }
+  dfn.vkDestroyBuffer(device, readback_buffer, nullptr);
+  dfn.vkFreeMemory(device, readback_memory, nullptr);
+  REXGPU_INFO("ReadbackGpuWrittenRange: scaled {:08X}: {} runs, {} KB{}",
+              runs.empty() ? 0 : runs.front().first,
+              runs.size(), uint32_t(readback_size_64) >> 10, ok ? "" : " (FAILED)");
+  return ok;
+}
+
+bool VulkanCommandProcessor::ReadbackGpuWrittenRange(uint32_t physical_address,
+                                                     uint32_t length) {
+  std::vector<std::pair<uint32_t, uint32_t>> runs;
+  shared_memory_->GetGpuWrittenRuns(physical_address, length, runs);
+  if (runs.empty()) {
+    return true;
+  }
+  if (texture_cache_->IsDrawResolutionScaled()) {
+    uint32_t readback_start = runs.front().first;
+    uint32_t readback_end = runs.back().first + runs.back().second;
+    std::vector<TextureCache::ScaledResolveRange> scaled_ranges;
+    texture_cache_->GetScaledResolveRanges(readback_start, readback_end - readback_start,
+                                           scaled_ranges);
+    std::vector<std::pair<uint32_t, uint32_t>> unscaled_ranges;
+    texture_cache_->GetUnscaledGpuWriteRanges(readback_start, readback_end - readback_start,
+                                              unscaled_ranges);
+    bool has_scaled_run = false;
+    for (const auto& run : runs) {
+      uint32_t run_end = run.first + run.second;
+      for (const TextureCache::ScaledResolveRange& scaled_range : scaled_ranges) {
+        uint32_t scaled_end = scaled_range.start + scaled_range.length;
+        if (scaled_range.start < run_end && scaled_end > run.first) {
+          has_scaled_run = true;
+          break;
+        }
+        if (scaled_range.start >= run_end) {
+          break;
+        }
+      }
+      if (has_scaled_run) {
+        break;
+      }
+    }
+    if (has_scaled_run) {
+      uint64_t request_end = std::min(uint64_t(SharedMemory::kBufferSize),
+                                      uint64_t(physical_address) + length);
+      std::vector<std::pair<uint32_t, uint32_t>> requested_runs;
+      requested_runs.reserve(runs.size());
+      for (const auto& run : runs) {
+        uint32_t run_end = run.first + run.second;
+        uint32_t request_start = std::max(physical_address, run.first);
+        uint32_t clipped_end = uint32_t(std::min<uint64_t>(request_end, run_end));
+        if (request_start < clipped_end) {
+          requested_runs.emplace_back(request_start, clipped_end - request_start);
+        }
+      }
+      if (requested_runs.empty()) {
+        return true;
+      }
+      return ReadbackScaledGpuWrittenRanges(requested_runs, scaled_ranges, unscaled_ranges);
+    }
+  }
+  uint32_t total = 0;
+  for (const auto& run : runs) {
+    total += run.second;
+  }
+
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  VkBuffer buffer = VK_NULL_HANDLE;
+  VkDeviceMemory buffer_memory = VK_NULL_HANDLE;
+  if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+          vulkan_device, total, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+          ui::vulkan::util::MemoryPurpose::kReadback, buffer, buffer_memory)) {
+    REXGPU_ERROR("ReadbackGpuWrittenRange: failed to create a {} KB readback buffer", total >> 10);
+    return false;
+  }
+  void* mapping = nullptr;
+  bool ok = dfn.vkMapMemory(device, buffer_memory, 0, VK_WHOLE_SIZE, 0, &mapping) == VK_SUCCESS;
+  if (ok) {
+    ok = BeginSubmission(true);
+  }
+  if (ok) {
+    SetGpuTimingCategory(GpuTimingCategory::kSharedMemoryUploadCopy);
+    shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
+    SubmitBarriers(true);
+    uint32_t offset = 0;
+    for (const auto& run : runs) {
+      VkBufferCopy region = {};
+      region.srcOffset = run.first;
+      region.dstOffset = offset;
+      region.size = run.second;
+      deferred_command_buffer_.CmdVkCopyBuffer(shared_memory_->buffer(), buffer, 1, &region);
+      offset += run.second;
+    }
+    PushBufferMemoryBarrier(buffer, 0, total, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                            VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                            VK_ACCESS_HOST_READ_BIT);
+    ok = AwaitAllQueueOperationsCompletion();
+  }
+  if (ok) {
+    VkMappedMemoryRange range = {};
+    range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+    range.memory = buffer_memory;
+    range.size = VK_WHOLE_SIZE;
+    dfn.vkInvalidateMappedMemoryRanges(device, 1, &range);
+    uint32_t offset = 0;
+    for (const auto& run : runs) {
+      // Writing guest memory fires the CPU-write watches, so these pages are re-uploaded from the
+      // (now identical) CPU copy if the GPU needs them again.
+      uint8_t* destination = memory_->TranslatePhysical(run.first);
+      if (destination) {
+        std::memcpy(destination, static_cast<const uint8_t*>(mapping) + offset, run.second);
+      }
+      offset += run.second;
+    }
+  }
+  if (mapping) {
+    dfn.vkUnmapMemory(device, buffer_memory);
+  }
+  dfn.vkDestroyBuffer(device, buffer, nullptr);
+  dfn.vkFreeMemory(device, buffer_memory, nullptr);
+  REXGPU_INFO("ReadbackGpuWrittenRange: {:08X}+{}: {} runs, {} KB{}", physical_address, length,
+              runs.size(), total >> 10, ok ? "" : " (FAILED)");
+  return ok;
+}
+
 void VulkanCommandProcessor::EvictOldReadbackBuffers(
     std::unordered_map<uint64_t, ReadbackBuffer>& buffer_map) {
   if (buffer_map.empty()) {
@@ -4964,27 +6581,43 @@ void VulkanCommandProcessor::InitializeTrace() {
   }
   bool render_target_submitted = render_target_cache_->InitializeTraceSubmitDownloads();
   bool shared_memory_submitted = shared_memory_->InitializeTraceSubmitDownloads();
-  if (!render_target_submitted && !shared_memory_submitted) {
+  if (!AwaitAllQueueOperationsCompletion()) {
     return;
   }
-  AwaitAllQueueOperationsCompletion();
   if (render_target_submitted) {
     render_target_cache_->InitializeTraceCompleteDownloads();
   }
   if (shared_memory_submitted) {
     shared_memory_->InitializeTraceCompleteDownloads();
   }
+
+  // A frame trace must not depend on sampled textures or shared-memory-backed
+  // buffers having been uploaded before tracing started. Preserve GPU-written
+  // shared-memory pages (their contents were captured above), but invalidate
+  // CPU-backed pages so their first use in the trace writes a MemoryRead.
+  // Clear the caches only after the preceding submission has completed, and
+  // only while opening a trace.
+  InvalidateTextureDescriptorSetReuse();
+  ClearTransientDescriptorPools();
+  texture_cache_->ClearCache();
+  primitive_processor_->ClearCache();
+  shared_memory_->ClearCache();
+  InvalidateAllVertexBufferResidency();
 }
 
 void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_submission) {
   // Only report once, no need to retry a wait that won't succeed anyway.
-  if (device_lost_) {
+  ObserveSubmissionWorkerFailure();
+  if (device_lost_ || submission_failed_) {
     return;
   }
 
   if (await_submission >= GetCurrentSubmission()) {
     if (submission_open_) {
       EndSubmission(false);
+    }
+    if (device_lost_ || submission_failed_) {
+      return;
     }
     // A submission won't be ended if it hasn't been started, or if ending
     // has failed - clamp the index.
@@ -4998,36 +6631,68 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
   size_t fences_total = submissions_in_flight_fences_.size();
   size_t fences_awaited = 0;
   if (await_submission > submission_completed_) {
+    if (!DrainSubmissionWorker(await_submission)) {
+      return;
+    }
     // Await in a blocking way if requested.
     // TODO(Triang3l): Await only one fence. "Fence signal operations that are
     // defined by vkQueueSubmit additionally include in the first
     // synchronization scope all commands that occur earlier in submission
     // order."
+    diagnostics::rate_census::RecordGpuWaitStart();
     VkResult wait_result =
         dfn.vkWaitForFences(device, uint32_t(await_submission - submission_completed_),
                             submissions_in_flight_fences_.data(), VK_TRUE, UINT64_MAX);
+    diagnostics::rate_census::RecordGpuWaitEnd();
     if (wait_result == VK_SUCCESS) {
       fences_awaited += await_submission - submission_completed_;
     } else {
+      ui::vulkan::util::LogVkResultFailure(vulkan_device,
+                                           "vkWaitForFences (blocking guest fence)", wait_result);
       REXGPU_ERROR("Failed to await submission completion Vulkan fences");
+      submission_failed_ = true;
       if (wait_result == VK_ERROR_DEVICE_LOST) {
         device_lost_ = true;
       }
     }
   }
   // Check how far into the submissions the GPU currently is, in order because
-  // submission themselves can be executed out of order, but Xenia serializes
+  // submission themselves can be executed out of order, but the runtime serializes
   // that for simplicity.
-  while (fences_awaited < fences_total) {
+  if (async_submission_enabled_ && submission_worker_.joinable()) {
+    // Don't poll a fence the submission worker may still be passing to vkQueueSubmit.
+    const uint64_t submission_worker_submitted =
+        submission_worker_submitted_.load(std::memory_order_acquire);
+    const uint64_t fences_submitted =
+        submission_worker_submitted > submission_completed_
+            ? submission_worker_submitted - submission_completed_
+            : 0;
+    fences_total = std::min(
+        fences_total, fences_submitted < uint64_t(fences_total) ? size_t(fences_submitted)
+                                                                : fences_total);
+  }
+  while (!submission_failed_ && fences_awaited < fences_total) {
     VkResult fence_status =
         dfn.vkWaitForFences(device, 1, &submissions_in_flight_fences_[fences_awaited], VK_TRUE, 0);
     if (fence_status != VK_SUCCESS) {
-      if (fence_status == VK_ERROR_DEVICE_LOST) {
-        device_lost_ = true;
+      if (fence_status != VK_TIMEOUT && fence_status != VK_NOT_READY) {
+        ui::vulkan::util::LogVkResultFailure(vulkan_device,
+                                             "vkWaitForFences (nonblocking guest fence)",
+                                             fence_status);
+        submission_failed_ = true;
+        if (fence_status == VK_ERROR_DEVICE_LOST) {
+          device_lost_ = true;
+        }
       }
       break;
     }
     ++fences_awaited;
+  }
+  if (submission_failed_) {
+    if (graphics_system_) {
+      graphics_system_->OnHostGpuLossFromAnyThread(true);
+    }
+    return;
   }
   if (device_lost_) {
     if (graphics_system_) {
@@ -5048,6 +6713,7 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
   submissions_in_flight_fences_.erase(submissions_in_flight_fences_.cbegin(),
                                       submissions_in_flight_fences_awaited_end);
   submission_completed_ += fences_awaited;
+  gpu_timing_->ProcessCompleted(submission_completed_);
 
   // Reclaim semaphores.
   while (!submissions_in_flight_semaphores_.empty()) {
@@ -5129,13 +6795,21 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
-  if (device_lost_) {
+  ObserveSubmissionWorkerFailure();
+  if (device_lost_ || submission_failed_) {
     return false;
   }
 
   bool is_opening_frame = is_guest_command && !frame_open_;
   if (submission_open_ && !is_opening_frame) {
     return true;
+  }
+  if (!submission_open_) {
+    InvalidateTextureDescriptorSetReuse();
+  }
+  if (is_opening_frame) {
+    RefreshReadbackCvarCache(REXCVAR_GET(vulkan_readback_resolve),
+                             REXCVAR_GET(vulkan_readback_memexport));
   }
 
   // Check the fence - needed for all kinds of submissions (to reclaim transient
@@ -5263,6 +6937,15 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
 }
 
 bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+  diagnostics::rate_census::ScopedCpPhase census_phase(
+      diagnostics::rate_census::CpPhase::kSubmit);
+  ObserveSubmissionWorkerFailure();
+  if (device_lost_ || submission_failed_) {
+    return false;
+  }
+  if ((is_swap || !async_submission_enabled_) && !DrainSubmissionWorker()) {
+    return false;
+  }
   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
@@ -5390,7 +7073,16 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
             dfn.vkQueueBindSparse(queue_acquisition.queue(), 1, &bind_sparse_info, VK_NULL_HANDLE);
       }
       if (bind_sparse_result != VK_SUCCESS) {
+        ui::vulkan::util::LogVkResultFailure(vulkan_device, "vkQueueBindSparse",
+                                             bind_sparse_result);
+        submission_failed_ = true;
+        if (bind_sparse_result == VK_ERROR_DEVICE_LOST) {
+          device_lost_ = true;
+        }
         REXGPU_ERROR("Failed to submit Vulkan sparse binds");
+        if (graphics_system_) {
+          graphics_system_->OnHostGpuLossFromAnyThread(true);
+        }
         return false;
       }
       current_submission_wait_semaphores_.push_back(bind_sparse_semaphore);
@@ -5405,77 +7097,167 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
 
     assert_false(command_buffers_writable_.empty());
     CommandBuffer command_buffer = command_buffers_writable_.back();
-    if (dfn.vkResetCommandPool(device, command_buffer.pool, 0) != VK_SUCCESS) {
-      REXGPU_ERROR("Failed to reset a Vulkan command pool");
-      return false;
-    }
-    VkCommandBufferBeginInfo command_buffer_begin_info;
-    command_buffer_begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    command_buffer_begin_info.pNext = nullptr;
-    command_buffer_begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    command_buffer_begin_info.pInheritanceInfo = nullptr;
-    if (dfn.vkBeginCommandBuffer(command_buffer.buffer, &command_buffer_begin_info) != VK_SUCCESS) {
-      REXGPU_ERROR("Failed to begin a Vulkan command buffer");
-      return false;
-    }
-    deferred_command_buffer_.Execute(command_buffer.buffer);
-    if (dfn.vkEndCommandBuffer(command_buffer.buffer) != VK_SUCCESS) {
-      REXGPU_ERROR("Failed to end a Vulkan command buffer");
-      return false;
-    }
+    if (async_submission_enabled_ && !is_swap) {
+      assert_false(fences_free_.empty());
+      VkFence fence = fences_free_.back();
+      if (dfn.vkResetFences(device, 1, &fence) != VK_SUCCESS) {
+        REXGPU_ERROR("Failed to reset a Vulkan submission fence");
+        return false;
+      }
 
-    VkSubmitInfo submit_info;
-    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submit_info.pNext = nullptr;
-    if (!current_submission_wait_semaphores_.empty()) {
-      submit_info.waitSemaphoreCount = uint32_t(current_submission_wait_semaphores_.size());
-      submit_info.pWaitSemaphores = current_submission_wait_semaphores_.data();
-      submit_info.pWaitDstStageMask = current_submission_wait_stage_masks_.data();
+      std::unique_ptr<DeferredCommandBuffer> deferred_command_buffer;
+      {
+        std::unique_lock<std::mutex> lock(submission_worker_mutex_);
+        submission_worker_condition_.wait(lock, [this] {
+          return !submission_worker_deferred_command_buffers_free_.empty() ||
+                 submission_worker_failed_.load(std::memory_order_acquire) ||
+                 submission_worker_stop_requested_;
+        });
+        if (submission_worker_deferred_command_buffers_free_.empty() ||
+            submission_worker_failed_.load(std::memory_order_acquire) ||
+            submission_worker_stop_requested_) {
+          lock.unlock();
+          ObserveSubmissionWorkerFailure();
+          return false;
+        }
+        deferred_command_buffer = std::move(
+            submission_worker_deferred_command_buffers_free_.back());
+        submission_worker_deferred_command_buffers_free_.pop_back();
+      }
+
+      // The active stream is handed to the worker by swapping it with an
+      // empty spare. The spare is returned after the worker has replayed it.
+      deferred_command_buffer_.SwapStorage(*deferred_command_buffer);
+      const uint64_t submission_current = GetCurrentSubmission();
+      gpu_timing_->SubmissionWillBeSubmitted(frame_current_, submission_current);
+      SubmissionJob job;
+      job.command_buffer = command_buffer;
+      job.fence = fence;
+      job.frame = frame_current_;
+      job.submission = submission_current;
+      job.wait_semaphores = current_submission_wait_semaphores_;
+      job.wait_stage_masks = current_submission_wait_stage_masks_;
+      job.deferred_command_buffer = std::move(deferred_command_buffer);
+
+      bool queued = false;
+      {
+        std::lock_guard<std::mutex> lock(submission_worker_mutex_);
+        if (!submission_worker_failed_.load(std::memory_order_acquire) &&
+            !submission_worker_stop_requested_) {
+          submission_worker_jobs_.push_back(std::move(job));
+          submission_worker_last_enqueued_.store(submission_current,
+                                                 std::memory_order_release);
+          queued = true;
+        }
+      }
+      if (!queued) {
+        gpu_timing_->SubmissionCancelled(frame_current_, submission_current);
+        deferred_command_buffer_.SwapStorage(*job.deferred_command_buffer);
+        ReturnSubmissionWorkerCommandBuffer(std::move(job.deferred_command_buffer));
+        ObserveSubmissionWorkerFailure();
+        return false;
+      }
+      submission_worker_condition_.notify_all();
+
+      current_submission_wait_stage_masks_.clear();
+      for (VkSemaphore semaphore : current_submission_wait_semaphores_) {
+        submissions_in_flight_semaphores_.emplace_back(submission_current, semaphore);
+      }
+      current_submission_wait_semaphores_.clear();
+      command_buffers_submitted_.emplace_back(submission_current, command_buffer);
+      command_buffers_writable_.pop_back();
+      // Increments the current submission number, going to the next submission.
+      submissions_in_flight_fences_.push_back(fence);
+      fences_free_.pop_back();
+      deferred_command_buffer_.Reset();
+      submission_open_ = false;
     } else {
-      submit_info.waitSemaphoreCount = 0;
-      submit_info.pWaitSemaphores = nullptr;
-      submit_info.pWaitDstStageMask = nullptr;
-    }
-    submit_info.commandBufferCount = 1;
-    submit_info.pCommandBuffers = &command_buffer.buffer;
-    submit_info.signalSemaphoreCount = 0;
-    submit_info.pSignalSemaphores = nullptr;
-    assert_false(fences_free_.empty());
-    VkFence fence = fences_free_.back();
-    if (dfn.vkResetFences(device, 1, &fence) != VK_SUCCESS) {
-      REXGPU_ERROR("Failed to reset a Vulkan submission fence");
-      return false;
-    }
-    VkResult submit_result;
-    {
-      ui::vulkan::VulkanDevice::Queue::Acquisition queue_acquisition =
-          vulkan_device->AcquireQueue(vulkan_device->queue_family_graphics_compute(), 0);
-      submit_result = dfn.vkQueueSubmit(queue_acquisition.queue(), 1, &submit_info, fence);
-    }
-    if (submit_result != VK_SUCCESS) {
-      REXGPU_ERROR("Failed to submit a Vulkan command buffer");
-      if (submit_result == VK_ERROR_DEVICE_LOST && !device_lost_) {
-        device_lost_ = true;
+      if (dfn.vkResetCommandPool(device, command_buffer.pool, 0) != VK_SUCCESS) {
+        REXGPU_ERROR("Failed to reset a Vulkan command pool");
+        return false;
+      }
+      VkCommandBufferBeginInfo command_buffer_begin_info;
+      command_buffer_begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+      command_buffer_begin_info.pNext = nullptr;
+      command_buffer_begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+      command_buffer_begin_info.pInheritanceInfo = nullptr;
+      if (dfn.vkBeginCommandBuffer(command_buffer.buffer, &command_buffer_begin_info) != VK_SUCCESS) {
+        REXGPU_ERROR("Failed to begin a Vulkan command buffer");
+        return false;
+      }
+      const uint64_t submission_current = GetCurrentSubmission();
+      gpu_timing_->SubmissionWillBeSubmitted(frame_current_, submission_current);
+      deferred_command_buffer_.Execute(command_buffer.buffer, frame_current_,
+                                       submission_current);
+      if (dfn.vkEndCommandBuffer(command_buffer.buffer) != VK_SUCCESS) {
+        gpu_timing_->SubmissionCancelled(frame_current_, submission_current);
+        REXGPU_ERROR("Failed to end a Vulkan command buffer");
+        return false;
+      }
+
+      VkSubmitInfo submit_info;
+      submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+      submit_info.pNext = nullptr;
+      if (!current_submission_wait_semaphores_.empty()) {
+        submit_info.waitSemaphoreCount = uint32_t(current_submission_wait_semaphores_.size());
+        submit_info.pWaitSemaphores = current_submission_wait_semaphores_.data();
+        submit_info.pWaitDstStageMask = current_submission_wait_stage_masks_.data();
+      } else {
+        submit_info.waitSemaphoreCount = 0;
+        submit_info.pWaitSemaphores = nullptr;
+        submit_info.pWaitDstStageMask = nullptr;
+      }
+      submit_info.commandBufferCount = 1;
+      submit_info.pCommandBuffers = &command_buffer.buffer;
+      submit_info.signalSemaphoreCount = 0;
+      submit_info.pSignalSemaphores = nullptr;
+      assert_false(fences_free_.empty());
+      VkFence fence = fences_free_.back();
+      if (dfn.vkResetFences(device, 1, &fence) != VK_SUCCESS) {
+        REXGPU_ERROR("Failed to reset a Vulkan submission fence");
+        return false;
+      }
+      VkResult submit_result;
+      {
+        ui::vulkan::VulkanDevice::Queue::Acquisition queue_acquisition =
+            vulkan_device->AcquireQueue(vulkan_device->queue_family_graphics_compute(), 0);
+        submit_result = ui::vulkan::util::QueueSubmit(
+            vulkan_device, queue_acquisition.queue(), 1, &submit_info, fence);
+      }
+      if (submit_result != VK_SUCCESS) {
+        ui::vulkan::util::LogVkResultFailure(vulkan_device, "vkQueueSubmit (guest work)",
+                                             submit_result);
+        gpu_timing_->SubmissionCancelled(frame_current_, submission_current);
+        REXGPU_ERROR("Failed to submit a Vulkan command buffer");
+        submission_failed_ = true;
+        if (submit_result == VK_ERROR_DEVICE_LOST) {
+          device_lost_ = true;
+        }
         if (graphics_system_) {
           graphics_system_->OnHostGpuLossFromAnyThread(true);
         }
+        return false;
       }
-      return false;
-    }
-    uint64_t submission_current = GetCurrentSubmission();
-    current_submission_wait_stage_masks_.clear();
-    for (VkSemaphore semaphore : current_submission_wait_semaphores_) {
-      submissions_in_flight_semaphores_.emplace_back(submission_current, semaphore);
-    }
-    current_submission_wait_semaphores_.clear();
-    command_buffers_submitted_.emplace_back(submission_current, command_buffer);
-    command_buffers_writable_.pop_back();
-    // Increments the current submission number, going to the next submission.
-    submissions_in_flight_fences_.push_back(fence);
-    fences_free_.pop_back();
+      if (async_submission_enabled_ && submission_worker_.joinable()) {
+        // Publish inline submissions for non-blocking fence polling.
+        submission_worker_submitted_.store(submission_current, std::memory_order_release);
+      }
+      current_submission_wait_stage_masks_.clear();
+      for (VkSemaphore semaphore : current_submission_wait_semaphores_) {
+        submissions_in_flight_semaphores_.emplace_back(submission_current, semaphore);
+      }
+      current_submission_wait_semaphores_.clear();
+      command_buffers_submitted_.emplace_back(submission_current, command_buffer);
+      command_buffers_writable_.pop_back();
+      // Increments the current submission number, going to the next submission.
+      submissions_in_flight_fences_.push_back(fence);
+      fences_free_.pop_back();
 
-    submission_open_ = false;
+      submission_open_ = false;
+    }
   }
+
+  InvalidateTextureDescriptorSetReuse();
 
   if (is_closing_frame) {
     if (REXCVAR_GET(clear_memory_page_state) && shared_memory_) {
@@ -5483,6 +7265,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     }
     frame_open_ = false;
     // Submission already closed now, so minus 1.
+    gpu_timing_->FrameClosed(frame_current_);
     closed_frame_submissions_[(frame_current_++) % kMaxFramesInFlight] = GetCurrentSubmission() - 1;
 
     if (cache_clear_requested_ && AwaitAllQueueOperationsCompletion()) {
@@ -5516,12 +7299,40 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
 
       shared_memory_->ClearCache();
     }
+
+    const std::string& periodic_clear = REXCVAR_GET(debug_periodic_cache_clear);
+    int32_t periodic_clear_frames = REXCVAR_GET(debug_periodic_cache_clear_frames);
+    if (!periodic_clear.empty() && periodic_clear_frames > 0 &&
+        ++periodic_cache_clear_frames_ >= uint32_t(periodic_clear_frames) &&
+        AwaitAllQueueOperationsCompletion()) {
+      periodic_cache_clear_frames_ = 0;
+      ++periodic_cache_clears_;
+      if (periodic_clear == "texture") {
+        // Cached transient descriptor sets may reference the destroyed views.
+        ClearTransientDescriptorPools();
+        texture_cache_->ClearCache();
+      } else if (periodic_clear == "descriptors") {
+        ClearTransientDescriptorPools();
+      } else if (periodic_clear == "render_target") {
+        render_target_cache_->ClearCache();
+      } else if (periodic_clear == "memory") {
+        primitive_processor_->ClearCache();
+        shared_memory_->ClearCache();
+        InvalidateAllVertexBufferResidency();
+      }
+      if (periodic_cache_clears_ <= 3 || periodic_cache_clears_ % 500 == 0) {
+        REXGPU_INFO("Periodic cache clear #{}: {}", periodic_cache_clears_, periodic_clear);
+      }
+    }
   }
 
   return true;
 }
 
 void VulkanCommandProcessor::ClearTransientDescriptorPools() {
+  ++texture_descriptor_allocator_generation_;
+  InvalidateTextureDescriptorSetReuse();
+
   texture_transient_descriptor_sets_free_.clear();
   texture_transient_descriptor_sets_used_.clear();
   transient_descriptor_allocator_textures_.Reset();
@@ -5535,6 +7346,14 @@ void VulkanCommandProcessor::ClearTransientDescriptorPools() {
   single_transient_descriptors_used_.clear();
   transient_descriptor_allocator_storage_buffer_.Reset();
   transient_descriptor_allocator_uniform_buffer_.Reset();
+}
+
+void VulkanCommandProcessor::InvalidateTextureDescriptorSetReuse() {
+  for (auto& stage_reuse : texture_descriptor_set_reuse_) {
+    for (TextureDescriptorSetReuse& reuse : stage_reuse) {
+      reuse = TextureDescriptorSetReuse();
+    }
+  }
 }
 
 void VulkanCommandProcessor::SplitPendingBarrier() {
@@ -5686,8 +7505,9 @@ void VulkanCommandProcessor::DestroySwapFxaaSourceImage() {
 }
 
 void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& viewport_info,
-                                                bool primitive_polygonal,
-                                                reg::RB_DEPTHCONTROL normalized_depth_control) {
+                                                 bool primitive_polygonal,
+                                                 reg::RB_DEPTHCONTROL normalized_depth_control,
+                                                 bool ui_c0_remap_this_draw) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -5710,7 +7530,7 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
     viewport.width = float(viewport_info.xy_extent[0]);
     viewport.height = float(viewport_info.xy_extent[1]);
   } else {
-    // Vulkan viewport width must be greater than 0.0f, but the Xenia  viewport
+    // Vulkan viewport width must be greater than 0.0f, but the the runtime  viewport
     // may be empty for various reasons - set the viewport to outside the
     // framebuffer.
     viewport.x = -1.0f;
@@ -5724,7 +7544,13 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
 
   // Scissor.
   draw_util::Scissor scissor;
-  draw_util::GetScissor(regs, scissor);
+  if (ui_c0_remap_this_draw) {
+    const UiC0RemapConfig& config = GetUiC0RemapConfig();
+    draw_util::GetScissor(regs, scissor, false);
+    ScaleUiScissorToScene(config, scissor);
+  } else {
+    draw_util::GetScissor(regs, scissor);
+  }
   scissor.offset[0] *= draw_resolution_scale_x;
   scissor.offset[1] *= draw_resolution_scale_y;
   scissor.extent[0] *= draw_resolution_scale_x;
@@ -5787,7 +7613,7 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
     // stencil is actually needed. However, due to the way dynamic state needs
     // to be set in Vulkan, which doesn't take into account whether the state
     // actually has effect on drawing, and because the masks and the references
-    // are always dynamic in Xenia guest pipelines, they must be set in the
+    // are always dynamic in the runtime guest pipelines, they must be set in the
     // command buffer before any draw.
     if (normalized_depth_control.stencil_enable) {
       Register stencil_ref_mask_front_reg, stencil_ref_mask_back_reg;
@@ -6393,12 +8219,48 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
 }
 
 bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
-                                            const VulkanShader* pixel_shader) {
+                                            const VulkanShader* pixel_shader,
+                                            bool ui_c0_remap_this_draw,
+                                            uint32_t ui_c0_target_x,
+                                            uint32_t ui_c0_target_y) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
+#if !defined(NDEBUG)
+  static const bool float_constant_map_entry_copy_checked = [] {
+    CheckFloatConstantMapEntryCopy();
+    return true;
+  }();
+  (void)float_constant_map_entry_copy_checked;
+#endif  // !defined(NDEBUG)
+
   const RegisterFile& regs = *register_file_;
+
+  // XTRs retain the guest register stream, before this host-side constant
+  // buffer substitution. Summarize effective remap applications for the
+  // single-frame trace window without logging per draw.
+  const bool ui_c0_single_frame_trace_open =
+      trace_writer_.is_open() && trace_state_ == TraceState::kSingleFrame;
+  if (ui_c0_single_frame_trace_open && !ui_c0_remap_trace_counting_) {
+    ui_c0_remap_trace_draw_counts_.fill(0);
+    ui_c0_remap_trace_counting_ = true;
+  } else if (!ui_c0_single_frame_trace_open && ui_c0_remap_trace_counting_) {
+    const UiC0RemapConfig& config = GetUiC0RemapConfig();
+    if (config.enabled) {
+      std::string draw_counts;
+      for (size_t i = 0; i < config.vertex_shader_hash_count; ++i) {
+        if (!draw_counts.empty()) {
+          draw_counts += ',';
+        }
+        draw_counts += fmt::format("{:016X}:{}", config.vertex_shader_hashes[i],
+                                   ui_c0_remap_trace_draw_counts_[i]);
+      }
+      REXGPU_INFO("[wwe2k16-ui-c0-remap] single-frame trace effective remap counts={}",
+                  draw_counts);
+    }
+    ui_c0_remap_trace_counting_ = false;
+  }
 
   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
@@ -6447,6 +8309,20 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     std::memset(current_float_constant_map_pixel_, 0, sizeof(current_float_constant_map_pixel_));
   }
 
+  // Float constants are cached across draws. A remapped UI draw gets its own
+  // copied buffer; invalidate it again on the following draw so no consumer
+  // (including a post/composite draw) can inherit the substituted c0.
+  constexpr uint32_t kVertexFloatConstantBufferMask =
+      UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFloatVertex;
+  if (vertex_float_constants_remapped_) {
+    current_constant_buffers_up_to_date_ &= ~kVertexFloatConstantBufferMask;
+    vertex_float_constants_remapped_ = false;
+  }
+
+  if (ui_c0_remap_this_draw) {
+    current_constant_buffers_up_to_date_ &= ~kVertexFloatConstantBufferMask;
+  }
+
   // Write the new constant buffers.
   constexpr uint32_t kAllConstantBuffersMask =
       (UINT32_C(1) << SpirvShaderTranslator::kConstantBufferCount) - 1;
@@ -6491,16 +8367,27 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
         return false;
       }
       buffer_info.range = VkDeviceSize(float_constants_size);
+      uint8_t* const vertex_constant_buffer_start = mapping;
       for (uint32_t i = 0; i < 4; ++i) {
-        uint64_t float_constant_map_entry = current_float_constant_map_vertex_[i];
-        uint32_t float_constant_index;
-        while (rex::bit_scan_forward(float_constant_map_entry, &float_constant_index)) {
-          float_constant_map_entry &= ~(1ull << float_constant_index);
-          std::memcpy(
-              mapping,
-              &regs[XE_GPU_REG_SHADER_CONSTANT_000_X + (i << 8) + (float_constant_index << 2)],
-              sizeof(float) * 4);
-          mapping += sizeof(float) * 4;
+        CopyFloatConstantMapEntry(
+            mapping, &regs[XE_GPU_REG_SHADER_CONSTANT_000_X + (i << 8)],
+            current_float_constant_map_vertex_[i]);
+      }
+      if (ui_c0_remap_this_draw) {
+        const uint32_t target_xy[2] = {ui_c0_target_x, ui_c0_target_y};
+        // c0 is register zero, so when used it is the first packed float4.
+        std::memcpy(vertex_constant_buffer_start, target_xy, sizeof(target_xy));
+        vertex_float_constants_remapped_ = true;
+        if (ui_c0_remap_trace_counting_ && trace_writer_.is_open() &&
+            trace_state_ == TraceState::kSingleFrame) {
+          const uint64_t shader_hash = vertex_shader->ucode_data_hash();
+          const UiC0RemapConfig& config = GetUiC0RemapConfig();
+          for (size_t i = 0; i < config.vertex_shader_hash_count; ++i) {
+            if (config.vertex_shader_hashes[i] == shader_hash) {
+              ++ui_c0_remap_trace_draw_counts_[i];
+              break;
+            }
+          }
         }
       }
       current_constant_buffers_up_to_date_ |= UINT32_C(1)
@@ -6521,16 +8408,9 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
       }
       buffer_info.range = VkDeviceSize(float_constants_size);
       for (uint32_t i = 0; i < 4; ++i) {
-        uint64_t float_constant_map_entry = current_float_constant_map_pixel_[i];
-        uint32_t float_constant_index;
-        while (rex::bit_scan_forward(float_constant_map_entry, &float_constant_index)) {
-          float_constant_map_entry &= ~(1ull << float_constant_index);
-          std::memcpy(
-              mapping,
-              &regs[XE_GPU_REG_SHADER_CONSTANT_256_X + (i << 8) + (float_constant_index << 2)],
-              sizeof(float) * 4);
-          mapping += sizeof(float) * 4;
-        }
+        CopyFloatConstantMapEntry(
+            mapping, &regs[XE_GPU_REG_SHADER_CONSTANT_256_X + (i << 8)],
+            current_float_constant_map_pixel_[i]);
       }
       current_constant_buffers_up_to_date_ |= UINT32_C(1)
                                               << SpirvShaderTranslator::kConstantBufferFloatPixel;
@@ -6592,32 +8472,19 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     sampler_count_pixel = 0;
     texture_count_pixel = 0;
   }
-  // TODO(Triang3l): Reuse texture and sampler bindings if not changed.
-  current_graphics_descriptor_set_values_up_to_date_ &=
-      ~((UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex) |
-        (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel));
+  const uint32_t descriptor_set_textures_vertex_bit =
+      UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex;
+  const uint32_t descriptor_set_textures_pixel_bit =
+      UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel;
 
-  // Make sure new descriptor sets are bound to the command buffer.
-
-  current_graphics_descriptor_sets_bound_up_to_date_ &=
-      current_graphics_descriptor_set_values_up_to_date_;
-
-  // Fill the texture and sampler write image infos.
-
-  bool write_vertex_textures =
-      (texture_count_vertex || sampler_count_vertex) &&
-      !(current_graphics_descriptor_set_values_up_to_date_ &
-        (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex));
-  bool write_pixel_textures =
-      (texture_count_pixel || sampler_count_pixel) &&
-      !(current_graphics_descriptor_set_values_up_to_date_ &
-        (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel));
+  // Fill the effective texture and sampler image infos before deciding whether
+  // either descriptor set can be reused. This includes the null-view fallback,
+  // image layout, and the sampler handles actually written to the set.
   descriptor_write_image_info_.clear();
   descriptor_write_image_info_.reserve(
-      (write_vertex_textures ? texture_count_vertex + sampler_count_vertex : 0) +
-      (write_pixel_textures ? texture_count_pixel + sampler_count_pixel : 0));
+      texture_count_vertex + sampler_count_vertex + texture_count_pixel + sampler_count_pixel);
   size_t vertex_texture_image_info_offset = descriptor_write_image_info_.size();
-  if (write_vertex_textures && texture_count_vertex) {
+  if (texture_count_vertex) {
     for (const VulkanShader::TextureBinding& texture_binding : textures_vertex) {
       VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
       descriptor_image_info.imageView = texture_cache_->GetActiveBindingOrNullImageView(
@@ -6629,7 +8496,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     }
   }
   size_t vertex_sampler_image_info_offset = descriptor_write_image_info_.size();
-  if (write_vertex_textures && sampler_count_vertex) {
+  if (sampler_count_vertex) {
     for (const std::pair<VulkanTextureCache::SamplerParameters, VkSampler>& sampler_pair :
          current_samplers_vertex_) {
       VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
@@ -6637,7 +8504,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     }
   }
   size_t pixel_texture_image_info_offset = descriptor_write_image_info_.size();
-  if (write_pixel_textures && texture_count_pixel) {
+  if (texture_count_pixel) {
     for (const VulkanShader::TextureBinding& texture_binding : *textures_pixel) {
       VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
       descriptor_image_info.imageView = texture_cache_->GetActiveBindingOrNullImageView(
@@ -6649,13 +8516,82 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     }
   }
   size_t pixel_sampler_image_info_offset = descriptor_write_image_info_.size();
-  if (write_pixel_textures && sampler_count_pixel) {
+  if (sampler_count_pixel) {
     for (const std::pair<VulkanTextureCache::SamplerParameters, VkSampler>& sampler_pair :
          current_samplers_pixel_) {
       VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
       descriptor_image_info.sampler = sampler_pair.second;
     }
   }
+
+  const VkDescriptorSetLayout texture_descriptor_set_layout_vertex =
+      current_guest_graphics_pipeline_layout_->descriptor_set_layout_textures_vertex_ref();
+  const VkDescriptorSetLayout texture_descriptor_set_layout_pixel =
+      current_guest_graphics_pipeline_layout_->descriptor_set_layout_textures_pixel_ref();
+  const uint64_t current_submission = GetCurrentSubmission();
+  const bool texture_descriptor_set_reuse_enabled = TextureDescriptorSetReuseEnabled();
+  uint64_t image_infos_hashes[2] = {};
+  auto try_reuse_texture_descriptor_set =
+      [&](size_t reuse_index, uint32_t descriptor_set_index, VkDescriptorSetLayout descriptor_set_layout,
+          const VkDescriptorImageInfo* image_infos, size_t image_info_count) {
+        if (!texture_descriptor_set_reuse_enabled || !image_info_count) {
+          return false;
+        }
+        image_infos_hashes[reuse_index] = HashDescriptorImageInfos(image_infos, image_info_count);
+        const TextureDescriptorSetReuse* found = nullptr;
+        for (const TextureDescriptorSetReuse& reuse : texture_descriptor_set_reuse_[reuse_index]) {
+          if (reuse.valid && reuse.image_infos_hash == image_infos_hashes[reuse_index] &&
+              reuse.set != VK_NULL_HANDLE && reuse.layout == descriptor_set_layout &&
+              reuse.frame == frame_current_ && reuse.submission == current_submission &&
+              reuse.allocator_generation == texture_descriptor_allocator_generation_ &&
+              DescriptorImageInfosEqual(reuse.image_infos, image_infos, image_info_count)) {
+            found = &reuse;
+            break;
+          }
+        }
+        if (!found) {
+          return false;
+        }
+        const TextureDescriptorSetReuse& reuse = *found;
+        if (current_graphics_descriptor_sets_[descriptor_set_index] != reuse.set) {
+          // An earlier set of this submission, not the one bound now: it must be bound again.
+          current_graphics_descriptor_sets_bound_up_to_date_ &= ~(UINT32_C(1) << descriptor_set_index);
+        }
+        current_graphics_descriptor_sets_[descriptor_set_index] = reuse.set;
+        current_graphics_descriptor_set_values_up_to_date_ |= UINT32_C(1) << descriptor_set_index;
+        diagnostics::rate_census::RecordDescriptorSetUpdate(descriptor_set_index ==
+                                                                SpirvShaderTranslator::kDescriptorSetTexturesVertex,
+                                                            true);
+        return true;
+      };
+
+  bool reuse_vertex_textures = try_reuse_texture_descriptor_set(
+      0, SpirvShaderTranslator::kDescriptorSetTexturesVertex, texture_descriptor_set_layout_vertex,
+      texture_count_vertex || sampler_count_vertex
+          ? descriptor_write_image_info_.data() + vertex_texture_image_info_offset
+          : nullptr,
+      texture_count_vertex + sampler_count_vertex);
+  bool reuse_pixel_textures = try_reuse_texture_descriptor_set(
+      1, SpirvShaderTranslator::kDescriptorSetTexturesPixel, texture_descriptor_set_layout_pixel,
+      texture_count_pixel || sampler_count_pixel
+          ? descriptor_write_image_info_.data() + pixel_texture_image_info_offset
+          : nullptr,
+      texture_count_pixel + sampler_count_pixel);
+  if (!reuse_vertex_textures) {
+    current_graphics_descriptor_set_values_up_to_date_ &= ~descriptor_set_textures_vertex_bit;
+  }
+  if (!reuse_pixel_textures) {
+    current_graphics_descriptor_set_values_up_to_date_ &= ~descriptor_set_textures_pixel_bit;
+  }
+
+  // Make sure new descriptor sets are bound to the command buffer.
+  current_graphics_descriptor_sets_bound_up_to_date_ &=
+      current_graphics_descriptor_set_values_up_to_date_;
+
+  bool write_vertex_textures =
+      (texture_count_vertex || sampler_count_vertex) && !reuse_vertex_textures;
+  bool write_pixel_textures =
+      (texture_count_pixel || sampler_count_pixel) && !reuse_pixel_textures;
 
   // Write the new descriptor sets.
 
@@ -6743,6 +8679,53 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
   if (write_descriptor_set_count) {
     dfn.vkUpdateDescriptorSets(device, write_descriptor_set_count, write_descriptor_sets.data(), 0,
                                nullptr);
+  }
+
+  if (write_descriptor_set_bits & descriptor_set_textures_vertex_bit) {
+    if (texture_descriptor_set_reuse_enabled) {
+      uint32_t& reuse_next = texture_descriptor_set_reuse_next_[0];
+      TextureDescriptorSetReuse& reuse = texture_descriptor_set_reuse_[0][reuse_next];
+      reuse_next = (reuse_next + 1) % kTextureDescriptorSetReuseEntries;
+      reuse.image_infos_hash = image_infos_hashes[0]
+                                   ? image_infos_hashes[0]
+                                   : HashDescriptorImageInfos(
+                                         descriptor_write_image_info_.data() + vertex_texture_image_info_offset, texture_count_vertex + sampler_count_vertex);
+      reuse.layout = texture_descriptor_set_layout_vertex;
+      reuse.set =
+          current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetTexturesVertex];
+      reuse.frame = frame_current_;
+      reuse.submission = current_submission;
+      reuse.allocator_generation = texture_descriptor_allocator_generation_;
+      reuse.image_infos.assign(
+          descriptor_write_image_info_.data() + vertex_texture_image_info_offset,
+          descriptor_write_image_info_.data() + vertex_texture_image_info_offset +
+              texture_count_vertex + sampler_count_vertex);
+      reuse.valid = true;
+    }
+    diagnostics::rate_census::RecordDescriptorSetUpdate(true, false);
+  }
+  if (write_descriptor_set_bits & descriptor_set_textures_pixel_bit) {
+    if (texture_descriptor_set_reuse_enabled) {
+      uint32_t& reuse_next = texture_descriptor_set_reuse_next_[1];
+      TextureDescriptorSetReuse& reuse = texture_descriptor_set_reuse_[1][reuse_next];
+      reuse_next = (reuse_next + 1) % kTextureDescriptorSetReuseEntries;
+      reuse.image_infos_hash = image_infos_hashes[1]
+                                   ? image_infos_hashes[1]
+                                   : HashDescriptorImageInfos(
+                                         descriptor_write_image_info_.data() + pixel_texture_image_info_offset, texture_count_pixel + sampler_count_pixel);
+      reuse.layout = texture_descriptor_set_layout_pixel;
+      reuse.set =
+          current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetTexturesPixel];
+      reuse.frame = frame_current_;
+      reuse.submission = current_submission;
+      reuse.allocator_generation = texture_descriptor_allocator_generation_;
+      reuse.image_infos.assign(
+          descriptor_write_image_info_.data() + pixel_texture_image_info_offset,
+          descriptor_write_image_info_.data() + pixel_texture_image_info_offset +
+              texture_count_pixel + sampler_count_pixel);
+      reuse.valid = true;
+    }
+    diagnostics::rate_census::RecordDescriptorSetUpdate(false, false);
   }
   // Only make valid if all descriptor sets have been allocated and written
   // successfully.

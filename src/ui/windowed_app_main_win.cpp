@@ -14,6 +14,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <rex/cvar.h>
@@ -22,7 +23,10 @@
 #include <rex/ui/windowed_app.h>
 #include <rex/ui/windowed_app_context_win.h>
 
+#include <windows.h>
+
 REXCVAR_DEFINE_BOOL(enable_console, true, "UI/Window", "Enable console window on Windows");
+REXCVAR_DECLARE(bool, debug_ui);
 
 namespace {
 
@@ -65,11 +69,22 @@ int WINAPI wWinMain(HINSTANCE hinstance, HINSTANCE hinstance_prev, LPWSTR comman
   for (auto& s : utf8_args) {
     argv_ptrs.push_back(s.data());
   }
-  auto remaining = rex::cvar::Init(static_cast<int>(argv_ptrs.size()), argv_ptrs.data());
+  auto init_result = rex::cvar::Init(static_cast<int>(argv_ptrs.size()), argv_ptrs.data());
+  if (init_result.parse_error) {
+    std::string message = "WWE 2K16 could not start: invalid launch option: " +
+                          *init_result.parse_error +
+                          ". Check your shortcut or launcher settings.";
+    MessageBoxA(nullptr, message.c_str(), "WWE 2K16", MB_OK | MB_ICONERROR);
+    return EXIT_FAILURE;
+  }
+  if (init_result.exit_requested) {
+    return EXIT_SUCCESS;
+  }
+  auto remaining = std::move(init_result.remaining);
   rex::cvar::ApplyEnvironment();
 
   // Allocate a console for debugging if enabled
-  if (REXCVAR_GET(enable_console)) {
+  if (REXCVAR_GET(debug_ui) && REXCVAR_GET(enable_console)) {
     AllocConsole();
     FILE* fp;
     freopen_s(&fp, "CONOUT$", "w", stdout);
@@ -105,7 +120,7 @@ int WINAPI wWinMain(HINSTANCE hinstance, HINSTANCE hinstance_prev, LPWSTR comman
       return EXIT_FAILURE;
     }
 
-    // TODO: Port InitializeWin32App from Xenia
+    // TODO: Port InitializeWin32App from the runtime
     // rex::InitializeWin32App(app->GetName());
 
     result = app->OnInitialize() ? app_context.RunMainMessageLoop() : EXIT_FAILURE;
@@ -113,8 +128,12 @@ int WINAPI wWinMain(HINSTANCE hinstance, HINSTANCE hinstance_prev, LPWSTR comman
     app->InvokeOnDestroy();
   }
 
-  // TODO: Port ShutdownWin32App from Xenia
-  // Logging may still be needed in the destructors.
+  // Flush all categories after app/context destruction, matching the POSIX
+  // entrypoint so the final release log is complete on normal exit.
+  rex::ShutdownLogging();
+
+  // TODO: Port ShutdownWin32App from the runtime
+  // Logging has been flushed and shut down after app destruction.
   // rex::ShutdownWin32App();
 
   CoUninitialize();

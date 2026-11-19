@@ -235,6 +235,7 @@ struct BoundsInfo {
   uint32_t maxEntries = 0;
   uint8_t indexReg = 0;
   uint32_t defaultTarget = 0;
+  uint32_t checkAddr = 0;  // Address of the clrlwi/cmpli/cmpi bounds check (0 if unknown)
   bool found = false;
 };
 
@@ -1315,6 +1316,7 @@ BoundsInfo scanForBounds(DecodedBinary& decoded, uint32_t bctrAddr, const CodeRe
       if (insn->D.RA == expectedReg) {
         result.maxEntries = static_cast<uint32_t>(insn->D.d) + 1;
         result.indexReg = expectedReg;
+        result.checkAddr = scanAddr;
         result.found = true;
         REXCODEGEN_TRACE("scanForBounds: MATCHED! maxEntries={}", result.maxEntries);
         return result;
@@ -1329,6 +1331,7 @@ BoundsInfo scanForBounds(DecodedBinary& decoded, uint32_t bctrAddr, const CodeRe
       if (insn->D.RA == expectedReg) {
         result.maxEntries = static_cast<uint32_t>(insn->D.d) + 1;
         result.indexReg = expectedReg;
+        result.checkAddr = scanAddr;
         result.found = true;
         REXCODEGEN_TRACE("scanForBounds: MATCHED! maxEntries={}", result.maxEntries);
         return result;
@@ -1343,6 +1346,7 @@ BoundsInfo scanForBounds(DecodedBinary& decoded, uint32_t bctrAddr, const CodeRe
         uint32_t bits = 32 - insn->M.MB;
         result.maxEntries = 1u << bits;
         result.indexReg = expectedReg;
+        result.checkAddr = scanAddr;
         result.found = true;
         REXCODEGEN_TRACE("scanForBounds: found clrlwi at 0x{:08X} MB={} maxEntries={}", scanAddr,
                          static_cast<unsigned>(insn->M.MB), result.maxEntries);
@@ -1395,6 +1399,67 @@ std::optional<JumpTable> detectJumpTable(DecodedBinary& decoded, uint32_t bctrAd
   uint8_t finalIndexReg = 0xFF;  // Last valid indexReg for scanForBounds/output
   int shiftAmount = 0;
 
+  // Index bias: `addi rI,rI,N` applied to the traced index register AFTER the
+  // bounds check (e.g. clrlwi r7,r9,30; addi r7,r7,7). Such a bias shifts the
+  // table window to [bias, bias+maxEntries); when a sibling path reaches the
+  // same bctr with the un-biased index the shared table covers the UNION
+  // [0, bias+maxEntries) and the emitted case labels stay 0..N-1 (union mode,
+  // see below). The bias only counts when it appears after the bounds check
+  // (biasAddr > bounds.checkAddr): a bias applied BEFORE the check is already
+  // part of the value the bounds check constrains, so it is not a table offset.
+  //
+  // Guards (cycle 9):
+  //  - `ori rI,rI,N` is NOT captured: OR can collapse distinct indices
+  //    (0..3 | 7 == 7), so it cannot be inverted into a unique table window.
+  //  - A self-addi on the SCALED register (`rlwinm r0,r7,2; addi r0,r0,7`) is
+  //    a byte-offset adjustment, not an element bias. The candidate is
+  //    captured while scanning backward (the addi is closer to the load than
+  //    the rlwinm) and discarded when the scaling rlwinm is reached, so only a
+  //    self-addi on the FINAL pre-scale index register survives.
+  //
+  // Cross-register shape (cycle 6): the bias addi may write a DIFFERENT
+  // register than it reads: `clrlwi rS,rX,30; addi rD,rS,7` where rD is the
+  // traced index register and rS is the re-masked source (real-world shape:
+  // clrlwi r11,r11,30; addi r19,r11,7). Scanning backward, the addi is
+  // captured as a PENDING candidate and tracing continues through its source
+  // register rS. The candidate is only COMMITTED as a real bias when the
+  // source is then proven masked -- an rlwinm with SH==0, ME==31, MB>0 writing
+  // rS, i.e. the same clrlwi pattern scanForBounds keys on. That mask bounds
+  // the pre-bias value, so the +N addend is an element bias and not an
+  // arbitrary register move. Any other write to rS (including a scaling slwi)
+  // discards the pending candidate and stops tracing, so the self-addi
+  // post-scale guard above still holds.
+  bool biasFound = false;
+  int32_t indexBias = 0;
+  uint32_t biasAddr = 0;
+  uint8_t biasReg = 0xFF;  // Register the captured bias was applied to
+  // MB of the mask proof for a COMMITTED cross-register bias (0 = self-addi
+  // bias, i.e. no cross-register mask proof was committed). The mask bounds the
+  // PRE-bias value to 2^(32-MB) entries -- the path-B window width used by the
+  // union-count computation below (cycle 7).
+  uint8_t biasMaskMB = 0;
+
+  // Pending cross-register bias candidate: `addi rD,rS,N` with rD the traced
+  // index register and rS a different (to-be-proven-masked) source. Committed
+  // into the bias fields above only when the backward scan reaches the mask on
+  // rS; see the commit/discard logic in the write-to-indexReg branch below.
+  bool hasPendingBias = false;
+  int32_t pendingBias = 0;
+  uint32_t pendingBiasAddr = 0;
+  uint8_t pendingBiasSrc = 0xFF;
+  uint8_t pendingBiasDst = 0xFF;
+
+  // Dual-window discriminator state (cycle 9b F2): `dualWindow` is only set
+  // when the backward scan proves an un-biased sibling path reaches the same
+  // shared bctr (see the check in the loop below); `loadAddr` is the address
+  // of the indexed table load feeding the bctr. `lastCondBranch*` track the
+  // nearest conditional branch in forward order so the check can pair it with
+  // the preceding `cmpli` bounds check.
+  bool dualWindow = false;
+  uint32_t loadAddr = 0;
+  uint32_t lastCondBranchAddr = 0;
+  uint32_t lastCondBranchTarget = 0;
+
   // Backward scan from bctr
   uint32_t scanAddr = bctrAddr;
   bool foundMtctr = false;
@@ -1410,6 +1475,41 @@ std::optional<JumpTable> detectJumpTable(DecodedBinary& decoded, uint32_t bctrAd
     // checks)
     if (isTerminator(*insn) && !isConditional(*insn))
       break;
+
+    // Remember the nearest conditional branch in forward order (the
+    // instruction immediately after the current one). The dual-window check
+    // below pairs it with the preceding `cmpli` bounds check.
+    if ((insn->opcode == Opcode::bc || insn->opcode == Opcode::bca ||
+         insn->opcode == Opcode::bcl || insn->opcode == Opcode::bcla) &&
+        insn->branch_target.has_value()) {
+      lastCondBranchAddr = scanAddr;
+      lastCondBranchTarget = insn->branch_target.value();
+    }
+
+    // Dual-window discriminator (cycle 9b F2): union mode is only valid when a
+    // sibling path reaches the same shared bctr with the un-biased index. The
+    // backward scan can see that path as `cmplwi/cmpwi cr?,rI,K` with
+    // K == indexBias immediately followed by a conditional branch whose target
+    // is beyond the bias instruction (it skips the re-mask+bias block) but
+    // still inside the table setup before the load, e.g.
+    //   clrlwi rI,rS,29; cmplwi cr6,rI,7; bne cr6,<setup>;  [un-biased 0..6]
+    //   clrlwi rI,rS,30; addi rI,rI,7; <setup>: ...          [biased 7..10]
+    // The bias addi sits between the branch and its target, so scanning
+    // backward from the bias sees the branch first (recorded above) and then
+    // the compare on the next iteration.
+    if (biasFound && !dualWindow &&
+        (insn->opcode == Opcode::cmpli || insn->opcode == Opcode::cmpi) &&
+        insn->D.RA == finalIndexReg &&
+        static_cast<uint32_t>(insn->D.UIMM()) == static_cast<uint32_t>(indexBias) &&
+        lastCondBranchAddr == scanAddr + 4 && lastCondBranchTarget > biasAddr &&
+        lastCondBranchTarget < loadAddr) {
+      dualWindow = true;
+      REXCODEGEN_TRACE(
+          "detectJumpTable: bctr=0x{:08X} dual-window: cmpli r{},{} at 0x{:08X} + branch "
+          "0x{:08X} -> 0x{:08X} skips re-mask/bias (bias {} at 0x{:08X}); union mode eligible",
+          bctrAddr, static_cast<unsigned>(insn->D.RA), indexBias, scanAddr, lastCondBranchAddr,
+          lastCondBranchTarget, indexBias, biasAddr);
+    }
 
     // Find mtctr rX
     if (!foundMtctr) {
@@ -1430,6 +1530,7 @@ std::optional<JumpTable> detectJumpTable(DecodedBinary& decoded, uint32_t bctrAd
         indexReg = insn->X.RB;
         finalIndexReg = indexReg;
         foundLoad = true;
+        loadAddr = scanAddr;
         REXCODEGEN_TRACE("detectJumpTable: bctr=0x{:08X} found lwzx at 0x{:08X}", bctrAddr,
                          scanAddr);
         continue;
@@ -1444,6 +1545,7 @@ std::optional<JumpTable> detectJumpTable(DecodedBinary& decoded, uint32_t bctrAd
         indexReg = insn->X.RB;
         finalIndexReg = indexReg;
         foundLoad = true;
+        loadAddr = scanAddr;
         REXCODEGEN_TRACE("detectJumpTable: bctr=0x{:08X} found lbzx at 0x{:08X}", bctrAddr,
                          scanAddr);
         continue;
@@ -1458,6 +1560,7 @@ std::optional<JumpTable> detectJumpTable(DecodedBinary& decoded, uint32_t bctrAd
         indexReg = insn->X.RB;
         finalIndexReg = indexReg;
         foundLoad = true;
+        loadAddr = scanAddr;
         REXCODEGEN_TRACE("detectJumpTable: bctr=0x{:08X} found lhzx at 0x{:08X}", bctrAddr,
                          scanAddr);
         continue;
@@ -1506,6 +1609,46 @@ std::optional<JumpTable> detectJumpTable(DecodedBinary& decoded, uint32_t bctrAd
     // NOTE: SH must be > 0 for a real shift; SH=0 is just a move/no-op (clrlwi r,r,0)
     // IMPORTANT: Stop tracing if another instruction writes to indexReg (breaks the chain)
     if (foundLoad && indexReg != 0xFF) {
+      // Step 3b: index bias (`addi rI,rI,N` on the traced index register).
+      // The bias is applied AFTER the bounds check, so keep tracing backward to
+      // the bounds check instead of treating this as an index overwrite. Only
+      // the first (innermost) bias is captured; it is discarded below if it
+      // turns out to sit on a scaled register (post-scale guard). `ori` is
+      // deliberately not captured (OR can collapse indices).
+      if (!biasFound && !hasPendingBias && insn->opcode == Opcode::addi &&
+          insn->D.RT == indexReg && insn->D.RA == indexReg) {
+        indexBias = static_cast<int32_t>(static_cast<int16_t>(insn->D.d));
+        biasFound = true;
+        biasAddr = scanAddr;
+        biasReg = indexReg;
+        REXCODEGEN_TRACE(
+            "detectJumpTable: bctr=0x{:08X} found index bias {} at 0x{:08X} (index r{})", bctrAddr,
+            indexBias, scanAddr, static_cast<unsigned>(indexReg));
+        continue;
+      }
+
+      // Cross-register bias (`addi rD,rS,N` with rD == indexReg, rS != rD): the
+      // bias is applied to a re-masked source register. Capture it as PENDING
+      // and keep tracing through rS; the commit (below) requires the mask proof
+      // on rS. Deliberately does NOT set biasFound / finalIndexReg: without the
+      // mask proof this addi could be an arbitrary register move, not a table
+      // bias.
+      if (!biasFound && !hasPendingBias && insn->opcode == Opcode::addi &&
+          insn->D.RT == indexReg && insn->D.RA != indexReg) {
+        pendingBias = static_cast<int32_t>(static_cast<int16_t>(insn->D.d));
+        pendingBiasAddr = scanAddr;
+        pendingBiasSrc = insn->D.RA;
+        pendingBiasDst = insn->D.RT;
+        hasPendingBias = true;
+        indexReg = insn->D.RA;
+        REXCODEGEN_TRACE(
+            "detectJumpTable: bctr=0x{:08X} pending cross-register bias {} at 0x{:08X} (r{} -> "
+            "r{}), tracing r{}",
+            bctrAddr, pendingBias, scanAddr, static_cast<unsigned>(pendingBiasSrc),
+            static_cast<unsigned>(pendingBiasDst), static_cast<unsigned>(indexReg));
+        continue;
+      }
+
       // Check if this instruction writes to indexReg
       bool writesToIndexReg = false;
       uint8_t destReg = 0xFF;
@@ -1519,7 +1662,10 @@ std::optional<JumpTable> detectJumpTable(DecodedBinary& decoded, uint32_t bctrAd
         destReg = insn->X.RA;
       } else if (insn->opcode == Opcode::lbz || insn->opcode == Opcode::lhz ||
                  insn->opcode == Opcode::lwz || insn->opcode == Opcode::li ||
-                 insn->opcode == Opcode::lis || insn->opcode == Opcode::addi) {
+                 insn->opcode == Opcode::lis || insn->opcode == Opcode::addi ||
+                 insn->opcode == Opcode::ori) {
+        // D-form writes to RT (ori included: it rewrites the register and is
+        // never treated as an index bias, so tracing must stop here).
         destReg = insn->D.RT;
       } else if (insn->opcode == Opcode::lbzx || insn->opcode == Opcode::lhzx ||
                  insn->opcode == Opcode::lwzx) {
@@ -1538,13 +1684,55 @@ std::optional<JumpTable> detectJumpTable(DecodedBinary& decoded, uint32_t bctrAd
       if (destReg == indexReg) {
         writesToIndexReg = true;
 
-        // Check for slwi pattern: if it matches, trace back; otherwise stop tracing
-        if (insn->opcode == Opcode::rlwinm) {
+        // While a cross-register bias candidate is pending, only the mask that
+        // proves it (rlwinm SH==0, ME==31, MB>0 -- the clrlwi pattern
+        // scanForBounds keys on) commits it; any other write to the traced
+        // source (including a scaling slwi) discards the candidate. Tracing
+        // stops either way: never follow a slwi while pending.
+        if (hasPendingBias) {
+          const bool maskProof = insn->opcode == Opcode::rlwinm && insn->M.SH == 0 &&
+                                 insn->M.ME == 31 && insn->M.MB > 0;
+          if (maskProof) {
+            biasFound = true;
+            biasAddr = pendingBiasAddr;
+            indexBias = pendingBias;
+            biasReg = pendingBiasDst;
+            biasMaskMB = insn->M.MB;
+            REXCODEGEN_TRACE(
+                "detectJumpTable: bctr=0x{:08X} committed cross-register bias {} at 0x{:08X} "
+                "(r{} masked at 0x{:08X} MB={} -> r{})",
+                bctrAddr, indexBias, biasAddr, static_cast<unsigned>(pendingBiasSrc), scanAddr,
+                static_cast<unsigned>(biasMaskMB), static_cast<unsigned>(biasReg));
+          } else {
+            REXCODEGEN_TRACE(
+                "detectJumpTable: bctr=0x{:08X} discarding pending cross-register bias {} at "
+                "0x{:08X} (r{} written at 0x{:08X} without mask proof)",
+                bctrAddr, pendingBias, pendingBiasAddr, static_cast<unsigned>(indexReg), scanAddr);
+          }
+          hasPendingBias = false;
+          indexReg = 0xFF;  // Stop tracing either way.
+        } else if (insn->opcode == Opcode::rlwinm) {
+          // Check for slwi pattern: if it matches, trace back; otherwise stop tracing
           uint8_t sh = insn->M.SH;
           uint8_t mb = insn->M.MB;
           uint8_t me = insn->M.ME;
           // Check for slwi pattern: SH>0, MB=0, ME=31-SH
           if (sh > 0 && mb == 0 && me == (31 - sh)) {
+            // The register being traced is the destination of a scaling
+            // rlwinm, so it is a SCALED byte-offset register. A self-addi
+            // captured on it is a byte-offset adjustment, not an element bias
+            // (P1 post-scale guard): discard the candidate. Only a self-addi
+            // on the final pre-scale index register is a table bias.
+            if (biasFound && biasReg == indexReg) {
+              REXCODEGEN_TRACE(
+                  "detectJumpTable: bctr=0x{:08X} discarding post-scale bias {} on r{} at "
+                  "0x{:08X} (byte-offset adjustment)",
+                  bctrAddr, indexBias, static_cast<unsigned>(indexReg), biasAddr);
+              biasFound = false;
+              indexBias = 0;
+              biasAddr = 0;
+              biasReg = 0xFF;
+            }
             indexReg = insn->M.RS;
             finalIndexReg = indexReg;
             REXCODEGEN_TRACE(
@@ -1680,35 +1868,109 @@ std::optional<JumpTable> detectJumpTable(DecodedBinary& decoded, uint32_t bctrAd
   // use max entries and let the validation loop determine actual table size
   uint32_t entryCount = bounds.found ? bounds.maxEntries : kMaxTableEntries;
 
+  // A captured index bias is only a table offset when it is applied AFTER the
+  // bounds check (positional discriminator): the bounds then constrain the
+  // PRE-bias index.
+  bool applyBias = bounds.found && biasFound && (biasAddr > bounds.checkAddr);
+
+  // Union mode (cycle 9, gated in cycle 9b F2): the bias is applied on ONE
+  // path only, while a sibling path reaches the same shared bctr with the
+  // un-biased index (path A: clrlwi rX,rS,29; cmplwi cr6,rX,7; bne <setup>;
+  // path B falls through clrlwi rX,rS,30; addi rX,rX,7). The shared table
+  // covers both windows [0, pathA_count) and [bias, bias + pathB_width), i.e.
+  // the union [0, unionCount). Read that union from the UN-BIASED base and
+  // emit plain case 0..N-1 labels (indexBias stays 0). A partial union switch
+  // is never emitted: any mid-window read/validation failure below returns
+  // nullopt, so build_bctr falls back to the guest-exact
+  // PPC_CALL_INDIRECT_FUNC(ctx.ctr.u32), which cannot SIGILL.
+  //
+  // F2 gating (cycle 9b):
+  //  - `dualWindow` (set by the backward-scan discriminator above) must prove
+  //    that an un-biased sibling path exists; otherwise the cycle-8
+  //    biased-window behavior is preserved (`indexBias` kept, entries read
+  //    from tableBase + indexBias*elementSize).
+  //  - The union count is computed in uint64 and must not exceed the
+  //    configured max_jump_table_entries; on overflow/cap-exceed union mode is
+  //    rejected and the biased window is used, so the read is never unbounded.
+  //
+  // Union count formula (cycle 7):
+  //  - Cross-register commits (`addi rD,rS,N` with rD != rS) carry the MB of
+  //    the committed mask proof on rS, so path B is only 2^(32-MB) entries
+  //    wide and the union is
+  //        unionCount = max(pathA_entryCount, indexBias + 2^(32-MB)).
+  //    At the real sites seen so far, path A bounds 8
+  //    entries (cmplwi r19,7) and the mask is MB=30, so the shared table is
+  //    max(8, 7+4) = 11 entries (case 0..10). The old bias+count sum read 15
+  //    and rejected on the first data word past the real table (entry[11]),
+  //    which forced the null-dispatching indirect fallback.
+  //  - Self-addi commits keep the historical `indexBias + entryCount` sum:
+  //    scanForBounds already stops at their re-mask, so pathA_entryCount is the
+  //    path-B window width itself (e.g. sibling sub_83361928: 7 + 4 = 11,
+  //    byte-identical to before).
+  //  - Mask widths outside [1,31] cannot come from a committed proof (the
+  //    commit requires MB>0 and MB is a 5-bit field); the sum form is used as
+  //    the defensive fallback so no shift can overflow.
+  bool unionMode = applyBias && indexBias > 0 && dualWindow;
+  if (unionMode) {
+    uint64_t unionCount;
+    if (biasMaskMB > 0 && biasMaskMB < 32) {
+      const uint64_t maskWidth = 1ull << (32 - biasMaskMB);
+      unionCount = std::max<uint64_t>(entryCount, static_cast<uint64_t>(indexBias) + maskWidth);
+    } else {
+      unionCount = static_cast<uint64_t>(indexBias) + entryCount;
+    }
+    if (unionCount > kMaxTableEntries) {
+      REXCODEGEN_TRACE(
+          "detectJumpTable: bctr=0x{:08X} union window {} (bias {} + count {}) exceeds "
+          "max_jump_table_entries {}; keeping biased window",
+          bctrAddr, unionCount, indexBias, entryCount, kMaxTableEntries);
+      unionMode = false;
+    } else {
+      entryCount = static_cast<uint32_t>(unionCount);
+    }
+  }
+
   // Read table entries
   JumpTable jt;
   jt.bctrAddress = bctrAddr;
   jt.tableAddress = tableAddr;
   jt.indexRegister = finalIndexReg;
+  jt.indexBias = (applyBias && !unionMode) ? indexBias : 0;
+
+  // Element size per table type; outside union mode the bias shifts the table
+  // window by bias elements
+  uint32_t elementSize = (tableType == JumpTableType::kAbsolute)    ? 4
+                         : (tableType == JumpTableType::kShortOffset) ? 2
+                                                                      : 1;
+  uint32_t tableBase = tableAddr;
+  if (applyBias && !unionMode)
+    tableBase += static_cast<uint32_t>(indexBias) * elementSize;
 
   REXCODEGEN_TRACE(
-      "detectJumpTable: bctr=0x{:08X} reading {} entries from table=0x{:08X} base=0x{:08X} type={}",
-      bctrAddr, entryCount, tableAddr, baseAddr, static_cast<int>(tableType));
+      "detectJumpTable: bctr=0x{:08X} reading {} entries from table=0x{:08X} base=0x{:08X} "
+      "type={} bias={} applyBias={} unionMode={} maskMB={} tableBase=0x{:08X}",
+      bctrAddr, entryCount, tableAddr, baseAddr, static_cast<int>(tableType), indexBias, applyBias,
+      unionMode, static_cast<unsigned>(biasMaskMB), tableBase);
 
   for (uint32_t i = 0; i < entryCount; i++) {
     uint32_t target = 0;
 
     switch (tableType) {
       case JumpTableType::kAbsolute: {
-        auto val = decoded.read<uint32_t>(tableAddr + i * 4);
+        auto val = decoded.read<uint32_t>(tableBase + i * 4);
         if (!val) {
           REXCODEGEN_TRACE("detectJumpTable: bctr=0x{:08X} entry[{}] read failed at 0x{:08X}",
-                           bctrAddr, i, tableAddr + i * 4);
+                           bctrAddr, i, tableBase + i * 4);
           break;
         }
         target = *val;
         break;
       }
       case JumpTableType::kByteOffset: {
-        auto val = decoded.read<uint8_t>(tableAddr + i);
+        auto val = decoded.read<uint8_t>(tableBase + i);
         if (!val) {
           REXCODEGEN_TRACE("detectJumpTable: bctr=0x{:08X} entry[{}] read failed at 0x{:08X}",
-                           bctrAddr, i, tableAddr + i);
+                           bctrAddr, i, tableBase + i);
           break;
         }
         target = baseAddr + *val;
@@ -1717,14 +1979,14 @@ std::optional<JumpTable> detectJumpTable(DecodedBinary& decoded, uint32_t bctrAd
         break;
       }
       case JumpTableType::kComputed: {
-        auto val = decoded.read<uint8_t>(tableAddr + i);
+        auto val = decoded.read<uint8_t>(tableBase + i);
         if (!val)
           break;
         target = baseAddr + (static_cast<uint32_t>(*val) << shiftAmount);
         break;
       }
       case JumpTableType::kShortOffset: {
-        auto val = decoded.read<uint16_t>(tableAddr + i * 2);
+        auto val = decoded.read<uint16_t>(tableBase + i * 2);
         if (!val)
           break;
         target = baseAddr + *val;
@@ -1737,8 +1999,15 @@ std::optional<JumpTable> detectJumpTable(DecodedBinary& decoded, uint32_t bctrAd
       REXCODEGEN_TRACE(
           "detectJumpTable: bctr=0x{:08X} entry[{}] target=0x{:08X} not 4-byte aligned", bctrAddr,
           i, target);
-      if (jt.targets.empty())
+      if (jt.targets.empty() || unionMode) {
+        if (unionMode) {
+          REXCODEGEN_TRACE(
+              "detectJumpTable: bctr=0x{:08X} union mode: rejecting table (entry[{}] "
+              "target=0x{:08X} not 4-byte aligned)",
+              bctrAddr, i, target);
+        }
         return std::nullopt;
+      }
       break;
     }
 
@@ -1762,8 +2031,15 @@ std::optional<JumpTable> detectJumpTable(DecodedBinary& decoded, uint32_t bctrAd
           "detectJumpTable: bctr=0x{:08X} entry[{}] target=0x{:08X} invalid (region "
           "0x{:08X}-0x{:08X})",
           bctrAddr, i, target, containingRegion.start, containingRegion.end);
-      if (jt.targets.empty())
+      if (jt.targets.empty() || unionMode) {
+        if (unionMode) {
+          REXCODEGEN_TRACE(
+              "detectJumpTable: bctr=0x{:08X} union mode: rejecting table (entry[{}] "
+              "target=0x{:08X} unreadable/invalid)",
+              bctrAddr, i, target);
+        }
         return std::nullopt;
+      }
       break;
     }
 
@@ -1772,8 +2048,15 @@ std::optional<JumpTable> detectJumpTable(DecodedBinary& decoded, uint32_t bctrAd
       REXCODEGEN_TRACE(
           "detectJumpTable: bctr=0x{:08X} entry[{}] target=0x{:08X} < funcStart=0x{:08X}", bctrAddr,
           i, target, funcStart);
-      if (jt.targets.empty())
+      if (jt.targets.empty() || unionMode) {
+        if (unionMode) {
+          REXCODEGEN_TRACE(
+              "detectJumpTable: bctr=0x{:08X} union mode: rejecting table (entry[{}] "
+              "target=0x{:08X} < funcStart=0x{:08X})",
+              bctrAddr, i, target, funcStart);
+        }
         return std::nullopt;
+      }
       break;
     }
 

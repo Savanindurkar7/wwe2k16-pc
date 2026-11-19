@@ -1,4 +1,4 @@
-// VK_KHR_swapchain functions used in Xenia.
+// VK_KHR_swapchain functions used in the runtime.
 XE_UI_VULKAN_FUNCTION(vkAcquireNextImageKHR)
 XE_UI_VULKAN_FUNCTION(vkCreateSwapchainKHR)
 XE_UI_VULKAN_FUNCTION(vkDestroySwapchainKHR)

@@ -19,6 +19,7 @@ set(REXGLUE_INSTALL_TARGETS
     # Vendored thirdparty libraries (required by SDK)
     disruptorplus renderdoc simde tomlplusplus  # INTERFACE (header-only)
     aes128 mspack o1heap disasm xxhash imgui  # STATIC libraries
+    rexdecoders                  # single-file audio decoders (custom music)
     libavcodec libavutil           # FFmpeg (vendored build)
     # CLI tool
     rexglue
@@ -122,6 +123,7 @@ endif()
 install(FILES
     src/ui/windowed_app_main_win.cpp
     src/ui/windowed_app_main_posix.cpp
+    src/ui/windowed_app_main_android.cpp
     src/ui/rex_app.cpp
     DESTINATION ${CMAKE_INSTALL_DATADIR}/rexglue
 )

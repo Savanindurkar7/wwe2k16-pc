@@ -18,6 +18,7 @@
 #include <rex/assert.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
+#include <rex/diagnostics/rate_census.h>
 #include <rex/perf/counter.h>
 #include <rex/graphics/d3d12/command_processor.h>
 #include <rex/graphics/d3d12/graphics_system.h>
@@ -850,10 +851,10 @@ std::string D3D12CommandProcessor::GetWindowTitleText() const {
   if (render_target_cache_) {
     // Rasterizer-ordered views are a feature very rarely used as of 2020 and
     // that faces adoption complications (outside of Direct3D - on Vulkan - at
-    // least), but crucial to Xenia - raise awareness of its usage.
+    // least), but crucial to the runtime - raise awareness of its usage.
     // https://github.com/KhronosGroup/Vulkan-Ecosystem/issues/27#issuecomment-455712319
-    // "In Xenia's title bar "D3D12 ROV" can be seen, which was a surprise, as I
-    //  wasn't aware that Xenia D3D12 backend was using Raster Order Views
+    // "In the runtime's title bar "D3D12 ROV" can be seen, which was a surprise, as I
+    //  wasn't aware that the runtime D3D12 backend was using Raster Order Views
     //  feature" - oscarbg in that issue.
     switch (render_target_cache_->GetPath()) {
       case RenderTargetCache::Path::kHostRenderTargets:
@@ -1918,6 +1919,7 @@ void D3D12CommandProcessor::OnGammaRampPWLValueWritten() {
 void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
+  diagnostics::rate_census::RecordPresent();
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
 
@@ -2522,7 +2524,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
           REXGPU_WARN(
               "Vertex fetch constant {} ({:08X} {:08X}) has \"invalid\" type! "
               "This is incorrect behavior, but you can try bypassing this by "
-              "launching Xenia with --gpu_allow_invalid_fetch_constants=true.",
+              "launching with --gpu_allow_invalid_fetch_constants=true.",
               vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1);
           return false;
         default:
@@ -2727,15 +2729,17 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     // Invalidate textures in memexported memory and watch for changes.
     if (!memexport_ranges_.empty()) {
       for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
-        shared_memory_->RangeWrittenByGpu(memexport_range.base_address_dwords << 2,
-                                          memexport_range.size_bytes);
+        uint32_t start = memexport_range.base_address_dwords << 2;
+        texture_cache_->MarkRangeAsUnscaledGpuWrite(start, memexport_range.size_bytes);
       }
     } else {
       // Stream constants can be invalid or dynamic, so exact destinations may
-      // be unknown. Keep invalidation conservative in this case.
+      // be unknown. Keep texture invalidation conservative, but don't classify
+      // the entire shared memory as unscaled: that would discard scaled-resolve
+      // metadata for destinations the draw may not have written.
       shared_memory_->RangeWrittenByGpu(0, SharedMemory::kBufferSize);
     }
-    if (IsReadbackMemexportEnabled(REXCVAR_GET(d3d12_readback_memexport)) &&
+    if (IsReadbackMemexportEnabled() &&
         !memexport_ranges_.empty()) {
       uint32_t memexport_total_size = 0;
       for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
@@ -2921,7 +2925,7 @@ bool D3D12CommandProcessor::IssueCopy() {
   if (!BeginSubmission(true)) {
     return false;
   }
-  ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
+  ReadbackResolveMode readback_mode = GetReadbackResolveMode();
   if (readback_mode == ReadbackResolveMode::kDisabled) {
     uint32_t written_address, written_length;
     return render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
@@ -3113,7 +3117,7 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
                                                written_address, written_length);
   }
 
-  ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
+  ReadbackResolveMode readback_mode = GetReadbackResolveMode();
   bool use_delayed_sync =
       readback_mode == ReadbackResolveMode::kFast || readback_mode == ReadbackResolveMode::kSome;
   uint32_t read_index = write_index;
@@ -3304,6 +3308,10 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
   if (submission_open_ && !is_opening_frame) {
     return true;
   }
+  if (is_opening_frame) {
+    RefreshReadbackCvarCache(REXCVAR_GET(d3d12_readback_resolve),
+                             REXCVAR_GET(d3d12_readback_memexport));
+  }
 
   // Check if the device is still available.
   ID3D12Device* device = GetD3D12Provider().GetDevice();
@@ -3472,7 +3480,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     // Only one deferred command list must be executed in the same
     // ExecuteCommandLists - the boundaries of ExecuteCommandLists are a full
     // UAV and aliasing barrier, and subsystems of the emulator assume it
-    // happens between Xenia submissions.
+    // happens between the runtime submissions.
     ID3D12CommandAllocator* command_allocator =
         command_allocator_writable_first_->command_allocator;
     command_allocator->Reset();

@@ -255,7 +255,7 @@ void TraceWriter::WriteEdramSnapshot(const void* snapshot) {
 
     // Stream the content right to the buffer.
     snappy::ByteArraySource snappy_source(reinterpret_cast<const char*>(snapshot),
-                                          xenos::kEdramSizeBytes);
+                                          xenos::GetEdramSizeBytes());
     SnappySink snappy_sink(file_);
     cmd.encoded_length = static_cast<uint32_t>(snappy::Compress(&snappy_source, &snappy_sink));
 
@@ -268,9 +268,9 @@ void TraceWriter::WriteEdramSnapshot(const void* snapshot) {
   {
     // Uncompressed - write buffer directly to the file.
     cmd.encoding_format = MemoryEncodingFormat::kNone;
-    cmd.encoded_length = xenos::kEdramSizeBytes;
+    cmd.encoded_length = xenos::GetEdramSizeBytes();
     fwrite(&cmd, 1, sizeof(cmd), file_);
-    fwrite(snapshot, 1, xenos::kEdramSizeBytes, file_);
+    fwrite(snapshot, 1, xenos::GetEdramSizeBytes(), file_);
   }
 }
 

@@ -91,6 +91,16 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   /// Called after runtime is fully initialized, before window creation.
   virtual void OnPostSetup() {}
 
+  /// Called when the runtime failed to initialize because the graphics backend
+  /// could not be set up (for example when no usable graphics device was
+  /// found). The platform entry point has not created a window yet, and the
+  /// application is about to exit. Override to present a player-facing message;
+  /// the failure is logged regardless.
+  virtual void OnGraphicsSetupFailed(X_STATUS status) { (void)status; }
+
+  /// Window title shown to the player. Defaults to the application name.
+  virtual std::string_view GetWindowTitle() const { return GetName(); }
+
   /// Called after ImGui drawer is created. Add custom dialogs here.
   virtual void OnCreateDialogs(ui::ImGuiDrawer* drawer) { (void)drawer; }
 

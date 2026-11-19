@@ -42,7 +42,7 @@
 // https://www.x.org/docs/AMD/old/RRG-216M56-03oOEM.pdf
 
 // All unused bits are intentionally declared as named fields for stable
-// comparisons when register values are constructed or modified by Xenia itself.
+// comparisons when register values are constructed or modified by the runtime itself.
 
 // Only 32-bit types (uint32_t, int32_t, float or enums with uint32_t / int32_t
 // as the underlying type) are allowed in the bit fields here, as Visual C++
@@ -736,7 +736,7 @@ union alignas(uint32_t) RB_COLOR_INFO {
   uint32_t value;
   struct {
     // The original R400 structure has 12-bit color_base, however the Xenos has
-    // periodic 11-bit EDRAM tile addressing, so this field was split in Xenia
+    // periodic 11-bit EDRAM tile addressing, so this field was split in the runtime
     // for convenience and to avoid mistakes.
     uint32_t color_base : 11;                         // +0 in tiles.
     uint32_t color_base_bit_11 : 1;                   // +11
@@ -835,7 +835,7 @@ union alignas(uint32_t) RB_DEPTH_INFO {
   uint32_t value;
   struct {
     // The original R400 structure has 12-bit depth_base, however the Xenos has
-    // periodic 11-bit EDRAM tile addressing, so this field was split in Xenia
+    // periodic 11-bit EDRAM tile addressing, so this field was split in the runtime
     // for convenience and to avoid mistakes.
     uint32_t depth_base : 11;                         // +0 in tiles.
     uint32_t depth_base_bit_11 : 1;                   // +11

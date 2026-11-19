@@ -24,9 +24,49 @@
 #include <rex/thread.h>
 #include <rex/cvar.h>
 
+#include <chrono>
+#include <cstdlib>
+#include <cstring>
+
 REXCVAR_DEFINE_INT32(
     audio_maxqframes, 8, "Audio",
     "Max buffered audio frames (range 4-64). Lower reduces latency but may cause stuttering.");
+
+namespace {
+
+bool AudioFrameProbeEnabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("REX_AUDIO_FRAME_PROBE");
+    return value && std::strcmp(value, "1") == 0;
+  }();
+  return enabled;
+}
+
+void CountAudioSystemSubmitFrame() {
+  using Clock = std::chrono::steady_clock;
+  static std::atomic<uint64_t> submissions{0};
+  static std::atomic<int64_t> window_start_ns{0};
+  submissions.fetch_add(1, std::memory_order_relaxed);
+
+  const int64_t now_ns =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count();
+  int64_t start_ns = window_start_ns.load(std::memory_order_relaxed);
+  if (!start_ns) {
+    window_start_ns.compare_exchange_strong(start_ns, now_ns, std::memory_order_relaxed);
+    return;
+  }
+  if (now_ns - start_ns < 1000000000LL ||
+      !window_start_ns.compare_exchange_strong(start_ns, now_ns, std::memory_order_relaxed)) {
+    return;
+  }
+
+  const uint64_t count = submissions.exchange(0, std::memory_order_relaxed);
+  const double seconds = static_cast<double>(now_ns - start_ns) / 1.0e9;
+  REXAPU_INFO("[audio-frame-probe] AudioSystem::SubmitFrame calls={} rate={:.1f}/s interval={:.0f}ms",
+              count, count / seconds, seconds * 1000.0);
+}
+
+}  // namespace
 
 // As with normal Microsoft, there are like twelve different ways to access
 // the audio APIs. Early games use XMA*() methods almost exclusively to touch
@@ -250,6 +290,10 @@ X_STATUS AudioSystem::RegisterClient(uint32_t callback, uint32_t callback_arg, s
 
 void AudioSystem::SubmitFrame(size_t index, uint32_t samples_ptr) {
   SCOPE_profile_cpu_f("apu");
+
+  if (AudioFrameProbeEnabled()) {
+    CountAudioSystemSubmitFrame();
+  }
 
   static uint32_t submit_count = 0;
   if (submit_count < 10) {

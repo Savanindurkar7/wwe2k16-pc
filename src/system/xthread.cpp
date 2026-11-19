@@ -18,6 +18,7 @@
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
+#include <rex/diagnostics/freeze_logger.h>
 #include <rex/perf/counter.h>
 #include <rex/literals.h>
 #include <rex/logging.h>
@@ -427,6 +428,9 @@ X_STATUS XThread::Create() {
     // Set name immediately, if we have one.
     thread_->set_name(thread_name_);
 
+    rex::diagnostics::freeze_logger::RegisterThread(
+        thread_id_, thread_name_.empty() ? "XThread" : thread_name_.c_str());
+
     PROFILE_THREAD_ENTER(thread_name_.c_str());
     PROFILE_THREAD_CREATED();
 
@@ -439,6 +443,8 @@ X_STATUS XThread::Create() {
 
     PROFILE_THREAD_EXITED();
     PROFILE_THREAD_EXIT();
+
+    rex::diagnostics::freeze_logger::UnregisterThread();
 
     // Release the self-reference to the thread.
     ReleaseHandle();
@@ -657,7 +663,7 @@ void XThread::UnlockApc(bool queue_delivery) {
   kernel::xboxkrnl::xeKeKfReleaseSpinLock(thread_state_->context(), &kthread->apc_lock,
                                           apc_lock_old_irql_);
   if (needs_apc && queue_delivery) {
-    // Match Edge/Canary behavior: callback is only a wakeup hint.
+    // Match the reference behavior: callback is only a wakeup hint.
     // User APC execution happens on alertable wait return paths.
     thread_->QueueUserCallback([]() {});
   }
@@ -689,7 +695,7 @@ void XThread::EnqueueApc(uint32_t normal_routine, uint32_t normal_context, uint3
         thread_id_, normal_routine, normal_context, arg1, arg2);
     return;
   }
-  // Match Edge/Canary behavior: callback is only a wakeup hint.
+  // Match the reference behavior: callback is only a wakeup hint.
   // APCs are delivered via alertable wait handling.
   thread_->QueueUserCallback([]() {});
 }

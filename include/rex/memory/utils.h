@@ -88,7 +88,7 @@ enum class DeallocationType {
 bool IsWritableExecutableMemorySupported();
 
 // Whether PageAccess::kExecuteReadWrite is a supported and preferred way of
-// writing executable memory, useful for simulating how Xenia would work without
+// writing executable memory, useful for simulating how the runtime would work without
 // writable executable memory on a system with it.
 bool IsWritableExecutableMemoryPreferred();
 

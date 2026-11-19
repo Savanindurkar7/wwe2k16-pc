@@ -18,6 +18,7 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 #include <cerrno>
 #include <cstddef>
 #include <ctime>
+#include <cstdlib>
 #include <deque>
 #include <limits>
 #include <memory>
@@ -40,11 +41,10 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 #if REX_PLATFORM_ANDROID
 #include <dlfcn.h>
 
-#include <rex/main_android.h>
 #include <rex/string/util.h>
 #endif
 
-#if REX_PLATFORM_LINUX
+#if REX_PLATFORM_LINUX && !REX_PLATFORM_ANDROID
 // SIGEV_THREAD_ID in timer_create(...) is a Linux extension
 #define REX_HAS_SIGEV_THREAD_ID 1
 #ifdef __GLIBC__
@@ -66,7 +66,7 @@ static void* android_libc_;
 static int (*android_pthread_getname_np_)(pthread_t pthread, char* buf, size_t n);
 
 void AndroidInitialize() {
-  if (rex::GetAndroidApiLevel() >= 26) {
+  if (__ANDROID_API__ >= 26) {
     android_libc_ = dlopen("libc.so", RTLD_NOW);
     assert_not_null(android_libc_);
     if (android_libc_) {
@@ -216,7 +216,7 @@ bool SetTlsValue(TlsHandle handle, uintptr_t value) {
 class PosixConditionBase {
  public:
   PosixConditionBase() {
-#if REX_PLATFORM_LINUX
+#if REX_PLATFORM_LINUX && !REX_PLATFORM_ANDROID
     // Use robust mutexes so waits can recover if owner thread terminates.
     pthread_mutexattr_t attr;
     if (pthread_mutexattr_init(&attr) == 0) {
@@ -236,7 +236,7 @@ class PosixConditionBase {
   WaitResult Wait(std::chrono::milliseconds timeout) {
     bool executed;
     auto predicate = [this] { return this->signaled(); };
-#if REX_PLATFORM_LINUX
+#if REX_PLATFORM_LINUX && !REX_PLATFORM_ANDROID
     auto native_mutex = static_cast<pthread_mutex_t*>(mutex_.native_handle());
     int lock_result = pthread_mutex_lock(native_mutex);
     if (lock_result == EOWNERDEAD) {
@@ -290,7 +290,7 @@ class PosixConditionBase {
       locks.reserve(handles.size());
 
       for (size_t i = 0; i < handles.size(); ++i) {
-#if REX_PLATFORM_LINUX
+#if REX_PLATFORM_LINUX && !REX_PLATFORM_ANDROID
         auto native_mutex = static_cast<pthread_mutex_t*>(handles[i]->mutex_.native_handle());
         int result = pthread_mutex_trylock(native_mutex);
         if (result == 0 || result == EOWNERDEAD) {
@@ -632,7 +632,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
   }
 
   virtual ~PosixCondition() {
-    // Match Canary/Edge behavior.
+    // Match the reference behavior.
     // Force-cancel/join from the condition destructor can self-join/crash
     // depending on shutdown ordering, so threads must be stopped explicitly.
   }
@@ -646,7 +646,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
     if (state_ != State::kUninitialized && state_ != State::kFinished) {
 #if REX_PLATFORM_ANDROID
       // pthread_getname_np was added in API 26 - below that, store the name in
-      // this object, which may be only modified through Xenia threading, but
+      // this object, which may be only modified through the runtime threading, but
       // should be enough in most cases.
       if (android_pthread_getname_np_) {
         if (android_pthread_getname_np_(thread_, result.data(), result.size() - 1) != 0) {
@@ -953,6 +953,22 @@ PosixWaitHandle::~PosixWaitHandle() = default;
 
 thread_local PosixCondition<Thread>* current_thread_condition_ = nullptr;
 
+#if defined(REXGLUE_BUILD_TESTS)
+void MaybeDelayThreadStartForTest() {
+  const char* delay = std::getenv("REXGLUE_TEST_THREAD_START_DELAY_US");
+  if (!delay) {
+    return;
+  }
+
+  char* end = nullptr;
+  const auto delay_us = std::strtoul(delay, &end, 10);
+  if (end == delay || *end != '\0') {
+    return;
+  }
+  std::this_thread::sleep_for(std::chrono::microseconds(delay_us));
+}
+#endif
+
 bool DispatchCurrentThreadUserCallback() {
   if (!current_thread_condition_) {
     Thread::GetCurrentThread();
@@ -1207,7 +1223,7 @@ class PosixTimer : public PosixConditionHandle<Timer> {
   }
   bool SetOnceAt(WClock_::time_point due_time,
                  std::function<void()> opt_callback = nullptr) override {
-    return SetOnceAt(std::chrono::clock_cast<GClock_>(due_time), std::move(opt_callback));
+    return SetOnceAt(std::chrono::time_point_cast<GClock_::duration>(GClock_::now() + (due_time - WClock_::now())), std::move(opt_callback));
   };
   bool SetOnceAt(GClock_::time_point due_time,
                  std::function<void()> opt_callback = nullptr) override {
@@ -1221,7 +1237,7 @@ class PosixTimer : public PosixConditionHandle<Timer> {
   }
   bool SetRepeatingAt(WClock_::time_point due_time, std::chrono::milliseconds period,
                       std::function<void()> opt_callback = nullptr) override {
-    return SetRepeatingAt(std::chrono::clock_cast<GClock_>(due_time), period,
+    return SetRepeatingAt(std::chrono::time_point_cast<GClock_::duration>(GClock_::now() + (due_time - WClock_::now())), period,
                           std::move(opt_callback));
   }
   bool SetRepeatingAt(GClock_::time_point due_time, std::chrono::milliseconds period,
@@ -1311,15 +1327,36 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
   current_thread_condition_ = &thread->handle_;
   {
     std::unique_lock<std::mutex> lock(thread->handle_.state_mutex_);
-    thread->handle_.state_ = create_suspended ? State::kSuspended : State::kRunning;
+    if (create_suspended) {
+      thread->handle_.suspend_count_ = 1;
+      thread->handle_.state_ = State::kSuspended;
+    } else {
+      thread->handle_.state_ = State::kRunning;
+    }
     thread->handle_.state_signal_.notify_all();
-  }
 
-  if (create_suspended) {
-    std::unique_lock<std::mutex> lock(thread->handle_.state_mutex_);
-    thread->handle_.suspend_count_ = 1;
-    thread->handle_.state_signal_.wait(lock,
-                                       [thread] { return thread->handle_.suspend_count_ == 0; });
+#if defined(REXGLUE_BUILD_TESTS)
+    if (create_suspended) {
+      MaybeDelayThreadStartForTest();
+    }
+#endif
+    if (create_suspended) {
+      thread->handle_.state_signal_.wait(lock,
+                                         [thread] { return thread->handle_.suspend_count_ == 0; });
+
+      // Resume() uses this semaphore for the signal-handler suspend path. A
+      // resume of the synthetic create-suspended count wakes the condition
+      // variable above, but must not leave a token for a later signal wait.
+      int result;
+      do {
+        result = sem_trywait(&thread->handle_.suspend_sem_);
+      } while (result == -1 && errno == EINTR);
+      while (result == 0) {
+        do {
+          result = sem_trywait(&thread->handle_.suspend_sem_);
+        } while (result == -1 && errno == EINTR);
+      }
+    }
   }
 
   start_routine();

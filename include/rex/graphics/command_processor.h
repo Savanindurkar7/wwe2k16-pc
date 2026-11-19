@@ -12,6 +12,8 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -24,6 +26,7 @@
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/trace_writer.h>
+#include <rex/graphics/util/content_probe.h>
 #include <rex/graphics/xenos.h>
 #include <rex/memory.h>
 #include <rex/memory/ring_buffer.h>
@@ -96,6 +99,14 @@ class CommandProcessor {
 
   void CallInThread(std::function<void()> fn);
 
+  // Makes data the GPU wrote (resolves) into [guest_address, guest_address + length) visible in
+  // guest memory, for titles whose CPU code reads render-to-texture results (some titles untile and
+  // converts composited wrestler textures). Only pages still holding GPU-written data are copied.
+  // Callable from any thread; the worker thread services the request between command batches.
+  // Returns false if nothing was done (timeout, unsupported backend, non-physical address).
+  bool MakeGpuWritesVisibleToCpu(uint32_t guest_address, uint32_t length,
+                                 std::chrono::milliseconds timeout = std::chrono::milliseconds(2000));
+
   virtual void ClearCaches();
   virtual void InvalidateGpuMemory();
 
@@ -143,6 +154,12 @@ class CommandProcessor {
   bool Save(::rex::stream::ByteStream* stream);
   bool Restore(::rex::stream::ByteStream* stream);
 
+  // Content probe: increment resolve-executed clear counter (zero overhead
+  // when the gpu_content_probe cvar is off)
+  void IncrementClearCount() { content_probe_counters_.OnResolveClearExecuted(); }
+  // Content probe: reset per-second counters
+  void ResetContentProbeCounters() { content_probe_counters_.Reset(); }
+
  protected:
   struct IndexBufferInfo {
     xenos::IndexFormat format = xenos::IndexFormat::kInt16;
@@ -178,6 +195,12 @@ class CommandProcessor {
   const reg::DC_LUT_PWL_DATA* gamma_ramp_pwl_rgb() const { return gamma_ramp_pwl_rgb_[0]; }
   virtual void OnGammaRamp256EntryTableValueWritten() {}
   virtual void OnGammaRampPWLValueWritten() {}
+  // Content probe (sub-second ordering): monotonic guest-frame ordinal used to
+  // stamp clear-register writes. The default body returns 0 so non-Vulkan
+  // subclasses (D3D12) compile unchanged; the only call site is inside the
+  // default-off gpu_content_probe cvar gate in WriteRegister, so this is
+  // zero-cost when the probe is disabled.
+  virtual uint64_t ContentProbeFrameOrdinal() const { return 0; }
 
   virtual void MakeCoherent();
   virtual void PrepareForWait();
@@ -243,8 +266,11 @@ class CommandProcessor {
 
   // Shared readback resolve mode with backend legacy-flag alias support.
   ReadbackResolveMode GetReadbackResolveMode(bool legacy_readback_resolve_enabled) const;
+  ReadbackResolveMode GetReadbackResolveMode() const { return readback_resolve_mode_; }
   // Shared memexport readback enable state with backend legacy-flag override support.
   bool IsReadbackMemexportEnabled(bool legacy_backend_flag) const;
+  bool IsReadbackMemexportEnabled() const { return readback_memexport_enabled_; }
+  void RefreshReadbackCvarCache(bool legacy_readback_resolve_enabled, bool legacy_backend_flag);
 
   memory::Memory* memory_ = nullptr;
   system::KernelState* kernel_state_ = nullptr;
@@ -266,10 +292,27 @@ class CommandProcessor {
 
   std::queue<std::function<void()>> pending_fns_;
 
+  // Backend hook for MakeGpuWritesVisibleToCpu, run on the worker thread.
+  virtual bool ReadbackGpuWrittenRange(uint32_t physical_address, uint32_t length) {
+    return false;
+  }
+  void ServiceCpuVisibilityRequest();
+  std::mutex cpu_visibility_caller_mutex_;
+  std::mutex cpu_visibility_mutex_;
+  std::condition_variable cpu_visibility_cv_;
+  std::atomic<bool> cpu_visibility_pending_{false};
+  uint32_t cpu_visibility_start_ = 0;
+  uint32_t cpu_visibility_length_ = 0;
+  bool cpu_visibility_done_ = false;
+  bool cpu_visibility_result_ = false;
+
   // MicroEngine binary from PM4_ME_INIT
   std::vector<uint32_t> me_bin_;
 
   uint32_t counter_ = 0;
+
+  // Content probe counters (zero overhead when gpu_content_probe is false)
+  content_probe::ProbeCounters content_probe_counters_;
 
   uint32_t primary_buffer_ptr_ = 0;
   uint32_t primary_buffer_size_ = 0;
@@ -302,6 +345,9 @@ class CommandProcessor {
   // Set by backend command processors to their legacy memexport readback cvar
   // name (for explicit-override compatibility).
   const char* legacy_readback_memexport_cvar_name_ = nullptr;
+
+  ReadbackResolveMode readback_resolve_mode_ = ReadbackResolveMode::kDisabled;
+  bool readback_memexport_enabled_ = true;
 
  private:
   reg::DC_LUT_30_COLOR gamma_ramp_256_entry_table_[256] = {};

@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <rex/cvar.h>
 #include <rex/kernel/xam/module.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/logging.h>
@@ -27,6 +28,8 @@
 
 #include <fmt/format.h>
 #include <fmt/xchar.h>
+
+REXCVAR_DECLARE(uint32_t, user_language);
 
 namespace rex {
 namespace kernel {
@@ -129,7 +132,7 @@ ppc_u32_result_t XamBuildGamercardResourceLocator_entry(ppc_pchar16_t filename,
                                                         ppc_pvoid_t buffer_ptr,
                                                         ppc_u32_t buffer_count) {
   // On an actual xbox these funcs would return a locator to xam.xex resources,
-  // but for Xenia we can return a locator to the resources as local files. (big
+  // but for the runtime we can return a locator to the resources as local files. (big
   // thanks to MS for letting XamBuildResourceLocator return local file
   // locators!)
 
@@ -189,6 +192,10 @@ ppc_u32_result_t XGetGameRegion_entry() {
 }
 
 ppc_u32_result_t XGetLanguage_entry() {
+  const uint32_t user_language = REXCVAR_GET(user_language);
+  if (user_language >= 1 && user_language <= 12) {
+    return user_language;
+  }
   auto desired_language = XLanguage::kEnglish;
 
   // Switch the language based on game region.

@@ -906,7 +906,7 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
       uint32_t tile_width = xenos::kEdramTileWidthSamples * draw_resolution_scale_x_;
       uint32_t tile_height = xenos::kEdramTileHeightSamples * draw_resolution_scale_y_;
       fsi_const_edram_size_dwords =
-          builder_->makeUintConstant(tile_width * tile_height * xenos::kEdramTileCount);
+          builder_->makeUintConstant(tile_width * tile_height * xenos::GetEdramTileCount());
       for (uint32_t i = 0; i < 4; ++i) {
         fsi_samples_covered[i] = builder_->createBinOp(
             spv::OpINotEqual, type_bool_,
@@ -1389,6 +1389,8 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
           assert_true(input_sample_id_ != spv::NoResult);
           builder_->createLoad(input_sample_id_, spv::NoPrecision);
         }
+        // Without IsSampleRate(), this reads pixel-center FragCoord.z and does
+        // not introduce a gl_SampleID-driven sample interpolation.
         depth = builder_->createTriBuiltinCall(
             type_float_, ext_inst_glsl_std_450_, GLSLstd450NClamp,
             builder_->createNoContractionBinOp(spv::OpFMul, type_float_, depth,
@@ -1627,7 +1629,7 @@ void SpirvShaderTranslator::FSI_LoadEdramOffsets(spv::Id msaa_samples) {
               spv::OpIAdd, type_uint_, offset_in_first_tile_half_at_32bpp,
               builder_->createTriOp(spv::OpSelect, type_uint_, is_second_tile_half, const_uint_0_,
                                     const_tile_half_width))),
-      builder_->makeUintConstant(tile_size * xenos::kEdramTileCount));
+       builder_->makeUintConstant(tile_size * xenos::GetEdramTileCount()));
 
   if (current_shader().writes_color_targets()) {
     // Get the offset of the sample 0 within a 32bpp surface, with samples
@@ -1964,7 +1966,7 @@ void SpirvShaderTranslator::FSI_DepthStencilTest(spv::Id msaa_samples,
           }
         } break;
         default: {
-          // Xenia samples 2 and 3 (top-right and bottom-right) -> Vulkan
+          // the runtime samples 2 and 3 (top-right and bottom-right) -> Vulkan
           // samples 1 and 3.
           const int8_t* sample_location_int =
               draw_util::kD3D10StandardSamplePositions4x[i ^ (((i & 1) ^ (i >> 1)) * 0b11)];

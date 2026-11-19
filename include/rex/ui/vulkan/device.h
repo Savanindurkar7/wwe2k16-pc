@@ -168,6 +168,9 @@ class VulkanDevice {
     // VK_EXT_robustness2
 
     bool nullDescriptor = false;
+
+    // VK_EXT_device_fault, enabled only when the extension and deviceFault feature are supported.
+    bool deviceFault = false;
   };
 
   // Properties of the core API and enabled extensions, and enabled features.
@@ -199,6 +202,7 @@ class VulkanDevice {
     bool ext_1_3_KHR_maintenance4 = false;  // #414
     // Has optional features not implied by this being true.
     bool ext_1_3_KHR_dynamic_rendering = false;  // #55
+    bool ext_EXT_device_fault = false;
   };
 
   const Extensions& extensions() const { return extensions_; }

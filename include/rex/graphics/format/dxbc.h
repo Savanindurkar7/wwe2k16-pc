@@ -24,9 +24,9 @@ namespace rex::graphics::dxbc {
 
 // Utilities for generating shader model 5_1 byte code (for Direct3D 12).
 //
-// This file contains only parts of DXBC used by Xenia currently or previously,
+// This file contains only parts of DXBC used by the runtime currently or previously,
 // not all of DXBC. If an operation, operand, blob or something else is needed
-// for Xenia, but is not here, add it (after reproducing it with FXC to see what
+// for the runtime, but is not here, add it (after reproducing it with FXC to see what
 // dependencies - such as STAT fields being modified - and encoding specifics it
 // has).
 //
@@ -42,7 +42,7 @@ namespace rex::graphics::dxbc {
 // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-// Before adding any sequence that you haven't seen in Xenia, try writing
+// Before adding any sequence that you haven't seen in the runtime, try writing
 // equivalent code in HLSL and running it through FXC, try with /Od, try with
 // full optimization, but if you see that FXC follows a different pattern than
 // what you are expecting, do what FXC does!!!
@@ -125,7 +125,7 @@ namespace rex::graphics::dxbc {
 // including the FourCC and the size), 0 pointer is considered null when
 // applicable.
 //
-// Even if DXIL emission is added to Xenia, it's still desirable to keep the
+// Even if DXIL emission is added to the runtime, it's still desirable to keep the
 // DXBC emitter as a usable option (unless supporting it becomes excessively
 // burdensome) - apart from much worse readability of the resulting DXIL code,
 // the UWP GPU driver on the Xbox One also doesn't support DXIL.

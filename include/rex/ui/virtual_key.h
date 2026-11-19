@@ -17,7 +17,7 @@ namespace ui {
 
 // Windows and Xbox 360 / XInput virtual key enumeration.
 // This is what platform-specific keys should be translated to, for both HID
-// keystroke emulation and Xenia-internal UI events. On Windows, the translation
+// keystroke emulation and the runtime-internal UI events. On Windows, the translation
 // is a simple cast.
 // This is uint16_t as it's WPARAM (which was 16-bit back in Win16 days, where
 // virtual key codes were added), and XINPUT_KEYSTROKE stores the virtual key as
@@ -239,7 +239,7 @@ enum class VirtualKey : uint16_t {
   // reserved in WinUser.h and are mostly not documented on MSDN (with the
   // exception of the Xbox Device Portal Remote Input REST API in the "UWP on
   // Xbox One" section).
-  // Xenia uses VK_PAD_* (kXInputPad*) for HID emulation internally instead
+  // the runtime uses VK_PAD_* (kXInputPad*) for HID emulation internally instead
   // because XInput is the API used for the Xbox 360 controller.
   // To avoid confusion between VK_GAMEPAD_* and VK_PAD_*, here they are
   // prefixed with kXboxOne and kXInput respectively.

@@ -21,6 +21,8 @@
 #include <rex/system/xenumerator.h>
 #include <rex/system/xtypes.h>
 
+#include <string>
+
 REXCVAR_DEFINE_UINT32(license_mask, 0, "Kernel", "Set license mask for activated content");
 
 namespace rex {
@@ -34,6 +36,7 @@ ppc_u32_result_t XamContentGetLicenseMask_entry(ppc_pu32_t mask_ptr, ppc_pvoid_t
   // seems to vary from game to game, but most appear to use bit 0 to indicate
   // if the game is purchased or not.
   *mask_ptr = REXCVAR_GET(license_mask);
+  REXKRNL_INFO("XamContentGetLicenseMask: mask={:#x}", uint32_t(*mask_ptr));
 
   if (overlapped_ptr) {
     REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(),
@@ -52,6 +55,8 @@ ppc_u32_result_t XamContentResolve_entry(ppc_u32_t user_index, ppc_pvoid_t conte
   // Result of buffer_ptr is sent to RtlInitAnsiString.
   // buffer_size is usually 260 (max path).
   // Games expect zero if resolve was successful.
+  REXKRNL_INFO("XamContentResolve: user_index={} buffer_size={} result={:#x}",
+               uint32_t(user_index), uint32_t(buffer_size), uint32_t(X_ERROR_NOT_FOUND));
   assert_always();
   REXKRNL_WARN("XamContentResolve unimplemented!");
   return X_ERROR_NOT_FOUND;
@@ -118,7 +123,8 @@ ppc_u32_result_t XamContentCreateEnumerator_entry(ppc_u32_t user_index, ppc_u32_
 
 enum class kDispositionState : uint32_t { Unknown = 0, Create = 1, Open = 2 };
 
-ppc_u32_result_t xeXamContentCreate(ppc_u32_t user_index, ppc_pchar_t root_name,
+ppc_u32_result_t xeXamContentCreate(const char* api_name, ppc_u32_t user_index,
+                                    ppc_pchar_t root_name,
                                     ppc_pvoid_t content_data_ptr, ppc_u32_t content_data_size,
                                     ppc_u32_t flags, ppc_pu32_t disposition_ptr,
                                     ppc_pu32_t license_mask_ptr, ppc_u32_t cache_size,
@@ -131,6 +137,10 @@ ppc_u32_result_t xeXamContentCreate(ppc_u32_t user_index, ppc_pchar_t root_name,
   } else if (content_data_size == sizeof(XCONTENT_AGGREGATE_DATA)) {
     content_data = *content_data_ptr.as<XCONTENT_AGGREGATE_DATA*>();
   } else {
+    const auto root = root_name ? root_name.value() : std::string_view("<null>");
+    REXKRNL_INFO("{}: root='{}' content_type=<unavailable> file_name=<unavailable> flags={:#x} "
+                 "disposition=unknown result={:#x} license=0",
+                 api_name, root, uint32_t(flags), uint32_t(X_ERROR_INVALID_PARAMETER));
     assert_always();
     return X_ERROR_INVALID_PARAMETER;
   }
@@ -145,12 +155,12 @@ ppc_u32_result_t xeXamContentCreate(ppc_u32_t user_index, ppc_pchar_t root_name,
     *disposition_ptr = 0;
   }
 
-  auto run = [content_manager, xuid, root_name = root_name.value(), flags, content_data,
-              disposition_ptr,
+  auto run = [content_manager, xuid, api_name, root_name = std::string(root_name.value()),
+              flags_value = static_cast<uint32_t>(flags), content_data, disposition_ptr,
               license_mask_ptr](uint32_t& extended_error, uint32_t& length) -> X_RESULT {
     X_RESULT result = X_ERROR_INVALID_PARAMETER;
     kDispositionState disposition = kDispositionState::Unknown;
-    switch (flags & 0xF) {
+    switch (flags_value & 0xF) {
       case 1:  // CREATE_NEW
                // Fail if exists.
         if (content_manager->ContentExists(xuid, content_data)) {
@@ -206,7 +216,7 @@ ppc_u32_result_t xeXamContentCreate(ppc_u32_t user_index, ppc_pchar_t root_name,
         }
         break;
       default:
-        assert_unhandled_case(flags & 0xF);
+        assert_unhandled_case(flags_value & 0xF);
         break;
     }
 
@@ -214,7 +224,12 @@ ppc_u32_result_t xeXamContentCreate(ppc_u32_t user_index, ppc_pchar_t root_name,
     if (disposition == kDispositionState::Create) {
       result = content_manager->CreateContent(root_name, xuid, content_data);
       if (XSUCCEEDED(result)) {
-        content_manager->WriteContentHeaderFile(xuid, content_data);
+        // The package itself exists and is open, so keep reporting success; a missing header only hides the
+        // content from enumeration until it is written again. Log it instead of failing silently.
+        const X_RESULT header_result = content_manager->WriteContentHeaderFile(xuid, content_data);
+        if (XFAILED(header_result)) {
+          REXKRNL_WARN("XamContentCreate: content header could not be written ({:08X})", header_result);
+        }
       }
     } else if (disposition == kDispositionState::Open) {
       result = content_manager->OpenContent(root_name, xuid, content_data, content_license);
@@ -227,6 +242,13 @@ ppc_u32_result_t xeXamContentCreate(ppc_u32_t user_index, ppc_pchar_t root_name,
     if (disposition_ptr) {
       *disposition_ptr = static_cast<uint32_t>(disposition);
     }
+
+    REXKRNL_INFO("{}: root='{}' content_type={:#x} file_name='{}' flags={:#x} disposition={} "
+                 "result={:#x} license={:#x}",
+                 api_name, root_name, uint32_t(content_data.content_type.get()),
+                 content_data.file_name(),
+                 flags_value, static_cast<uint32_t>(disposition), uint32_t(result),
+                 content_license);
 
     extended_error = X_HRESULT_FROM_WIN32(result);
     length = static_cast<uint32_t>(disposition);
@@ -247,17 +269,18 @@ ppc_u32_result_t XamContentCreateEx_entry(ppc_u32_t user_index, ppc_pchar_t root
                                           ppc_pu32_t disposition_ptr, ppc_pu32_t license_mask_ptr,
                                           ppc_u32_t cache_size, ppc_u64_t content_size,
                                           ppc_pvoid_t overlapped_ptr) {
-  return xeXamContentCreate(user_index, root_name, content_data_ptr, sizeof(XCONTENT_DATA), flags,
-                            disposition_ptr, license_mask_ptr, cache_size, content_size,
-                            overlapped_ptr);
+  return xeXamContentCreate("XamContentCreateEx", user_index, root_name, content_data_ptr,
+                            sizeof(XCONTENT_DATA), flags, disposition_ptr, license_mask_ptr,
+                            cache_size, content_size, overlapped_ptr);
 }
 
 ppc_u32_result_t XamContentCreate_entry(ppc_u32_t user_index, ppc_pchar_t root_name,
                                         ppc_pvoid_t content_data_ptr, ppc_u32_t flags,
                                         ppc_pu32_t disposition_ptr, ppc_pu32_t license_mask_ptr,
                                         ppc_pvoid_t overlapped_ptr) {
-  return xeXamContentCreate(user_index, root_name, content_data_ptr, sizeof(XCONTENT_DATA), flags,
-                            disposition_ptr, license_mask_ptr, 0, 0, overlapped_ptr);
+  return xeXamContentCreate("XamContentCreate", user_index, root_name, content_data_ptr,
+                            sizeof(XCONTENT_DATA), flags, disposition_ptr, license_mask_ptr, 0, 0,
+                            overlapped_ptr);
 }
 
 ppc_u32_result_t XamContentCreateInternal_entry(ppc_pchar_t root_name, ppc_pvoid_t content_data_ptr,
@@ -265,9 +288,9 @@ ppc_u32_result_t XamContentCreateInternal_entry(ppc_pchar_t root_name, ppc_pvoid
                                                 ppc_pu32_t license_mask_ptr, ppc_u32_t cache_size,
                                                 ppc_u64_t content_size,
                                                 ppc_pvoid_t overlapped_ptr) {
-  return xeXamContentCreate(0xFE, root_name, content_data_ptr, sizeof(XCONTENT_AGGREGATE_DATA),
-                            flags, disposition_ptr, license_mask_ptr, cache_size, content_size,
-                            overlapped_ptr);
+  return xeXamContentCreate("XamContentCreateInternal", 0xFE, root_name, content_data_ptr,
+                            sizeof(XCONTENT_AGGREGATE_DATA), flags, disposition_ptr,
+                            license_mask_ptr, cache_size, content_size, overlapped_ptr);
 }
 
 ppc_u32_result_t XamContentOpenFile_entry(ppc_u32_t user_index, ppc_pchar_t root_name,
@@ -275,11 +298,17 @@ ppc_u32_result_t XamContentOpenFile_entry(ppc_u32_t user_index, ppc_pchar_t root
                                           ppc_pu32_t disposition_ptr, ppc_pu32_t license_mask_ptr,
                                           ppc_pvoid_t overlapped_ptr) {
   // TODO(gibbed): arguments assumed based on XamContentCreate.
+  const auto root = root_name ? root_name.value() : std::string_view("<null>");
+  const auto file_path = path ? path.value() : std::string_view("<null>");
+  REXKRNL_INFO("XamContentOpenFile: root='{}' path='{}' flags={:#x} result={:#x}",
+               root, file_path, uint32_t(flags), uint32_t(X_ERROR_FILE_NOT_FOUND));
   return X_ERROR_FILE_NOT_FOUND;
 }
 
 ppc_u32_result_t XamContentFlush_entry(ppc_pchar_t root_name, ppc_pvoid_t overlapped_ptr) {
   X_RESULT result = X_ERROR_SUCCESS;
+  const auto root = root_name ? root_name.value() : std::string_view("<null>");
+  REXKRNL_INFO("XamContentFlush: root='{}' result={:#x}", root, static_cast<uint32_t>(result));
   if (overlapped_ptr) {
     REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(), result);
     return X_ERROR_IO_PENDING;
@@ -291,6 +320,8 @@ ppc_u32_result_t XamContentFlush_entry(ppc_pchar_t root_name, ppc_pvoid_t overla
 ppc_u32_result_t XamContentClose_entry(ppc_pchar_t root_name, ppc_pvoid_t overlapped_ptr) {
   // Closes a previously opened root from XamContentCreate*.
   auto result = REX_KERNEL_STATE()->content_manager()->CloseContent(root_name.value());
+  REXKRNL_INFO("XamContentClose: root='{}' result={:#x}", root_name.value(),
+               static_cast<uint32_t>(result));
 
   if (overlapped_ptr) {
     REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(), result);
@@ -326,6 +357,8 @@ ppc_u32_result_t XamContentGetCreator_entry(ppc_u32_t user_index, ppc_pvoid_t co
   } else {
     result = X_ERROR_PATH_NOT_FOUND;
   }
+
+  REXKRNL_INFO("XamContentGetCreator: result={:#x}", static_cast<uint32_t>(result));
 
   if (overlapped_ptr) {
     REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(), result);
@@ -442,38 +475,58 @@ XAM_EXPORT(__imp__XamContentSetThumbnail, rex::kernel::xam::XamContentSetThumbna
 XAM_EXPORT(__imp__XamContentDelete, rex::kernel::xam::XamContentDelete_entry)
 XAM_EXPORT(__imp__XamContentDeleteInternal, rex::kernel::xam::XamContentDeleteInternal_entry)
 
-XAM_EXPORT_STUB(__imp__XamContentClosePackageFile);
-XAM_EXPORT_STUB(__imp__XamContentCopyInternal);
-XAM_EXPORT_STUB(__imp__XamContentCreateAndMountPackage);
-XAM_EXPORT_STUB(__imp__XamContentCreateEnumeratorInternal);
-XAM_EXPORT_STUB(__imp__XamContentDismountAndClosePackage);
-XAM_EXPORT_STUB(__imp__XamContentDuplicateFileHandle);
-XAM_EXPORT_STUB(__imp__XamContentExistsOnDeviceInternal);
-XAM_EXPORT_STUB(__imp__XamContentFlushPackage);
-XAM_EXPORT_STUB(__imp__XamContentGetAttributes);
-XAM_EXPORT_STUB(__imp__XamContentGetAttributesInternal);
-XAM_EXPORT_STUB(__imp__XamContentGetHeaderInternal);
-XAM_EXPORT_STUB(__imp__XamContentGetLocalizedString);
-XAM_EXPORT_STUB(__imp__XamContentGetMetaDataInternal);
-XAM_EXPORT_STUB(__imp__XamContentGetMountedPackageByRootName);
-XAM_EXPORT_STUB(__imp__XamContentGetOnlineCreator);
-XAM_EXPORT_STUB(__imp__XamContentInstall);
-XAM_EXPORT_STUB(__imp__XamContentInstallInternal);
-XAM_EXPORT_STUB(__imp__XamContentIsGameInstalledToHDD);
-XAM_EXPORT_STUB(__imp__XamContentLaunchImage);
-XAM_EXPORT_STUB(__imp__XamContentLaunchImageFromFileInternal);
-XAM_EXPORT_STUB(__imp__XamContentLaunchImageInternal);
-XAM_EXPORT_STUB(__imp__XamContentLaunchImageInternalEx);
-XAM_EXPORT_STUB(__imp__XamContentLockUnlockPackageHeaders);
-XAM_EXPORT_STUB(__imp__XamContentMountInstalledGame);
-XAM_EXPORT_STUB(__imp__XamContentMountPackage);
-XAM_EXPORT_STUB(__imp__XamContentMoveInternal);
-XAM_EXPORT_STUB(__imp__XamContentOpenFileInternal);
-XAM_EXPORT_STUB(__imp__XamContentOpenPackageFile);
-XAM_EXPORT_STUB(__imp__XamContentQueryLicenseInternal);
-XAM_EXPORT_STUB(__imp__XamContentRegisterChangeCallback);
-XAM_EXPORT_STUB(__imp__XamContentResolveInternal);
-XAM_EXPORT_STUB(__imp__XamContentSetAttributes);
-XAM_EXPORT_STUB(__imp__XamContentSetMediaMetaDataInternal);
-XAM_EXPORT_STUB(__imp__XamContentSetThumbnailInternal);
-XAM_EXPORT_STUB(__imp__XamContentWritePackageHeader);
+#define XAM_CONTENT_EXPORT_STUB(name, export_name)                                \
+  extern "C" PPC_WEAK_FUNC(name) {                                                \
+    (void)base;                                                                   \
+    REXKRNL_INFO("{} called", export_name);                                      \
+    REXKRNL_WARN("{} STUB", #name);                                              \
+  }                                                                               \
+  static rex::detail::PPCFuncRegistrar _ppc_reg_##name(#name, &name);
+
+XAM_CONTENT_EXPORT_STUB(__imp__XamContentClosePackageFile, "XamContentClosePackageFile")
+XAM_CONTENT_EXPORT_STUB(__imp__XamContentCopyInternal, "XamContentCopyInternal")
+XAM_CONTENT_EXPORT_STUB(__imp__XamContentCreateAndMountPackage, "XamContentCreateAndMountPackage")
+XAM_CONTENT_EXPORT_STUB(__imp__XamContentCreateEnumeratorInternal,
+                        "XamContentCreateEnumeratorInternal")
+XAM_CONTENT_EXPORT_STUB(__imp__XamContentDismountAndClosePackage,
+                        "XamContentDismountAndClosePackage")
+XAM_CONTENT_EXPORT_STUB(__imp__XamContentDuplicateFileHandle, "XamContentDuplicateFileHandle")
+XAM_CONTENT_EXPORT_STUB(__imp__XamContentExistsOnDeviceInternal,
+                        "XamContentExistsOnDeviceInternal")
+XAM_CONTENT_EXPORT_STUB(__imp__XamContentFlushPackage, "XamContentFlushPackage")
+XAM_CONTENT_EXPORT_STUB(__imp__XamContentGetAttributes, "XamContentGetAttributes")
+XAM_CONTENT_EXPORT_STUB(__imp__XamContentGetAttributesInternal,
+                        "XamContentGetAttributesInternal")
+XAM_CONTENT_EXPORT_STUB(__imp__XamContentGetHeaderInternal, "XamContentGetHeaderInternal")
+XAM_CONTENT_EXPORT_STUB(__imp__XamContentGetLocalizedString, "XamContentGetLocalizedString")
+XAM_CONTENT_EXPORT_STUB(__imp__XamContentGetMetaDataInternal, "XamContentGetMetaDataInternal")
+XAM_CONTENT_EXPORT_STUB(__imp__XamContentGetMountedPackageByRootName,
+                        "XamContentGetMountedPackageByRootName")
+XAM_CONTENT_EXPORT_STUB(__imp__XamContentGetOnlineCreator, "XamContentGetOnlineCreator")
+XAM_CONTENT_EXPORT_STUB(__imp__XamContentInstall, "XamContentInstall")
+XAM_CONTENT_EXPORT_STUB(__imp__XamContentInstallInternal, "XamContentInstallInternal")
+XAM_CONTENT_EXPORT_STUB(__imp__XamContentIsGameInstalledToHDD, "XamContentIsGameInstalledToHDD")
+XAM_CONTENT_EXPORT_STUB(__imp__XamContentLaunchImage, "XamContentLaunchImage")
+XAM_CONTENT_EXPORT_STUB(__imp__XamContentLaunchImageFromFileInternal,
+                        "XamContentLaunchImageFromFileInternal")
+XAM_CONTENT_EXPORT_STUB(__imp__XamContentLaunchImageInternal, "XamContentLaunchImageInternal")
+XAM_CONTENT_EXPORT_STUB(__imp__XamContentLaunchImageInternalEx,
+                        "XamContentLaunchImageInternalEx")
+XAM_CONTENT_EXPORT_STUB(__imp__XamContentLockUnlockPackageHeaders,
+                        "XamContentLockUnlockPackageHeaders")
+XAM_CONTENT_EXPORT_STUB(__imp__XamContentMountInstalledGame, "XamContentMountInstalledGame")
+XAM_CONTENT_EXPORT_STUB(__imp__XamContentMountPackage, "XamContentMountPackage")
+XAM_CONTENT_EXPORT_STUB(__imp__XamContentMoveInternal, "XamContentMoveInternal")
+XAM_CONTENT_EXPORT_STUB(__imp__XamContentOpenFileInternal, "XamContentOpenFileInternal")
+XAM_CONTENT_EXPORT_STUB(__imp__XamContentOpenPackageFile, "XamContentOpenPackageFile")
+XAM_CONTENT_EXPORT_STUB(__imp__XamContentQueryLicenseInternal, "XamContentQueryLicenseInternal")
+XAM_CONTENT_EXPORT_STUB(__imp__XamContentRegisterChangeCallback,
+                        "XamContentRegisterChangeCallback")
+XAM_CONTENT_EXPORT_STUB(__imp__XamContentResolveInternal, "XamContentResolveInternal")
+XAM_CONTENT_EXPORT_STUB(__imp__XamContentSetAttributes, "XamContentSetAttributes")
+XAM_CONTENT_EXPORT_STUB(__imp__XamContentSetMediaMetaDataInternal,
+                        "XamContentSetMediaMetaDataInternal")
+XAM_CONTENT_EXPORT_STUB(__imp__XamContentSetThumbnailInternal, "XamContentSetThumbnailInternal")
+XAM_CONTENT_EXPORT_STUB(__imp__XamContentWritePackageHeader, "XamContentWritePackageHeader")
+
+#undef XAM_CONTENT_EXPORT_STUB

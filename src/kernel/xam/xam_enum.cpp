@@ -11,6 +11,7 @@
 
 #include <rex/kernel/xam/module.h>
 #include <rex/kernel/xam/private.h>
+#include <rex/kernel/xam/apps/xmp_app.h>
 #include <rex/logging.h>
 #include <rex/ppc/function.h>
 #include <rex/ppc/types.h>
@@ -18,6 +19,8 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/xenumerator.h>
 #include <rex/system/xtypes.h>
+
+#include <atomic>
 
 #if REX_PLATFORM_WIN32
 #include <rex/platform.h>
@@ -84,11 +87,42 @@ ppc_u32_result_t XamEnumerate_entry(ppc_u32_t handle, ppc_u32_t flags, ppc_pvoid
   return result;
 }
 
-ppc_u32_result_t XamCreateEnumeratorHandle_entry(ppc_unknown_t unk1, ppc_unknown_t unk2,
-                                                 ppc_unknown_t unk3, ppc_unknown_t unk4,
-                                                 ppc_unknown_t unk5, ppc_unknown_t unk6,
-                                                 ppc_unknown_t unk7, ppc_unknown_t unk8) {
-  return X_ERROR_INVALID_PARAMETER;
+ppc_u32_result_t XamCreateEnumeratorHandle_entry(ppc_u32_t user_index, ppc_u32_t app_id,
+                                                 ppc_u32_t open_message,
+                                                 ppc_u32_t close_message,
+                                                 ppc_u32_t extra_size,
+                                                 ppc_u32_t items_per_enumerate,
+                                                 ppc_u32_t flags, ppc_pu32_t out_handle_ptr) {
+  if (uint32_t(app_id) != 0xFA) {
+    static std::atomic_flag warned = ATOMIC_FLAG_INIT;
+    if (!warned.test_and_set(std::memory_order_relaxed)) {
+      REXKRNL_WARN("XamCreateEnumeratorHandle: unsupported app id {:#x}", uint32_t(app_id));
+    }
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  if (!out_handle_ptr) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+
+  auto* app = static_cast<apps::XmpApp*>(REX_KERNEL_STATE()->app_manager()->GetApp(0xFA));
+  if (!app) {
+    REXKRNL_WARN("XamCreateEnumeratorHandle: XMP app is not registered");
+    return X_ERROR_INVALID_PARAMETER;
+  }
+
+  auto enumerator = make_object<XStaticUntypedEnumerator>(
+      REX_KERNEL_STATE(), uint32_t(items_per_enumerate), 820);
+  void* extra = nullptr;
+  const auto initialize_result = enumerator->Initialize(
+      uint32_t(user_index), uint32_t(app_id), uint32_t(open_message), uint32_t(close_message),
+      uint32_t(flags), uint32_t(extra_size), &extra);
+  if (XFAILED(initialize_result)) {
+    return initialize_result;
+  }
+
+  app->AppendCustomMusicItems(enumerator.get());
+  *out_handle_ptr = enumerator->handle();
+  return X_ERROR_SUCCESS;
 }
 
 ppc_u32_result_t XamGetPrivateEnumStructureFromHandle_entry(ppc_u32_t handle,

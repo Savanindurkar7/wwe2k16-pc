@@ -384,6 +384,27 @@ ppc_u32_result_t RtlInitializeCriticalSectionAndSpinCount_entry(
 }
 
 void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
+  // Cycle-16 H1 guard: a null critical section is a guest-supplied null.
+  // Guest address 0 maps to a host nullptr through ArgTranslator
+  // (include/rex/ppc/function.h:326-328 = ../tools/rexglue/include/rex/ppc/
+  // function.h), so without this guard the host dereferences null+0x18
+  // (X_RTL_CRITICAL_SECTION::owning_thread, line 343) and faults with
+  // SEGV_MAPERR si_addr=0x18; the real hardware would read mapped physical
+  // 0x10..0x1C and continue. Evidence: cycle-16 m11 capture
+  // (logs/cycle16-m11-attribution.txt), guest thid 10 (host tid 578675),
+  // RIP offset 0x4554d3 `movbe 0x18(%rbx),%eax` with rbx=0, ctx.r3=0,
+  // ctx.lr=0x82b20dfc (generated/wwe2k16_recomp.74.cpp:37049 calls
+  // RtlEnterCriticalSection with r3=0). Leave shares the same null source;
+  // only Enter is guarded this cycle (see docs/CRASH_LOG.md cycle 16).
+  if (!cs) {
+    static volatile uint32_t null_cs_count = 0;
+    uint32_t n = rex::thread::atomic_inc(&null_cs_count);
+    if (n <= 32) {
+      REXKRNL_IMPORT_TRACE("RtlEnterCriticalSection",
+                           "null cs (guest address 0), ignoring (count={})", n);
+    }
+    return;
+  }
   uint32_t cur_thread = XThread::GetCurrentThread()->guest_object();
   uint32_t spin_count = cs->header.absolute * 256;
 
@@ -434,6 +455,28 @@ ppc_u32_result_t RtlTryEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTI
 }
 
 void RtlLeaveCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
+  // Cycle-17 H2 guard: a null critical section is a guest-supplied null.
+  // Guest address 0 maps to a host nullptr through ArgTranslator
+  // (include/rex/ppc/function.h:326-328 = ../tools/rexglue/include/rex/ppc/
+  // function.h), so without this guard the host dereferences null+0x14
+  // (X_RTL_CRITICAL_SECTION::recursion_count, line 342) and faults with
+  // SEGV_MAPERR si_addr=0x14; the real hardware would read mapped physical
+  // 0x10..0x1C and continue. Evidence: cycle-17 m11 capture
+  // (logs/cycle17-m11-attribution.txt), guest thid 10 (host tid 591272),
+  // RIP offset 0x527bb35 `movbe 0x14(%rsi),%eax` with rsi=0 -- the Leave body
+  // is inlined into its HostToGuestFunction trampoline, so the faulting ELF
+  // symbol is that trampoline rather than the out-of-line body at 0x4556f0 --
+  // ctx.r3=0, ctx.lr=0x82b20e1c (generated/wwe2k16_recomp.74.cpp:37064 calls
+  // RtlLeaveCriticalSection with r3=0). Enter's cycle-16 guard is unchanged.
+  if (!cs) {
+    static volatile uint32_t null_cs_count = 0;
+    uint32_t n = rex::thread::atomic_inc(&null_cs_count);
+    if (n <= 32) {
+      REXKRNL_IMPORT_TRACE("RtlLeaveCriticalSection",
+                           "null cs (guest address 0), ignoring (count={})", n);
+    }
+    return;
+  }
   assert_true(cs->owning_thread == XThread::GetCurrentThread()->guest_object());
 
   // Drop recursion count - if it isn't zero we still have the lock.

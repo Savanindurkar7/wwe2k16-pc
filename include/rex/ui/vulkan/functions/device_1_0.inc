@@ -1,4 +1,4 @@
-// Vulkan 1.0 core device functions used in Xenia.
+// Vulkan 1.0 core device functions used in the runtime.
 XE_UI_VULKAN_FUNCTION(vkAllocateCommandBuffers)
 XE_UI_VULKAN_FUNCTION(vkAllocateDescriptorSets)
 XE_UI_VULKAN_FUNCTION(vkAllocateMemory)

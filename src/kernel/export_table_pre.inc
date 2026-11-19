@@ -14,7 +14,7 @@
  * // Build the export table used for resolution.
  * #include "rex/kernel/util/export_table_pre.inc"
  * static Export my_module_export_table[] = {
- *   #include "xenia/kernel/my_module/my_module_table.inc"
+ *   #include "rex/kernel/my_module/my_module_table.inc"
  * };
  * #include "rex/kernel/util/export_table_post.inc"
  * export_resolver_->RegisterTable(

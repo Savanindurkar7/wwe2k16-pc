@@ -15,6 +15,8 @@
 #include <utility>
 
 #include <rex/assert.h>
+#include <rex/chrono/clock.h>
+#include <rex/filesystem.h>
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
@@ -284,6 +286,14 @@ namespace ui {
 void Presenter::FatalErrorHostGpuLossCallback([[maybe_unused]] bool is_responsible,
                                               [[maybe_unused]] bool statically_from_ui_thread) {
   rex::FatalError("Graphics device lost (probably due to an internal error)");
+}
+
+void Presenter::ReportHostGpuFailure() {
+  if (host_gpu_loss_callback_) {
+    host_gpu_loss_callback_(true, false);
+  } else {
+    FatalErrorHostGpuLossCallback(true, false);
+  }
 }
 
 Presenter::~Presenter() {
@@ -844,6 +854,10 @@ std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(
         (old_acquired_and_ready & ~uint32_t(3)) | (old_acquired_and_ready >> 2);
   }
   uint32_t mailbox_index = desired_acquired_and_ready & 3;
+  if ((old_acquired_and_ready & 3) != mailbox_index) {
+    // A guest frame newer than the one consumed last time (display pacing statistics).
+    guest_frames_consumed_.fetch_add(1, std::memory_order_relaxed);
+  }
   // Give the current acquired image to the caller, or UINT32_MAX if it's
   // inactive.
   const GuestOutputProperties& properties = guest_output_properties_[mailbox_index];
@@ -1502,6 +1516,25 @@ Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers) {
   assert_false(execute_ui_drawers && !is_in_ui_thread_paint_);
   assert_true(surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable);
   PaintResult result = PaintAndPresentImpl(execute_ui_drawers);
+  // Frames actually presented to the display per second, logged when below 58 (what an FPS overlay shows; the
+  // guest's own flip count can be 60 while frames are dropped or doubled here).
+  {
+    static uint64_t window_start_ms = 0;
+    static uint32_t presents = 0;
+    const uint64_t now_ms = rex::chrono::Clock::QueryHostUptimeMillis();
+    if (result == PaintResult::kPresented || result == PaintResult::kPresentedSuboptimal) {
+      ++presents;
+    }
+    if (!window_start_ms) {
+      window_start_ms = now_ms;
+    } else if (now_ms - window_start_ms >= 1000) {
+      if (presents < 58) {
+        REXLOG_INFO("[presenter] {} frames presented in the last second", presents);
+      }
+      presents = 0;
+      window_start_ms = now_ms;
+    }
+  }
   switch (result) {
     case PaintResult::kPresented:
       surface_paint_connection_was_optimal_at_successful_paint_ = true;
@@ -1606,6 +1639,72 @@ void Presenter::WaitForUITickFromUIThread() {
     }
     dxgi_ui_tick_signal_condition_.wait(dxgi_ui_tick_lock);
   }
+#endif  // XE_PLATFORM
+}
+
+#if REX_PLATFORM_WIN32
+Microsoft::WRL::ComPtr<IDXGIOutput> Presenter::HostVsyncOutput() {
+  {
+    std::scoped_lock<std::mutex> dxgi_ui_tick_lock(dxgi_ui_tick_mutex_);
+    if (dxgi_ui_tick_output_) {
+      return dxgi_ui_tick_output_;
+    }
+  }
+  std::scoped_lock<std::mutex> lock(host_vsync_mutex_);
+  const uint64_t now_ms = GetTickCount64();
+  if (host_vsync_output_ && now_ms < host_vsync_output_expiry_ms_) {
+    return host_vsync_output_;
+  }
+  host_vsync_output_expiry_ms_ = now_ms + 2000;
+  const Window* window = window_;
+  HWND hwnd = window ? static_cast<const Win32Window*>(window)->hwnd() : nullptr;
+  if (!hwnd) {
+    return host_vsync_output_;
+  }
+  HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+  if (!host_vsync_factory_ || !host_vsync_factory_->IsCurrent()) {
+    host_vsync_factory_.Reset();
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&host_vsync_factory_)))) {
+      return host_vsync_output_;
+    }
+  }
+  auto output = GetDXGIOutputForMonitor(host_vsync_factory_.Get(), monitor);
+  if (output && output != host_vsync_output_) {
+    DXGI_OUTPUT_DESC desc;
+    if (SUCCEEDED(output->GetDesc(&desc))) {
+      REXLOG_INFO("Presenter: host vsync on display output {}", rex::path_to_utf8(desc.DeviceName));
+    }
+  }
+  host_vsync_output_ = output;
+  return host_vsync_output_;
+}
+#endif  // REX_PLATFORM_WIN32
+
+bool Presenter::WaitForHostDisplayVBlank() {
+#if REX_PLATFORM_WIN32
+  Microsoft::WRL::ComPtr<IDXGIOutput> output = HostVsyncOutput();
+  return output && SUCCEEDED(output->WaitForVBlank());
+#else
+  return false;
+#endif  // XE_PLATFORM
+}
+
+uint32_t Presenter::GetHostDisplayRefreshHz() {
+#if REX_PLATFORM_WIN32
+  Microsoft::WRL::ComPtr<IDXGIOutput> output = HostVsyncOutput();
+  DXGI_OUTPUT_DESC output_desc;
+  if (!output || FAILED(output->GetDesc(&output_desc))) {
+    return 0;
+  }
+  DEVMODEW mode = {};
+  mode.dmSize = sizeof(mode);
+  if (!EnumDisplaySettingsW(output_desc.DeviceName, ENUM_CURRENT_SETTINGS, &mode) ||
+      !(mode.dmFields & DM_DISPLAYFREQUENCY)) {
+    return 0;
+  }
+  return mode.dmDisplayFrequency;
+#else
+  return 0;
 #endif  // XE_PLATFORM
 }
 

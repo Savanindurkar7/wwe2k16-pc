@@ -9,8 +9,13 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
+#include <cstring>
 #include <memory>
 
+#include "snappy.h"
+
+#include <rex/assert.h>
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/graphics_system.h>
 #include <rex/graphics/registers.h>
@@ -76,6 +81,13 @@ void TracePlayer::SeekCommand(int target_command) {
     PlayTrace(frame->start_ptr, command.end_ptr - frame->start_ptr, TracePlaybackMode::kBreakOnSwap,
               true);
   }
+}
+
+void TracePlayer::ReplayCurrentFrame() {
+  auto frame = current_frame();
+  current_command_index_ = int(frame->commands.size()) - 1;
+  PlayTrace(frame->start_ptr, frame->end_ptr - frame->start_ptr, TracePlaybackMode::kBreakOnSwap,
+            false);
 }
 
 void TracePlayer::WaitOnPlayback() {
@@ -176,9 +188,22 @@ void TracePlayer::PlayTraceOnThread(const uint8_t* trace_data, size_t trace_size
       case TraceCommandType::kEdramSnapshot: {
         auto cmd = reinterpret_cast<const EdramSnapshotCommand*>(trace_ptr);
         trace_ptr += sizeof(*cmd);
-        std::unique_ptr<uint8_t[]> edram_snapshot(new uint8_t[xenos::kEdramSizeBytes]);
-        DecompressMemory(cmd->encoding_format, trace_ptr, cmd->encoded_length, edram_snapshot.get(),
-                         xenos::kEdramSizeBytes);
+        size_t snapshot_size = cmd->encoded_length;
+        if (cmd->encoding_format == MemoryEncodingFormat::kSnappy) {
+          assert_true(snappy::GetUncompressedLength(reinterpret_cast<const char*>(trace_ptr),
+                                                    cmd->encoded_length, &snapshot_size));
+        } else {
+          assert_true(cmd->encoding_format == MemoryEncodingFormat::kNone);
+        }
+        assert_true(snapshot_size == xenos::kEdramDefaultSizeBytes ||
+                    snapshot_size == xenos::kEdramMaxSizeBytes);
+        std::unique_ptr<uint8_t[]> captured_snapshot(new uint8_t[snapshot_size]);
+        assert_true(DecompressMemory(cmd->encoding_format, trace_ptr, cmd->encoded_length,
+                                     captured_snapshot.get(), snapshot_size));
+        const size_t runtime_snapshot_size = xenos::GetEdramSizeBytes();
+        std::unique_ptr<uint8_t[]> edram_snapshot(new uint8_t[runtime_snapshot_size]());
+        std::memcpy(edram_snapshot.get(), captured_snapshot.get(),
+                    std::min(snapshot_size, runtime_snapshot_size));
         trace_ptr += cmd->encoded_length;
         command_processor->RestoreEdramSnapshot(edram_snapshot.get());
         break;

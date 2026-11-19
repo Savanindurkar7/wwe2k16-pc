@@ -32,10 +32,13 @@ void DeferredCommandBuffer::Reset() {
   command_stream_.clear();
 }
 
-void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
+void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer, uint64_t frame,
+                                   uint64_t submission) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+
+  command_processor_.GpuTimingBeginRecording(command_buffer, frame, submission);
 
   const ui::vulkan::VulkanDevice::Functions& dfn =
       command_processor_.GetVulkanDevice()->functions();
@@ -314,6 +317,11 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
                                  rex::align(sizeof(ArgsVkSetViewport), alignof(VkViewport))));
       } break;
 
+      case Command::kGpuTimingCategory: {
+        auto& args = *reinterpret_cast<const ArgsGpuTimingCategory*>(stream);
+        command_processor_.GpuTimingChangeCategory(command_buffer, args.category);
+      } break;
+
       default:
         assert_unhandled_case(header.command);
         break;
@@ -322,6 +330,7 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
     stream += header.arguments_size_elements;
     stream_remaining -= header.arguments_size_elements;
   }
+  command_processor_.GpuTimingEndRecording(command_buffer);
 }
 
 void DeferredCommandBuffer::CmdVkPipelineBarrier(

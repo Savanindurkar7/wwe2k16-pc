@@ -28,29 +28,36 @@ std::vector<VTableInfo> VTableScanner::scan() {
   auto cols = findCompleteObjectLocators();
   REXCODEGEN_DEBUG("VTableScanner: found {} Complete Object Locators", cols.size());
 
-  // Step 2: For each COL, find its vtable and read slots
+  // Step 2: For each COL, find EVERY referencing vtable and read its slots
   for (uint32_t colAddr : cols) {
-    auto vtableAddr = findVTableForCOL(colAddr);
-    if (!vtableAddr) {
+    auto vtableAddrs = findVTablesForCOL(colAddr);
+    if (vtableAddrs.empty()) {
       REXCODEGEN_TRACE("VTableScanner: COL at 0x{:08X} has no referencing vtable", colAddr);
       continue;
     }
 
-    VTableInfo info;
-    info.vtableAddress = *vtableAddr;
-    info.colAddress = colAddr;
-    info.className = extractClassName(colAddr);
-    info.slots = readVTableSlots(*vtableAddr);
-
-    if (info.slots.empty()) {
-      REXCODEGEN_TRACE("VTableScanner: vtable at 0x{:08X} has no valid slots", *vtableAddr);
-      continue;
+    if (vtableAddrs.size() > 1) {
+      REXCODEGEN_DEBUG("VTableScanner: COL at 0x{:08X} is referenced by {} vtables", colAddr,
+                       vtableAddrs.size());
     }
 
-    REXCODEGEN_DEBUG("VTableScanner: vtable at 0x{:08X} ({}) has {} slots", info.vtableAddress,
-                     info.className, info.slots.size());
+    for (uint32_t vtableAddr : vtableAddrs) {
+      VTableInfo info;
+      info.vtableAddress = vtableAddr;
+      info.colAddress = colAddr;
+      info.className = extractClassName(colAddr);
+      info.slots = readVTableSlots(vtableAddr);
 
-    vtables.push_back(std::move(info));
+      if (info.slots.empty()) {
+        REXCODEGEN_TRACE("VTableScanner: vtable at 0x{:08X} has no valid slots", vtableAddr);
+        continue;
+      }
+
+      REXCODEGEN_DEBUG("VTableScanner: vtable at 0x{:08X} ({}) has {} slots", info.vtableAddress,
+                       info.className, info.slots.size());
+
+      vtables.push_back(std::move(info));
+    }
   }
 
   return vtables;
@@ -108,14 +115,15 @@ std::vector<uint32_t> VTableScanner::findCompleteObjectLocators() {
   return cols;
 }
 
-std::optional<uint32_t> VTableScanner::findVTableForCOL(uint32_t colAddr) {
-  // The vtable pointer to COL is stored at vtable[-1]
-  // So we need to find a dword in .rdata that contains colAddr,
-  // and the vtable starts at that address + 4
+std::vector<uint32_t> VTableScanner::findVTablesForCOL(uint32_t colAddr) {
+  // The pointer to the COL is stored at vtable[-1], so every dword in .rdata
+  // equal to colAddr marks a vtable starting 4 bytes later. Collect ALL of
+  // them; see the header for why stopping at the first is wrong.
+  std::vector<uint32_t> found;
 
   const auto* rdata = binary_.findSectionByName(".rdata");
   if (!rdata || !rdata->data) {
-    return std::nullopt;
+    return found;
   }
 
   const uint8_t* data = rdata->data;
@@ -126,13 +134,12 @@ std::optional<uint32_t> VTableScanner::findVTableForCOL(uint32_t colAddr) {
     uint32_t value = load_and_swap<uint32_t>(data + offset);
 
     if (value == colAddr) {
-      // Found reference to COL - vtable starts at next dword
-      uint32_t vtableAddr = base + static_cast<uint32_t>(offset) + 4;
-      return vtableAddr;
+      // Found a reference to the COL - that vtable starts at the next dword
+      found.push_back(base + static_cast<uint32_t>(offset) + 4);
     }
   }
 
-  return std::nullopt;
+  return found;
 }
 
 std::vector<uint32_t> VTableScanner::readVTableSlots(uint32_t vtableStart) {

@@ -22,6 +22,8 @@
 
 namespace std::chrono {
 
+#if !defined(__ANDROID__)
+
 // This conveniently works only for Host time domain because Guest needs
 // additional scaling. Convert XSystemClock to WinSystemClock first if
 // necessary.
@@ -69,5 +71,7 @@ struct clock_time_conversion<std::chrono::steady_clock, ::rex::chrono::WinSystem
     return steady_now + delta;
   }
 };
+
+#endif  // !__ANDROID__
 
 }  // namespace std::chrono

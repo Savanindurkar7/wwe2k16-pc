@@ -254,10 +254,12 @@ bool build_vaddsws(BuilderContext& ctx) {
   ctx.println(
       "\t\tsimde__m128i sat_val = simde_mm_xor_si128(simde_mm_srai_epi32(a, 31), "
       "simde_mm_set1_epi32(0x7FFFFFFF));");
-  // Blend: select sat_val where overflow MSB is set, else sum
+  // Blend: select sat_val where the word's overflow MSB is set, else sum. blendv_epi8 selects per
+  // byte on each byte's MSB, so spread bit 31 across the word first; blending on the raw overflow
+  // word replaced any byte whose own bit 7 happened to be set (e.g. 0x158 + 0x160 -> 0x2FF).
   ctx.println(
       "\t\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_blendv_epi8(sum, sat_val, "
-      "overflow));",
+      "simde_mm_srai_epi32(overflow, 31)));",
       vD);
   ctx.println("\t}}");
   return true;

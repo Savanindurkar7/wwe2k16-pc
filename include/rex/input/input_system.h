@@ -10,11 +10,13 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
 #include <memory>
 #include <vector>
 
 #include <rex/input/input.h>
 #include <rex/input/input_driver.h>
+#include <rex/input/text_entry.h>
 #include <rex/system/interfaces/input.h>
 
 namespace rex::ui {
@@ -36,6 +38,10 @@ class InputSystem : public system::IInputSystem {
   void AddDriver(std::unique_ptr<InputDriver> driver);
   void AttachWindow(rex::ui::Window* window);
   void SetActiveCallback(std::function<bool()> callback);
+  void SetTextEntryTarget(TextEntryTarget* target);
+  TextEntryTarget* GetTextEntryTarget() const {
+    return text_entry_target_.load(std::memory_order_acquire);
+  }
 
   X_RESULT GetCapabilities(uint32_t user_index, uint32_t flags, X_INPUT_CAPABILITIES* out_caps);
   X_RESULT GetState(uint32_t user_index, X_INPUT_STATE* out_state);
@@ -44,6 +50,7 @@ class InputSystem : public system::IInputSystem {
 
  private:
   rex::ui::Window* window_ = nullptr;
+  std::atomic<TextEntryTarget*> text_entry_target_{nullptr};
 
   std::vector<std::unique_ptr<InputDriver>> drivers_;
 };

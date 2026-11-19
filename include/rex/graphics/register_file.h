@@ -35,6 +35,7 @@ class RegisterFile {
  public:
   RegisterFile();
 
+  static bool IsRegisterKnown(uint32_t index);
   static const RegisterInfo* GetRegisterInfo(uint32_t index);
 
   static constexpr size_t kRegisterCount = 0x5003;

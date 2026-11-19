@@ -119,6 +119,13 @@ class GraphicsSystem : public system::IGraphicsSystem {
   std::atomic<bool> vsync_worker_running_;
   system::object_ref<system::XHostThread> vsync_worker_thread_;
 
+  // display_pacing_stats (Windows): per host display vblank, how many new guest frames were presented since the
+  // previous one (0 = the display repeated a frame, 1 = even, 2+ = a frame was replaced before it was shown).
+  void DisplayPacingThread();
+  std::atomic<bool> display_pacing_running_{false};
+  std::thread display_pacing_thread_;
+  std::atomic<uint32_t> last_host_refresh_hz_{60};
+
   RegisterFile register_file_;
   std::unique_ptr<CommandProcessor> command_processor_;
 

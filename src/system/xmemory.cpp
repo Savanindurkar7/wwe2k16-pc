@@ -10,7 +10,12 @@
  */
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstring>
+#include <cstdlib>
+#include <mutex>
+#include <unordered_set>
 #include <utility>
 
 #include <fmt/format.h>
@@ -18,6 +23,7 @@
 #include <rex/assert.h>
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
+#include <rex/diagnostics/freeze_logger.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/stream.h>
@@ -27,6 +33,59 @@
 
 // TODO(benvanik): move xbox.h out
 #include <rex/system/xtypes.h>
+
+namespace {
+
+std::atomic<uint64_t> missing_indirect_function_calls{0};
+std::mutex missing_indirect_function_log_mutex;
+std::unordered_set<uint32_t> logged_missing_indirect_functions;
+
+}  // namespace
+
+#if defined(__clang__) || defined(__GNUC__)
+__attribute__((cold, noinline))
+#elif defined(_MSC_VER)
+__declspec(noinline)
+#endif
+void PPCHandleMissingIndirectFunction(PPCContext& ctx, [[maybe_unused]] uint8_t* base,
+                                      uint32_t guest_address) {
+  missing_indirect_function_calls.fetch_add(1, std::memory_order_relaxed);
+
+  bool should_log = false;
+  {
+    std::lock_guard lock(missing_indirect_function_log_mutex);
+    should_log = logged_missing_indirect_functions.insert(guest_address).second;
+  }
+
+  if (should_log) {
+    REXSYS_ERROR(
+        "[missing-function] indirect call to 0x{:08X} from lr=0x{:08X} ctr=0x{:08X}",
+        guest_address, uint32_t(ctx.lr), ctx.ctr.u32);
+    if (auto* logger = rex::GetLoggerRaw(rex::log::System)) {
+      logger->flush();
+    }
+  }
+
+  // GH3/#17: a null guest function pointer has no callable target. Some title
+  // objects build their method table at construction and leave a slot null; a
+  // destructor that calls it should not take the whole process down. Skip the
+  // call (a no-op) instead of aborting. Non-null but uncompiled addresses keep
+  // the fatal default below.
+  if (guest_address == 0) {
+    return;
+  }
+
+  const char* continue_on_missing = std::getenv("WWE2K16_MISSING_FN_CONTINUE");
+  if (continue_on_missing && std::strcmp(continue_on_missing, "1") == 0) {
+    return;
+  }
+
+  std::abort();
+}
+
+uint64_t PPCMissingIndirectFunctionCallCount() noexcept {
+  return missing_indirect_function_calls.load(std::memory_order_relaxed);
+}
 
 REXCVAR_DEFINE_BOOL(protect_zero, true, "Memory", "Protect the zero page from reads and writes")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -127,14 +186,18 @@ Memory::~Memory() {
 }
 
 bool Memory::Initialize() {
-  file_name_ = fmt::format("xenia_memory_{}", chrono::Clock::QueryHostTickCount());
+  file_name_ = fmt::format("wwe2k16_memory_{}", chrono::Clock::QueryHostTickCount());
 
   // Create main page file-backed mapping. This is all reserved but
   // uncommitted (so it shouldn't expand page file).
   mapping_ =
       rex::memory::CreateFileMappingHandle(file_name_,
-                                           // entire 4gb space + 512mb physical:
-                                           0x11FFFFFFF, rex::memory::PageAccess::kReadWrite, false);
+                                           // entire 4gb space + 512mb physical + 4kb:
+                                           // covers the vE view's last file offset
+                                           // 0x120000FFF (view end 0x120001000) and the
+                                           // raw physical view end 0x120000000; the added
+                                           // pages are zero-filled sparse pages:
+                                           0x120001000, rex::memory::PageAccess::kReadWrite, false);
   if (mapping_ == rex::memory::kFileMappingHandleInvalid) {
     REXSYS_ERROR("Unable to reserve the 4gb guest address space.");
     assert_always();
@@ -195,7 +258,7 @@ bool Memory::Initialize() {
                               memory::kMemoryProtectRead | memory::kMemoryProtectWrite);
 
   // Pre-commit the physical memory range so the GPU can access it
-  // without page faults. Reference: xenia-canary 5f5be0668.
+  // without page faults.
   rex::memory::AllocFixed(heaps_.physical.TranslateRelative(0), heaps_.physical.heap_size(),
                           rex::memory::AllocationType::kCommit,
                           rex::memory::PageAccess::kReadWrite);
@@ -218,8 +281,7 @@ bool Memory::Initialize() {
 
   // Allocate region at start of XEX range. Title 544307D5 explicitly
   // accesses 0x8000001C and expects a specific constant value.
-  // Reference: xenia-canary 78f97f8ff.
-  uint32_t unknown_xex_range;
+    uint32_t unknown_xex_range;
   heaps_.v80000000.Alloc(0x40000, 4 * 1024, memory::kMemoryAllocationCommit,
                          memory::kMemoryProtectRead | memory::kMemoryProtectWrite, false,
                          &unknown_xex_range);
@@ -464,6 +526,68 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
     return false;
   }
   if (heap->heap_type() != memory::HeapType::kGuestPhysical) {
+    // Recovery path for stale host protection state in guest-virtual memory:
+    // if guest metadata says the page is committed and writable but host
+    // protection is still no-access, restore host access and resume execution.
+    // This happens for stack guard pages: XThread::AllocateStack commits the
+    // whole stack read/write and only then Protect(NoAccess)s the two 64 KB
+    // guard regions (xthread.cpp), which updates current_protect but leaves
+    // allocation_protect RW. Without this branch the callback returns false
+    // forever and the faulting guest instruction re-executes in an eternal
+    // silent SIGSEGV storm.
+    constexpr uint32_t kWriteProtectMask =
+        memory::kMemoryProtectWrite | memory::kMemoryProtectWriteCombine;
+    constexpr uint32_t kReadProtectMask =
+        memory::kMemoryProtectRead | memory::kMemoryProtectWrite;
+    uint32_t guest_protect = 0;
+    bool allow = false;
+    HeapAllocationInfo guest_info{};
+    if (heap->QueryRegionInfo(virtual_address, &guest_info) &&
+        (guest_info.state & memory::kMemoryAllocationCommit)) {
+      if (is_write) {
+        allow = (guest_info.allocation_protect & kWriteProtectMask) != 0;
+      } else {
+        allow = (guest_info.allocation_protect & kReadProtectMask) == kReadProtectMask;
+      }
+      guest_protect = guest_info.allocation_protect;
+    }
+    if (allow) {
+      size_t host_page_size = rex::memory::page_size();
+      uintptr_t page_base =
+          reinterpret_cast<uintptr_t>(host_address) & ~(uintptr_t(host_page_size - 1));
+      if (rex::memory::Protect(reinterpret_cast<void*>(page_base), host_page_size,
+                               rex::memory::PageAccess::kReadWrite, nullptr)) {
+        rex::diagnostics::freeze_logger::RecordMemoryRecovery(
+            rex::diagnostics::freeze_logger::MemoryRecoveryKind::kGuestVirtualStaleProtect,
+            virtual_address, guest_protect);
+        // Bounded logging: at most 32 distinct host pages are logged verbosely;
+        // after that a single summary line is emitted so a recovery storm
+        // cannot flood the log.
+        static uintptr_t logged_pages[32];
+        static uint32_t logged_page_count = 0;
+        bool already_logged = false;
+        uint32_t scan_count = logged_page_count < 32 ? logged_page_count : 32;
+        for (uint32_t i = 0; i < scan_count; ++i) {
+          if (logged_pages[i] == page_base) {
+            already_logged = true;
+            break;
+          }
+        }
+        if (!already_logged && logged_page_count < 32) {
+          logged_pages[logged_page_count++] = page_base;
+          REXSYS_WARN(
+              "Recovered stale guest-virtual page protection for guest {:08X} (host {:016X}, "
+              "allocation_protect {:08X})",
+              virtual_address, static_cast<uint64_t>(page_base), guest_protect);
+        } else if (!already_logged && logged_page_count == 32) {
+          logged_page_count = 33;
+          REXSYS_WARN(
+              "Recovered stale guest-virtual page protection: more than 32 distinct pages, "
+              "further recoveries logged silently");
+        }
+        return true;
+      }
+    }
     return false;
   }
 
@@ -476,6 +600,58 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
   if (physical_heap->TriggerCallbacks(std::move(global_lock_locked_once), virtual_address, 1,
                                       is_write, false)) {
     return true;
+  }
+
+  // Recovery path for released guest-physical pages:
+  // MmFreePhysicalMemory releases the backing block (BaseHeap::Release clears
+  // the page table entry back to free) while host protection may remain
+  // no-access. Real hardware keeps released physical RAM readable/writable
+  // until it is reused, and the Bink movie decoder reads a released 64 KB
+  // block (16-byte movdqa loads); without this branch the read fault repeats
+  // forever. If the owning heap reports the page as exactly free, restore host
+  // read/write access for the containing host page and resume execution.
+  // Reserve-only and committed pages (any state != 0) are never recovered
+  // here; committed-writable writes still use the stale-write path below.
+  {
+    HeapAllocationInfo released_info{};
+    if (heap->QueryRegionInfo(virtual_address, &released_info) && released_info.state == 0) {
+      size_t host_page_size = rex::memory::page_size();
+      uintptr_t page_base =
+          reinterpret_cast<uintptr_t>(host_address) & ~(uintptr_t(host_page_size - 1));
+      if (rex::memory::Protect(reinterpret_cast<void*>(page_base), host_page_size,
+                               rex::memory::PageAccess::kReadWrite, nullptr)) {
+        rex::diagnostics::freeze_logger::RecordMemoryRecovery(
+            rex::diagnostics::freeze_logger::MemoryRecoveryKind::kReleasedPhysical, virtual_address,
+            0);
+        // Bounded logging: at most 32 distinct host pages are logged verbosely;
+        // after that a single summary line is emitted so a recovery storm
+        // cannot flood the log.
+        static uintptr_t logged_released_pages[32];
+        static uint32_t logged_released_page_count = 0;
+        bool already_logged = false;
+        uint32_t scan_count =
+            logged_released_page_count < 32 ? logged_released_page_count : 32;
+        for (uint32_t i = 0; i < scan_count; ++i) {
+          if (logged_released_pages[i] == page_base) {
+            already_logged = true;
+            break;
+          }
+        }
+        if (!already_logged && logged_released_page_count < 32) {
+          logged_released_pages[logged_released_page_count++] = page_base;
+          REXSYS_WARN(
+              "Recovered released guest-physical page for guest {:08X} (host {:016X}, "
+              "state free)",
+              virtual_address, static_cast<uint64_t>(page_base));
+        } else if (!already_logged && logged_released_page_count == 32) {
+          logged_released_page_count = 33;
+          REXSYS_WARN(
+              "Recovered released guest-physical page: more than 32 distinct pages, "
+              "further recoveries logged silently");
+        }
+        return true;
+      }
+    }
   }
 
   // Recovery path for stale host protection state in physical memory:
@@ -526,6 +702,9 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
           reinterpret_cast<uintptr_t>(host_address) & ~(uintptr_t(host_page_size - 1));
       if (rex::memory::Protect(reinterpret_cast<void*>(page_base), host_page_size,
                                rex::memory::PageAccess::kReadWrite, nullptr)) {
+        rex::diagnostics::freeze_logger::RecordMemoryRecovery(
+            rex::diagnostics::freeze_logger::MemoryRecoveryKind::kStalePhysical, virtual_address,
+            guest_protect);
         REXSYS_WARN(
             "Recovered stale physical page protection for guest {:08X} (host {:016X}, "
             "guest_protect {:08X})",
@@ -1141,6 +1320,54 @@ bool BaseHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t alignme
   return true;
 }
 
+namespace {
+
+// Guest allocation failures come in bursts of ~1000/s when the game probes for memory with
+// requests that cannot fit (same counts on Linux and Windows); logging every one cost ~3 log
+// lines per failure during those bursts. Log the first few in full, then one summary per
+// second with the count and the time spent in failed page-table searches.
+struct AllocFailureLog {
+  std::atomic<uint64_t> failures{0};
+  std::atomic<uint64_t> failed_search_ns{0};
+  std::atomic<uint64_t> window_start_ns{0};
+  std::atomic<uint32_t> logged_in_full{0};
+};
+AllocFailureLog g_alloc_failure_log;
+constexpr uint32_t kAllocFailuresLoggedInFull = 32;
+
+uint64_t AllocFailureNowNs() {
+  return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      std::chrono::steady_clock::now().time_since_epoch())
+                      .count());
+}
+
+void NoteAllocFailure(const char* message, uint64_t search_ns) {
+  auto& log = g_alloc_failure_log;
+  const uint64_t now = AllocFailureNowNs();
+  uint64_t window_start = log.window_start_ns.load(std::memory_order_relaxed);
+  if (window_start == 0) {
+    log.window_start_ns.compare_exchange_strong(window_start, now);
+  } else if (now - window_start >= 1000000000ull &&
+             log.window_start_ns.compare_exchange_strong(window_start, now)) {
+    const uint64_t failures = log.failures.exchange(0);
+    const uint64_t failed_ns = log.failed_search_ns.exchange(0);
+    if (failures) {
+      REXSYS_WARN(
+          "[alloc-fail] {} guest allocation failures in the last {:.1f} s, {:.1f} ms in failed "
+          "page-table searches (only the first {} are logged in full)",
+          failures, double(now - window_start) / 1e9, double(failed_ns) / 1e6,
+          kAllocFailuresLoggedInFull);
+    }
+  }
+  log.failures.fetch_add(1, std::memory_order_relaxed);
+  log.failed_search_ns.fetch_add(search_ns, std::memory_order_relaxed);
+  if (log.logged_in_full.fetch_add(1, std::memory_order_relaxed) < kAllocFailuresLoggedInFull) {
+    REXSYS_ERROR("{}", message);
+  }
+}
+
+}  // namespace
+
 bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint32_t size,
                           uint32_t alignment, uint32_t allocation_type, uint32_t protect,
                           bool top_down, uint32_t* out_address) {
@@ -1165,11 +1392,12 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint32_t 
 
   uint32_t available_page_count = high_page_number - low_page_number + 1;
   if (!page_count || page_count > available_page_count) {
-    REXSYS_ERROR("BaseHeap::Alloc page count too big for requested range");
+    NoteAllocFailure("BaseHeap::Alloc page count too big for requested range", 0);
     return false;
   }
 
   std::lock_guard<std::recursive_mutex> heap_lock(heap_mutex_);
+  const uint64_t search_start_ns = AllocFailureNowNs();
 
   // Find a free page range.
   // The base page must match the requested alignment, so we first scan for
@@ -1251,7 +1479,8 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint32_t 
   }
   if (start_page_number == UINT_MAX || end_page_number == UINT_MAX) {
     // Out of memory.
-    REXSYS_ERROR("BaseHeap::Alloc failed to find contiguous range");
+    NoteAllocFailure("BaseHeap::Alloc failed to find contiguous range",
+                     AllocFailureNowNs() - search_start_ns);
     assert_always("Heap exhausted!");
     return false;
   }
@@ -1636,7 +1865,7 @@ bool PhysicalHeap::Alloc(uint32_t size, uint32_t alignment, uint32_t allocation_
   uint32_t parent_address;
   if (!parent_heap_->AllocRange(parent_heap_start, parent_heap_end, size, alignment,
                                 allocation_type, protect, top_down, &parent_address)) {
-    REXSYS_ERROR("PhysicalHeap::Alloc unable to alloc physical memory in parent heap");
+    NoteAllocFailure("PhysicalHeap::Alloc unable to alloc physical memory in parent heap", 0);
     return false;
   }
 
@@ -1666,7 +1895,7 @@ bool PhysicalHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t ali
   // TODO(benvanik): flag for ensure-not-committed?
   uint32_t parent_base_address = GetPhysicalAddress(base_address);
   if (!parent_heap_->AllocFixed(parent_base_address, size, alignment, allocation_type, protect)) {
-    REXSYS_ERROR("PhysicalHeap::Alloc unable to alloc physical memory in parent heap");
+    NoteAllocFailure("PhysicalHeap::Alloc unable to alloc physical memory in parent heap", 0);
     return false;
   }
 
@@ -1701,7 +1930,7 @@ bool PhysicalHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint3
   uint32_t parent_address;
   if (!parent_heap_->AllocRange(parent_low_address, parent_high_address, size, alignment,
                                 allocation_type, protect, top_down, &parent_address)) {
-    REXSYS_ERROR("PhysicalHeap::Alloc unable to alloc physical memory in parent heap");
+    NoteAllocFailure("PhysicalHeap::Alloc unable to alloc physical memory in parent heap", 0);
     return false;
   }
 

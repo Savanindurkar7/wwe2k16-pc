@@ -135,7 +135,7 @@ bool PacketDisassembler::DisasmPacketType3(const uint8_t* base_ptr, uint32_t pac
       break;
     }
     case PM4_XE_SWAP: {
-      // Xenia-specific VdSwap hook.
+      // the runtime-specific VdSwap hook.
       // VdSwap will post this to tell us we need to swap the screen/fire an
       // interrupt.
       // 63 words here, but only the first has any data.

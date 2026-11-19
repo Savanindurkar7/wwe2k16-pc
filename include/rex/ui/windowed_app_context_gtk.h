@@ -29,6 +29,8 @@ class GTKWindowedAppContext final : public WindowedAppContext {
 
   void PlatformQuitFromUIThread() override;
 
+  bool ShowSimpleMessageBox(const char* title, const char* message) override;
+
   void RunMainGTKLoop();
 
  private:

@@ -22,6 +22,7 @@
 namespace rex::graphics::vulkan {
 
 class VulkanCommandProcessor;
+enum class GpuTimingCategory : uint32_t;
 
 class DeferredCommandBuffer {
  public:
@@ -29,7 +30,14 @@ class DeferredCommandBuffer {
                         size_t initial_size_bytes = 1024 * 1024);
 
   void Reset();
-  void Execute(VkCommandBuffer command_buffer);
+  void SwapStorage(DeferredCommandBuffer& other) { command_stream_.swap(other.command_stream_); }
+  void Execute(VkCommandBuffer command_buffer, uint64_t frame, uint64_t submission);
+
+  void CmdGpuTimingCategory(GpuTimingCategory category) {
+    auto& args = *reinterpret_cast<ArgsGpuTimingCategory*>(
+        WriteCommand(Command::kGpuTimingCategory, sizeof(ArgsGpuTimingCategory)));
+    args.category = category;
+  }
 
   // render_pass_begin->pNext of all barriers must be null.
   void CmdVkBeginRenderPass(const VkRenderPassBeginInfo* render_pass_begin,
@@ -381,6 +389,7 @@ class DeferredCommandBuffer {
     kVkSetStencilReference,
     kVkSetStencilWriteMask,
     kVkSetViewport,
+    kGpuTimingCategory,
   };
 
   struct CommandHeader {
@@ -575,6 +584,10 @@ class DeferredCommandBuffer {
     uint32_t viewport_count;
     // Followed by aligned VkViewport[].
     static_assert(alignof(VkViewport) <= alignof(uintmax_t));
+  };
+
+  struct ArgsGpuTimingCategory {
+    GpuTimingCategory category;
   };
 
   void* WriteCommand(Command command, size_t arguments_size_bytes);

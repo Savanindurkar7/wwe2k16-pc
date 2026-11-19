@@ -10,9 +10,11 @@
  */
 
 #include <sstream>
+#include <system_error>
 
 #include <fmt/format.h>
 
+#include <rex/filesystem.h>
 #include <rex/logging.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/user_profile.h>
@@ -159,10 +161,15 @@ void UserProfile::SaveSetting(UserProfile::Setting* setting) {
   if (setting->is_title_specific()) {
     auto serialized_setting = setting->Serialize();
     auto content_dir = kernel_state_->content_manager()->ResolveGameUserContentPath();
-    std::filesystem::create_directories(content_dir);
+    std::error_code ec;  // Non-throwing: a read-only save folder loses the setting, never the game.
+    std::filesystem::create_directories(content_dir, ec);
     auto setting_id = fmt::format("{:08X}", setting->setting_id);
     auto file_path = content_dir / setting_id;
     auto file = rex::filesystem::OpenFile(file_path, "wb");
+    if (!file) {
+      REXSYS_WARN("UserProfile::SaveSetting: cannot write {}", rex::path_to_utf8(file_path));
+      return;
+    }
     fwrite(serialized_setting.data(), 1, serialized_setting.size(), file);
     fclose(file);
   } else {

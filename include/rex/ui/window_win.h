@@ -77,6 +77,10 @@ class Win32Window : public Window {
   uint32_t GetCurrentSystemDpi() const;
   uint32_t GetCurrentDpi() const;
 
+  void ApplyDisplayRefreshMatch(const WCHAR* device_name,
+                                WindowDestructionReceiver& destruction_receiver);
+  void RestoreDisplayRefreshMode(WindowDestructionReceiver* destruction_receiver = nullptr);
+
   void ApplyFullscreenEntry(WindowDestructionReceiver& destruction_receiver);
 
   void HandleSizeUpdate(WindowDestructionReceiver& destruction_receiver);
@@ -117,6 +121,9 @@ class Win32Window : public Window {
 
   uint32_t pre_fullscreen_dpi_;
   WINDOWPLACEMENT pre_fullscreen_placement_;
+  std::wstring display_refresh_device_name_;
+  bool display_refresh_mode_changed_ = false;
+  bool display_refresh_operation_in_progress_ = false;
   // The client area part of pre_fullscreen_placement_.rcNormalPosition, saved
   // in case something effecting the behavior of AdjustWindowRectEx for the
   // non-fullscreen state is changed mid-fullscreen (for instance, the menu is

@@ -23,6 +23,8 @@
 #include <rex/math.h>
 #include <rex/ui/vulkan/util.h>
 
+#include "gpu_timing.h"
+
 REXCVAR_DEFINE_BOOL(vulkan_sparse_shared_memory, true, "GPU/Vulkan",
                     "Use sparse shared memory on Vulkan")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -289,6 +291,7 @@ void VulkanSharedMemory::InitializeTraceCompleteDownloads() {
       trace_writer_.WriteMemoryRead(
           download_range.first, download_range.second,
           reinterpret_cast<const uint8_t*>(download_mapping) + download_buffer_offset);
+      download_buffer_offset += download_range.second;
     }
     dfn.vkUnmapMemory(device, trace_download_buffer_memory_);
   } else {
@@ -345,6 +348,7 @@ bool VulkanSharedMemory::UploadRanges(
   if (upload_page_ranges.empty()) {
     return true;
   }
+  command_processor_.SetGpuTimingCategory(GpuTimingCategory::kSharedMemoryUploadCopy);
   // upload_page_ranges are sorted, use them to determine the range for the
   // ordering barrier.
   Use(Usage::kTransferDestination,

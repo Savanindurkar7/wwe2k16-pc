@@ -1,3 +1,3 @@
-// VK_KHR_win32_surface functions used in Xenia.
+// VK_KHR_win32_surface functions used in the runtime.
 XE_UI_VULKAN_FUNCTION(vkCreateWin32SurfaceKHR)
 XE_UI_VULKAN_FUNCTION(vkGetPhysicalDeviceWin32PresentationSupportKHR)

@@ -50,6 +50,8 @@ REXCVAR_DECLARE(bool, direct_host_resolve);
 
 // GPU Textures
 REXCVAR_DECLARE(bool, gpu_allow_invalid_fetch_constants);
+REXCVAR_DECLARE(bool, gpu_content_probe);
+REXCVAR_DECLARE(bool, wwe2k16_dof_composite_nop);
 REXCVAR_DECLARE(bool, gpu_3d_to_2d_texture);
 REXCVAR_DECLARE(int32_t, anisotropic_override);
 REXCVAR_DECLARE(int32_t, texture_cache_memory_limit_render_to_texture);

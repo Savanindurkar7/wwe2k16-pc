@@ -10,7 +10,10 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
+#include <filesystem>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -18,6 +21,10 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/app_manager.h>
 #include <rex/thread/mutex.h>
+
+namespace rex::system {
+class XStaticUntypedEnumerator;
+}
 
 namespace rex {
 namespace kernel {
@@ -69,6 +76,14 @@ class XmpApp : public system::xam::App {
     uint32_t flags;
     std::vector<std::unique_ptr<Song>> songs;
   };
+  // A song enumerated from the host music folder (phase 1: <exe>/music or
+  // the xmp_music_dir cvar). The play request names one of these.
+  struct CustomMusicSong {
+    uint32_t handle;
+    std::filesystem::path path;
+    std::u16string name;
+    uint32_t format;
+  };
 
   explicit XmpApp(system::KernelState* kernel_state);
 
@@ -86,6 +101,12 @@ class XmpApp : public system::xam::App {
   X_HRESULT XMPNext();
   X_HRESULT XMPPrevious();
 
+  // Plays a song from the custom music folder (0x7003B). Looks the song up by
+  // handle first, then by name (handles change when the folder changes).
+  X_HRESULT XMPPlayCustomSong(const CustomMusicSong* song);
+
+  void AppendCustomMusicItems(system::XStaticUntypedEnumerator* enumerator);
+
   X_HRESULT DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
                                 uint32_t buffer_length) override;
 
@@ -95,6 +116,14 @@ class XmpApp : public system::xam::App {
   static const uint32_t kMsgPlaybackControllerChanged = 0x0A000003;
 
   void OnStateChanged();
+  void EnsureCustomMusicLoaded();
+
+  // The custom song currently playing (independent of the guest playlist
+  // objects). Used for 0x7000E info and to decide what 0x70009 reports.
+  struct ActiveCustomSong {
+    const CustomMusicSong* song = nullptr;
+    uint64_t start_ms = 0;
+  };
 
   State state_;
   PlaybackClient playback_client_;
@@ -104,11 +133,18 @@ class XmpApp : public system::xam::App {
   float volume_;
   Playlist* active_playlist_;
   int active_song_index_;
+  // A 0x7003B play request overrides whatever the playlist objects say: the
+  // game's own entrance editor sends it for the selected folder song.
+  ActiveCustomSong active_custom_song_;
 
   rex::thread::global_critical_region global_critical_region_;
   std::unordered_map<uint32_t, Playlist*> playlists_;
   uint32_t next_playlist_handle_;
   uint32_t next_song_handle_;
+  std::once_flag custom_music_once_;
+  std::vector<CustomMusicSong> custom_music_songs_;
+  std::atomic<uint64_t> get_status_log_count_{0};
+  std::atomic<uint64_t> get_playback_controller_log_count_{0};
 };
 
 }  // namespace apps

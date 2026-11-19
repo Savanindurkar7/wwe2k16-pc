@@ -8,7 +8,7 @@
  * @license     BSD 3-Clause License
  *              See LICENSE file in the project root for full license text.
  *
- * @remarks     Derived from Xenia's runtime::Processor (Ben Vanik, 2020).
+ * @remarks     Derived from the runtime's runtime::Processor (Ben Vanik, 2020).
  *              Stripped of emulation-era dead code and renamed to reflect its
  *              role as a function dispatch table rather than a CPU emulator.
  */

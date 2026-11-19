@@ -8,7 +8,7 @@
  * @license     BSD 3-Clause License
  *              See LICENSE file in the project root for full license text.
  *
- * @remarks     PPCPointer types derived from Xenia (https://xenia.jp)
+ * @remarks     PPCPointer types derived from the runtime (https://runtime.jp)
  *              Register semantics based on XenonRecomp/UnleashedRecomp
  */
 

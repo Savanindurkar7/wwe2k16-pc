@@ -18,6 +18,7 @@
 #include <rex/graphics/video_mode_util.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
+#include <rex/ui/clipboard.h>
 #include <rex/ui/flags.h>
 #include <rex/ui/surface_gnulinux.h>
 #include <rex/ui/virtual_key.h>
@@ -302,6 +303,34 @@ VirtualKey TranslateGdkKeyvalToVirtualKey(guint keyval) {
 namespace rex {
 namespace ui {
 
+std::optional<std::u16string> GetClipboardText() {
+  GtkClipboard* clipboard = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
+  if (!clipboard) {
+    return std::nullopt;
+  }
+
+  gchar* clipboard_text = gtk_clipboard_wait_for_text(clipboard);
+  if (!clipboard_text) {
+    return std::nullopt;
+  }
+
+  glong utf16_length = 0;
+  gunichar2* utf16_text =
+      g_utf8_to_utf16(clipboard_text, -1, nullptr, &utf16_length, nullptr);
+  g_free(clipboard_text);
+  if (!utf16_text) {
+    return std::nullopt;
+  }
+
+  std::u16string text;
+  text.reserve(static_cast<size_t>(utf16_length));
+  for (glong i = 0; i < utf16_length; ++i) {
+    text.push_back(static_cast<char16_t>(utf16_text[i]));
+  }
+  g_free(utf16_text);
+  return text;
+}
+
 std::unique_ptr<Window> Window::Create(WindowedAppContext& app_context,
                                        const std::string_view title, uint32_t desired_logical_width,
                                        uint32_t desired_logical_height) {
@@ -317,6 +346,7 @@ GTKWindow::GTKWindow(WindowedAppContext& app_context, const std::string_view tit
 
 GTKWindow::~GTKWindow() {
   EnterDestructor();
+  StopCursorAutoHideTimer();
   if (window_) {
     // Set window_ to null to ignore events from now on since this ui::GTKWindow
     // is entering an indeterminate state.
@@ -578,7 +608,7 @@ std::unique_ptr<Surface> GTKWindow::CreateSurfaceImpl(Surface::TypeFlags allowed
   if (type_known && !type_supported_by_display) {
     REXLOG_ERROR(
         "GTKWindow: The window system of the GTK window is not supported by "
-        "Xenia");
+        "the runtime");
   }
   return nullptr;
 }
@@ -757,6 +787,7 @@ gboolean GTKWindow::WindowEventHandler(GdkEvent* event) {
       // at some point in closing anyway.
       GtkWidget* window = window_;
       window_ = nullptr;
+      StopCursorAutoHideTimer();
       // Destroying the top-level window also destroys its children.
       drawing_area_ = nullptr;
       box_ = nullptr;
@@ -805,7 +836,83 @@ gboolean GTKWindow::WindowEventHandlerThunk(GtkWidget* widget, GdkEvent* event,
   return window->WindowEventHandler(event);
 }
 
+void GTKWindow::ApplyNewCursorVisibility(CursorVisibility old_cursor_visibility) {
+  (void)old_cursor_visibility;
+  switch (GetCursorVisibility()) {
+    case CursorVisibility::kVisible:
+      StopCursorAutoHideTimer();
+      SetDrawingAreaCursorHidden(false);
+      break;
+    case CursorVisibility::kHidden:
+      StopCursorAutoHideTimer();
+      SetDrawingAreaCursorHidden(true);
+      break;
+    case CursorVisibility::kAutoHidden:
+      // Entering auto-hide hides the cursor at once (Window::SetCursorVisibility contract); movement reveals it.
+      StopCursorAutoHideTimer();
+      cursor_last_position_valid_ = false;
+      SetDrawingAreaCursorHidden(true);
+      break;
+  }
+}
+
+void GTKWindow::SetDrawingAreaCursorHidden(bool hidden) {
+  if (!drawing_area_) {
+    return;
+  }
+  GdkWindow* gdk_window = gtk_widget_get_window(drawing_area_);
+  if (!gdk_window) {
+    return;
+  }
+  if (!hidden) {
+    gdk_window_set_cursor(gdk_window, nullptr);
+    return;
+  }
+  GdkCursor* blank = gdk_cursor_new_for_display(gdk_window_get_display(gdk_window), GDK_BLANK_CURSOR);
+  gdk_window_set_cursor(gdk_window, blank);
+  if (blank) {
+    g_object_unref(blank);
+  }
+}
+
+void GTKWindow::RestartCursorAutoHideTimer() {
+  StopCursorAutoHideTimer();
+  cursor_auto_hide_source_ = g_timeout_add(kDefaultCursorAutoHideMilliseconds, CursorAutoHideTimeout, this);
+}
+
+void GTKWindow::StopCursorAutoHideTimer() {
+  if (cursor_auto_hide_source_) {
+    g_source_remove(cursor_auto_hide_source_);
+    cursor_auto_hide_source_ = 0;
+  }
+}
+
+gboolean GTKWindow::CursorAutoHideTimeout(gpointer user_data) {
+  auto* window = static_cast<GTKWindow*>(user_data);
+  window->cursor_auto_hide_source_ = 0;
+  if (window->GetCursorVisibility() == CursorVisibility::kAutoHidden) {
+    window->SetDrawingAreaCursorHidden(true);
+  }
+  return G_SOURCE_REMOVE;
+}
+
 gboolean GTKWindow::DrawingAreaEventHandler(GdkEvent* event) {
+  if (GetCursorVisibility() == CursorVisibility::kAutoHidden) {
+    bool reveal = event->type == GDK_BUTTON_PRESS || event->type == GDK_SCROLL;
+    if (event->type == GDK_MOTION_NOTIFY) {
+      // Motion events also arrive without the user moving the mouse (window changes): only real movement reveals.
+      const auto* motion_event = reinterpret_cast<const GdkEventMotion*>(event);
+      reveal = !cursor_last_position_valid_ || motion_event->x_root != cursor_last_x_ ||
+               motion_event->y_root != cursor_last_y_;
+      cursor_last_position_valid_ = true;
+      cursor_last_x_ = motion_event->x_root;
+      cursor_last_y_ = motion_event->y_root;
+    }
+    if (reveal) {
+      SetDrawingAreaCursorHidden(false);
+      RestartCursorAutoHideTimer();
+    }
+  }
   switch (event->type) {
     case GDK_MOTION_NOTIFY:
     case GDK_BUTTON_PRESS:

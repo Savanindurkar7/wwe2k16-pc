@@ -131,7 +131,7 @@ ppc_u32_result_t XMAInitializeContext_entry(ppc_pvoid_t context_ptr,
   if (input_buffer_0_guest_ptr) {
     input_buffer_0_physical_address =
         REX_KERNEL_MEMORY()->GetPhysicalAddress(input_buffer_0_guest_ptr);
-    // Xenia-specific safety check.
+    // the runtime-specific safety check.
     assert_true(input_buffer_0_physical_address != UINT32_MAX);
     if (input_buffer_0_physical_address == UINT32_MAX) {
       REXKRNL_ERROR("XMAInitializeContext: Invalid input buffer 0 virtual address {:08X}",
@@ -226,7 +226,7 @@ ppc_u32_result_t XMASetInputBuffer0_entry(ppc_pvoid_t context_ptr, ppc_pvoid_t b
       REX_KERNEL_MEMORY()->GetPhysicalAddress(buffer.guest_address());
   assert_true(buffer_physical_address != UINT32_MAX);
   if (buffer_physical_address == UINT32_MAX) {
-    // Xenia-specific safety check.
+    // the runtime-specific safety check.
     REXKRNL_ERROR("XMASetInputBuffer0: Invalid buffer virtual address {:08X}",
                   buffer.guest_address());
     return X_E_FALSE;
@@ -261,7 +261,7 @@ ppc_u32_result_t XMASetInputBuffer1_entry(ppc_pvoid_t context_ptr, ppc_pvoid_t b
       REX_KERNEL_MEMORY()->GetPhysicalAddress(buffer.guest_address());
   assert_true(buffer_physical_address != UINT32_MAX);
   if (buffer_physical_address == UINT32_MAX) {
-    // Xenia-specific safety check.
+    // the runtime-specific safety check.
     REXKRNL_ERROR("XMASetInputBuffer1: Invalid buffer virtual address {:08X}",
                   buffer.guest_address());
     return X_E_FALSE;

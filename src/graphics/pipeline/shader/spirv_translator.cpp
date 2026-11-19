@@ -90,7 +90,7 @@ uint64_t SpirvShaderTranslator::GetDefaultPixelShaderModification(
 }
 
 std::vector<uint8_t> SpirvShaderTranslator::CreateDepthOnlyFragmentShader(
-    Modification::DepthStencilMode depth_stencil_mode) {
+    Modification::DepthStencilMode depth_stencil_mode, bool float24_depth_pixel_rate) {
   is_depth_only_fragment_shader_ = true;
   // TODO(Triang3l): Handle in a nicer way (is_depth_only_fragment_shader_ is a
   // leftover from when a Shader object wasn't used during translation).
@@ -99,6 +99,7 @@ std::vector<uint8_t> SpirvShaderTranslator::CreateDepthOnlyFragmentShader(
   shader.AnalyzeUcode(instruction_disassembly_buffer);
   Modification modification(GetDefaultPixelShaderModification(0));
   modification.pixel.depth_stencil_mode = depth_stencil_mode;
+  modification.pixel.float24_depth_pixel_rate = uint32_t(float24_depth_pixel_rate);
   Shader::Translation& translation = *shader.GetOrCreateTranslation(modification.value);
   TranslateAnalyzedShader(translation);
   is_depth_only_fragment_shader_ = false;
@@ -1108,7 +1109,8 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
       builder_->addExecutionMode(function_main_, spv::ExecutionModeDepthReplacing);
       if (!current_shader().writes_depth() &&
           GetSpirvShaderModification().pixel.depth_stencil_mode ==
-              Modification::DepthStencilMode::kFloat24Truncating) {
+              Modification::DepthStencilMode::kFloat24Truncating &&
+          !GetSpirvShaderModification().pixel.float24_depth_pixel_rate) {
         builder_->addExecutionMode(function_main_, spv::ExecutionModeDepthLess);
       }
     }
@@ -3143,7 +3145,7 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
     // OpFNegate requires sign bit flipping even for 0.0 (in this case, the
     // first column or row of pixels) only since SPIR-V 1.5 revision 2 (not the
     // base 1.5).
-    // TODO(Triang3l): When SPIR-V 1.6 is used in Xenia, see if OpFNegate can be
+    // TODO(Triang3l): When SPIR-V 1.6 is used in the runtime, see if OpFNegate can be
     // used there, should be cheaper because it may be implemented as a hardware
     // instruction modifier, though it respects the rule for subnormal numbers -
     // see the actual hardware instructions in both OpBitwiseXor and OpFNegate

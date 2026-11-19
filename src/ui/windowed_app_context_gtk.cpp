@@ -48,6 +48,19 @@ void GTKWindowedAppContext::PlatformQuitFromUIThread() {
   quit_idle_pending_ = gdk_threads_add_idle(QuitSourceFunc, this);
 }
 
+bool GTKWindowedAppContext::ShowSimpleMessageBox(const char* const title,
+                                                const char* const message) {
+  GtkWidget* const dialog = gtk_message_dialog_new(
+      nullptr, GTK_DIALOG_MODAL, GTK_MESSAGE_ERROR, GTK_BUTTONS_CLOSE, "%s", message);
+  if (!dialog) {
+    return false;
+  }
+  gtk_window_set_title(GTK_WINDOW(dialog), title);
+  gtk_dialog_run(GTK_DIALOG(dialog));
+  gtk_widget_destroy(dialog);
+  return true;
+}
+
 void GTKWindowedAppContext::RunMainGTKLoop() {
   // For safety, in case the quit request somehow happened before the loop.
   if (HasQuitFromUIThread()) {

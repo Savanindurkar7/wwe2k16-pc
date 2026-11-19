@@ -52,7 +52,7 @@ inline uint64_t decode_fat_timestamp(const uint32_t date, const uint32_t time) {
   return (timet + 11644473600LL) * 10000000;
 }
 
-// Structs used for interchange between Xenia and actual Xbox360 kernel/XAM
+// Structs used for interchange between the runtime and actual Xbox360 kernel/XAM
 
 inline uint32_t load_uint24_be(const uint8_t* p) {
   return (uint32_t(p[0]) << 16) | (uint32_t(p[1]) << 8) | uint32_t(p[2]);

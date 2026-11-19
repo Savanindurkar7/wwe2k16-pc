@@ -157,6 +157,24 @@ bool build_mulhw(BuilderContext& ctx) {
   return true;
 }
 
+bool build_mulchw(BuilderContext& ctx) {
+  // mulchw rD,rA,rB: rD = (int16)rA * rB (PowerPC 405/440 multiply cross halfword).
+  // This is NOT the high-word multiply (mulhw): the architectural result is the low
+  // 32 bits of the product. Truncate the 47-bit product through int32_t before the
+  // .s64 store so the register never carries product bits above bit 31 (e.g.
+  // 0x7FFF * INT32_MAX must yield 0x000000007FFF8001, not 0x00003FFF7FFF8001). int32_t is the
+  // framework idiom for signed 32-bit results (see extsw/lwa) and sign-extends to
+  // 64 bits; record-form (mulchw.) compares rD.s32.
+  // NOTE: build_mullw below still stores the untruncated 64-bit product. That is a
+  // pre-existing, framework-wide pattern (upstream v0.7.3 and SVR07-Recomp emit the
+  // same); its 64-bit consumers need separate runtime evidence before changing it.
+  ctx.println("\t{}.s64 = int32_t(int64_t(int16_t({}.s32)) * int64_t({}.s32));",
+              ctx.r(ctx.insn.operands[0]), ctx.r(ctx.insn.operands[1]),
+              ctx.r(ctx.insn.operands[2]));
+  emitRecordFormCompare(ctx);
+  return true;
+}
+
 bool build_mulhwu(BuilderContext& ctx) {
   ctx.println("\t{}.u64 = (uint64_t({}.u32) * uint64_t({}.u32)) >> 32;",
               ctx.r(ctx.insn.operands[0]), ctx.r(ctx.insn.operands[1]),

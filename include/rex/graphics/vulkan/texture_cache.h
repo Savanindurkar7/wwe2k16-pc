@@ -89,6 +89,8 @@ class VulkanTextureCache final : public TextureCache {
   VkImageView GetActiveBindingOrNullImageView(uint32_t fetch_constant_index,
                                               xenos::FetchOpDimension dimension, bool is_signed);
 
+  // Memoized per fetch constant slot: the result is a pure function of the fetch constant, the binding's filter
+  // overrides, max_anisotropy_ and the anisotropic_override cvar, all part of the memo key.
   SamplerParameters GetSamplerParameters(const VulkanShader::SamplerBinding& binding) const;
 
   // Must be called for every used sampler at least once in a single submission,
@@ -376,6 +378,24 @@ class VulkanTextureCache final : public TextureCache {
   xenos::AnisoFilter max_anisotropy_;
 
   std::unordered_map<SamplerParameters, Sampler, SamplerParameters::Hasher> samplers_;
+
+  SamplerParameters ComputeSamplerParameters(const VulkanShader::SamplerBinding& binding) const;
+  struct SamplerParametersMemo {
+    uint32_t fetch[6] = {};
+    uint32_t binding_filters = UINT32_MAX;
+    int32_t anisotropic_override = 0;
+    SamplerParameters parameters;
+  };
+  mutable std::array<SamplerParametersMemo, 32> sampler_parameters_memo_;
+  // Samplers already used in the current submission, by parameters: such a sampler can't be evicted before the
+  // submission completes (eviction requires last_usage_submission <= completed submission), so it can be returned
+  // without the map lookup and LRU update.
+  struct UsedSamplerMemo {
+    SamplerParameters parameters;
+    VkSampler sampler = VK_NULL_HANDLE;
+    uint64_t submission = 0;
+  };
+  std::array<UsedSamplerMemo, 64> used_sampler_memo_;
   std::pair<const SamplerParameters, Sampler>* sampler_used_first_ = nullptr;
   std::pair<const SamplerParameters, Sampler>* sampler_used_last_ = nullptr;
   uint32_t custom_border_color_sampler_count_ = 0;

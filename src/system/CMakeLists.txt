@@ -3,6 +3,7 @@
 
 set(REXSYSTEM_SOURCES
     runtime.cpp
+    cache_drive.cpp
     kernel_state.cpp
     xmemory.cpp
     kernel_module.cpp

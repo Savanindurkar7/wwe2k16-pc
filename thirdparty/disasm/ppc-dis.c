@@ -5350,7 +5350,14 @@ powerpc_dialect(struct disassemble_info* info)
 
     if (info->disassembler_options
         && strstr(info->disassembler_options, "cell") != NULL)
+    {
+        /* Cell/Xenon (Xbox 360) is not a PPC403/PPC405/PPC440 part: drop the
+           PPC405/440 opcode classes that the default fallback added above so
+           they cannot shadow VMX128 entries (e.g. PPC405 mulchw at
+           ppc-dis.c:2235 vs VMX128 vsldoi128 at ppc-dis.c:2464). */
+        dialect &= ~(PPC_OPCODE_403 | PPC_OPCODE_440);
         dialect |= PPC_OPCODE_POWER4 | PPC_OPCODE_CELL | PPC_OPCODE_ALTIVEC | PPC_OPCODE_VMX_128;
+    }
 
     if (info->disassembler_options
         && strstr(info->disassembler_options, "power6") != NULL)

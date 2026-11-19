@@ -13,8 +13,10 @@
 
 #include <array>
 #include <atomic>
+#include <functional>
 #include <mutex>
 #include <optional>
+#include <thread>
 #include <vector>
 
 #include <rex/input/input_driver.h>
@@ -24,8 +26,8 @@
 #define HID_SDL_USER_COUNT 4
 #define HID_SDL_THUMB_THRES 0x4E00
 #define HID_SDL_TRIGG_THRES 0x1F
-#define HID_SDL_REPEAT_DELAY 400
-#define HID_SDL_REPEAT_RATE 100
+#define HID_SDL_REPEAT_DELAY 220
+#define HID_SDL_REPEAT_RATE 45
 
 namespace rex::input::sdl {
 
@@ -86,12 +88,18 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   bool TestSDLVersion() const;
   void UpdateXCapabilities(ControllerState& state);
   void QueueControllerUpdate();
+  // sdl_input_poll_thread: SDL lives on its own thread, pumped every ~1 ms, so GetState sees fresh input instead
+  // of the state from the previous UI-thread pump (one or more frames old while the UI thread waits on vsync).
+  void StartPollThread(std::function<void()> init_sdl);
+  void StopPollThread();
 
   rex::ui::Window* attached_window_ = nullptr;
   bool sdl_events_initialized_;
   bool SDL_Gamepad_initialized_;
   std::atomic<int> sdl_events_unflushed_;
   std::atomic<bool> sdl_pumpevents_queued_;
+  std::thread poll_thread_;
+  std::atomic<bool> poll_thread_running_{false};
   std::array<ControllerState, HID_SDL_USER_COUNT> controllers_;
   std::mutex controllers_mutex_;
   std::mutex event_queue_mutex_;

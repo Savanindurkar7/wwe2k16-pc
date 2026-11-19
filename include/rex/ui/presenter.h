@@ -92,7 +92,7 @@ struct RawImage {
 // The presenter displays up to two layers of content on a host surface:
 // - Guest output image, focusing on lowering latency and maintaining stable
 //   frame pacing, with various scaling and sharpening methods and letterboxing;
-// - Xenia's internal UI (such as the profiler and Dear ImGui).
+// - the runtime's internal UI (such as the profiler and Dear ImGui).
 //
 // The guest output image may be refreshed from any thread generating it
 // (usually the GPU emulation thread), as long as there are no multiple threads
@@ -118,7 +118,7 @@ struct RawImage {
 //   vertical sync in that thread too early if host vertical sync can't be
 //   disabled on the platform, blocking the next frame of GPU emulation).
 //
-// The composition of the guest and the UI is done by Xenia manually, as opposed
+// The composition of the guest and the UI is done by the runtime manually, as opposed
 // to using platform functionality such as DirectComposition, in order to have
 // more predictability of GPU queue scheduling, but primarily to be able to take
 // advantage of independent host presentation where it's available, so variable
@@ -355,7 +355,25 @@ class Presenter {
   // Requests (re)painting with the UI if there's UI to draw.
   void RequestUIPaintFromUIThread();
 
+  // Host display vertical blank of the monitor the surface is on, for pacing the guest vblank to the real
+  // display (callable from any thread). Windows (DXGI) only; elsewhere, or with no known output, the wait returns
+  // false immediately and the refresh rate is 0.
+  bool WaitForHostDisplayVBlank();
+  uint32_t GetHostDisplayRefreshHz();
+  // Successful host presents of the guest output so far (for display pacing statistics).
+  uint64_t host_present_count() const { return host_present_count_.load(std::memory_order_relaxed); }
+  // Guest output images consumed for painting that were newer than the previously consumed one (distinct guest
+  // frames reaching the host surface; host presents also repaint the same image).
+  uint64_t guest_frames_consumed() const { return guest_frames_consumed_.load(std::memory_order_relaxed); }
+
  protected:
+  // Reports an unrecoverable host-graphics API failure through the owning app's
+  // normal GPU-loss callback (which marshals user-facing UI to the UI thread).
+  void ReportHostGpuFailure();
+
+  std::atomic<uint64_t> host_present_count_{0};
+  std::atomic<uint64_t> guest_frames_consumed_{0};
+
   enum class PaintResult {
     kPresented,
     kPresentedSuboptimal,
@@ -939,7 +957,7 @@ class Presenter {
   // The guest output images may be consumed by two operations - painting, and
   // capturing to a CPU-side buffer. These two usually never happen in parallel
   // in reality though, as they're usually not even needed both at once in the
-  // same app within Xenia, so there's no need to create any
+  // same app within the runtime, so there's no need to create any
   // complex lock-free synchronization between the two, but still, the situation
   // when multiple consumers want the guest output image at the same is
   // perfectly valid (unlike for producers, because even with a producer lock
@@ -1016,6 +1034,13 @@ class Presenter {
   // a failure to find the output in DXGI), or don't draw at all if the window
   // was removed from a connected monitor.
   Microsoft::WRL::ComPtr<IDXGIOutput> dxgi_ui_tick_output_;
+  // Host-vsync fallback when dxgi_ui_tick_output_ was never set (the monitor lookup at surface creation ran before
+  // the window was on a monitor): resolved from the window's current monitor, refreshed every 2 s.
+  Microsoft::WRL::ComPtr<IDXGIOutput> HostVsyncOutput();
+  std::mutex host_vsync_mutex_;
+  Microsoft::WRL::ComPtr<IDXGIFactory1> host_vsync_factory_;
+  Microsoft::WRL::ComPtr<IDXGIOutput> host_vsync_output_;
+  uint64_t host_vsync_output_expiry_ms_ = 0;
   // To avoid allocating processing resources to the thread when nothing needs
   // the ticks (not drawing the UI), the thread waits for vertical blanking
   // intervals only when the UI drawing ticks are needed, and sleeping waiting

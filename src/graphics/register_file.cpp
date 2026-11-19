@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <array>
 #include <cstring>
 
 #include <rex/graphics/register_file.h>
@@ -16,8 +17,24 @@
 
 namespace rex::graphics {
 
+namespace {
+
+const std::array<bool, RegisterFile::kRegisterCount> kKnownRegisterIndices = [] {
+  std::array<bool, RegisterFile::kRegisterCount> known_registers = {};
+#define XE_GPU_REGISTER(index, type, name) known_registers[index] = true;
+#include <rex/graphics/register_table.inc>
+#undef XE_GPU_REGISTER
+  return known_registers;
+}();
+
+}  // namespace
+
 RegisterFile::RegisterFile() {
   std::memset(values, 0, sizeof(values));
+}
+
+bool RegisterFile::IsRegisterKnown(uint32_t index) {
+  return index < kKnownRegisterIndices.size() && kKnownRegisterIndices[index];
 }
 
 const RegisterInfo* RegisterFile::GetRegisterInfo(uint32_t index) {

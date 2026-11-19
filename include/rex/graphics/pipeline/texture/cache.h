@@ -16,6 +16,7 @@
 #include <cstring>
 #include <memory>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <rex/assert.h>
@@ -80,7 +81,19 @@ class TextureCache {
   virtual void BeginSubmission(uint64_t new_submission_index);
   virtual void BeginFrame();
 
-  void MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_unscaled);
+  struct ScaledResolveRange {
+    uint32_t start;
+    uint32_t length;
+    uint32_t pixel_size_log2;
+  };
+  void MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_unscaled,
+                           uint32_t pixel_size_log2, bool scaled);
+  void GetScaledResolveRanges(uint32_t start_unscaled, uint32_t length_unscaled,
+                              std::vector<ScaledResolveRange>& ranges_out);
+  void MarkRangeAsUnscaledGpuWrite(uint32_t start_unscaled, uint32_t length_unscaled);
+  void GetUnscaledGpuWriteRanges(
+      uint32_t start_unscaled, uint32_t length_unscaled,
+      std::vector<std::pair<uint32_t, uint32_t>>& ranges_out);
   // Ensures the memory backing the range in the scaled resolve address space is
   // allocated and returns whether it is.
   virtual bool EnsureScaledResolveMemoryCommitted(uint32_t start_unscaled, uint32_t length_unscaled,
@@ -282,7 +295,7 @@ class TextureCache {
   //     unmapped tiles results in undefined behavior, including a GPU page
   //     fault and device removal. So, shaders must not try to access
   //     potentially unmapped regions (that are outside the texture memory
-  //     extents calculated on the CPU, taking into account that Xenia can't
+  //     extents calculated on the CPU, taking into account that the runtime can't
   //     overestimate texture sizes freely since it must not try to upload
   //     unallocated pages on the CPU).
   //   - Buffer tiles have 64 KB size on Direct3D 12. Vulkan has its own
@@ -568,6 +581,8 @@ class TextureCache {
   // Checks if there are any pages that contain scaled resolve data within the
   // range.
   bool IsRangeScaledResolved(uint32_t start_unscaled, uint32_t length_unscaled);
+  void RemoveScaledResolveRanges(uint32_t address_first, uint32_t address_last);
+  void RemoveUnscaledGpuWriteRanges(uint32_t address_first, uint32_t address_last);
   // Global shared memory invalidation callback for invalidating scaled resolved
   // texture data.
   static void ScaledResolveGlobalWatchCallbackThunk(
@@ -593,6 +608,8 @@ class TextureCache {
   // >> 12 for 4 KB pages, >> 5 for uint32_t level 1 bits, >> 6 for uint64_t
   // level 2 bits.
   uint64_t scaled_resolve_pages_l2_[SharedMemory::kBufferSize >> (12 + 5 + 6)];
+  std::vector<ScaledResolveRange> scaled_resolve_ranges_;
+  std::vector<std::pair<uint32_t, uint32_t>> unscaled_gpu_write_ranges_;
 
   // Global watch for scaled resolve data invalidation.
   SharedMemory::GlobalWatchHandle scaled_resolve_global_watch_handle_ = nullptr;

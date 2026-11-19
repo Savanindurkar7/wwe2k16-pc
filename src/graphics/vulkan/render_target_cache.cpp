@@ -9,12 +9,14 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <cstdlib>
 #include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <string>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -37,9 +39,16 @@
 #include <rex/math.h>
 #include <rex/ui/vulkan/util.h>
 
+#include "gpu_timing.h"
+
 REXCVAR_DEFINE_STRING(render_target_path_vulkan, "", "GPU/Vulkan",
                       "Vulkan render target implementation path")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_BOOL(vulkan_rt_update_fast_path, true, "GPU/Vulkan",
+                    "Skip the render target cache update for a draw whose render target inputs equal the previous "
+                    "draw's when nothing else changed the cache in between");
+REXCVAR_DECLARE(bool, debug_rt_cache_ownership);
 
 // DEFINE_string(
 //     render_target_path_vulkan, "",
@@ -93,6 +102,41 @@ namespace shaders {
 #include "../shaders/vulkan_spirv/resolve_full_8bpp_cs.h"
 #include "../shaders/vulkan_spirv/resolve_full_8bpp_scaled_cs.h"
 }  // namespace shaders
+
+namespace {
+
+// Prebuilt resolve SPIR-V stores EDRAM ring sizes in OpConstant instructions.
+// Replace just the single ring constant per shader module, keeping the original
+// arrays untouched so the 2048-tile mode continues to use the exact same words.
+bool PatchEdramResolveSpirvRingConstant(std::vector<uint32_t>& spirv, uint32_t from,
+                                        uint32_t to) {
+  constexpr uint32_t kSpirvMagic = 0x07230203;
+  constexpr uint32_t kSpirvHeaderWords = 5;
+  constexpr uint32_t kOpConstant = 43;
+  if (spirv.size() < kSpirvHeaderWords || spirv[0] != kSpirvMagic) {
+    return false;
+  }
+
+  size_t patched_constants = 0;
+  for (size_t word_index = kSpirvHeaderWords; word_index < spirv.size();) {
+    const uint32_t instruction = spirv[word_index];
+    const uint32_t instruction_word_count = instruction >> 16;
+    const uint32_t opcode = instruction & 0xFFFF;
+    if (!instruction_word_count || instruction_word_count > spirv.size() - word_index) {
+      return false;
+    }
+    // A 32-bit OpConstant is [instruction, type id, result id, literal].
+    if (opcode == kOpConstant && instruction_word_count == 4 &&
+        spirv[word_index + 3] == from) {
+      spirv[word_index + 3] = to;
+      ++patched_constants;
+    }
+    word_index += instruction_word_count;
+  }
+  return patched_constants == 1;
+}
+
+}  // namespace
 
 const VulkanRenderTargetCache::ResolveCopyShaderCode
     VulkanRenderTargetCache::kResolveCopyShaders[size_t(
@@ -481,7 +525,7 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
   // maxStorageBufferRange.
   if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
           vulkan_device,
-          VkDeviceSize(xenos::kEdramSizeBytes *
+           VkDeviceSize(xenos::GetEdramSizeBytes() *
                        (draw_resolution_scale_x() * draw_resolution_scale_y())),
           VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
@@ -553,6 +597,42 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
   dfn.vkUpdateDescriptorSets(device, 1, &edram_storage_buffer_descriptor_write, 0, nullptr);
 
   bool draw_resolution_scaled = IsDrawResolutionScaled();
+  const bool extended_edram = xenos::GetEdramTileCount() == xenos::kEdramMaxTileCount;
+  std::vector<std::string> patched_resolve_shader_names;
+
+  // The unscaled compute shaders reduce EDRAM dword addresses modulo
+  // 2048 * 1280 (2,621,440). Scaled variants compute the same wrap as
+  // tile_stride * 2048. For 4096 tiles, patch only those ring constants to
+  // 5,242,880 or 4096 respectively. The 2047 masks elsewhere extract the
+  // 11-bit Xenos base-tile field or resolve-width bitfield, not the EDRAM ring.
+  auto create_resolve_compute_pipeline = [&](VkPipelineLayout pipeline_layout,
+                                             const uint32_t* shader_code,
+                                             size_t shader_code_size_bytes,
+                                             const std::string& shader_name) {
+    if (!extended_edram) {
+      return ui::vulkan::util::CreateComputePipeline(vulkan_device, pipeline_layout, shader_code,
+                                                     shader_code_size_bytes);
+    }
+    if (shader_code_size_bytes % sizeof(uint32_t)) {
+      REXGPU_ERROR("VulkanRenderTargetCache: Invalid SPIR-V size for {}", shader_name);
+      return VkPipeline(VK_NULL_HANDLE);
+    }
+    std::vector<uint32_t> patched_shader(
+        shader_code, shader_code + shader_code_size_bytes / sizeof(uint32_t));
+    const uint32_t ring_constant_from = draw_resolution_scaled ? 2048 : 2621440;
+    const uint32_t ring_constant_to = draw_resolution_scaled ? 4096 : 5242880;
+    if (!PatchEdramResolveSpirvRingConstant(patched_shader, ring_constant_from,
+                                           ring_constant_to)) {
+      REXGPU_ERROR(
+          "VulkanRenderTargetCache: Expected exactly one EDRAM ring constant {} in {}, "
+          "refusing the 4096-tile shader",
+          ring_constant_from, shader_name);
+      return VkPipeline(VK_NULL_HANDLE);
+    }
+    patched_resolve_shader_names.push_back(shader_name);
+    return ui::vulkan::util::CreateComputePipeline(vulkan_device, pipeline_layout,
+                                                   patched_shader.data(), shader_code_size_bytes);
+  };
 
   // Resolve copy pipeline layout.
   VkDescriptorSetLayout resolve_copy_descriptor_set_layouts[kResolveCopyDescriptorSetCount] = {};
@@ -624,12 +704,16 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
     // Somewhat verification whether resolve_copy_shaders_ is up to date.
     assert_true(resolve_copy_shader_code.unscaled && resolve_copy_shader_code.unscaled_size_bytes &&
                 resolve_copy_shader_code.scaled && resolve_copy_shader_code.scaled_size_bytes);
-    VkPipeline resolve_copy_pipeline = ui::vulkan::util::CreateComputePipeline(
-        vulkan_device, resolve_copy_pipeline_layout_,
+    const std::string resolve_copy_shader_name =
+        std::string(resolve_copy_shader_info.debug_name) +
+        (draw_resolution_scaled ? " (scaled)" : " (unscaled)");
+    VkPipeline resolve_copy_pipeline = create_resolve_compute_pipeline(
+        resolve_copy_pipeline_layout_,
         draw_resolution_scaled ? resolve_copy_shader_code.scaled
                                : resolve_copy_shader_code.unscaled,
         draw_resolution_scaled ? resolve_copy_shader_code.scaled_size_bytes
-                               : resolve_copy_shader_code.unscaled_size_bytes);
+                               : resolve_copy_shader_code.unscaled_size_bytes,
+        resolve_copy_shader_name);
     if (resolve_copy_pipeline == VK_NULL_HANDLE) {
       REXGPU_ERROR(
           "VulkanRenderTargetCache: Failed to create the resolve copy "
@@ -709,7 +793,8 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
         vulkan_device, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
         std::max(
             ui::vulkan::VulkanUploadBufferPool::kDefaultPageSize,
-            sizeof(float) * 2 * 6 * Transfer::kMaxCutoutBorderRectangles * xenos::kEdramTileCount));
+            sizeof(float) * 2 * 6 * Transfer::kMaxCutoutBorderRectangles *
+                xenos::GetEdramTileCount()));
 
     // Transfer vertex shader.
     transfer_passthrough_vertex_shader_ =
@@ -862,12 +947,14 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
       Shutdown();
       return false;
     }
-    resolve_fsi_clear_32bpp_pipeline_ = ui::vulkan::util::CreateComputePipeline(
-        vulkan_device, resolve_fsi_clear_pipeline_layout_,
+    resolve_fsi_clear_32bpp_pipeline_ = create_resolve_compute_pipeline(
+        resolve_fsi_clear_pipeline_layout_,
         draw_resolution_scaled ? shaders::resolve_clear_32bpp_scaled_cs
                                : shaders::resolve_clear_32bpp_cs,
         draw_resolution_scaled ? sizeof(shaders::resolve_clear_32bpp_scaled_cs)
-                               : sizeof(shaders::resolve_clear_32bpp_cs));
+                               : sizeof(shaders::resolve_clear_32bpp_cs),
+        draw_resolution_scaled ? "resolve_clear_32bpp (scaled)"
+                               : "resolve_clear_32bpp (unscaled)");
     if (resolve_fsi_clear_32bpp_pipeline_ == VK_NULL_HANDLE) {
       REXGPU_ERROR(
           "VulkanRenderTargetCache: Failed to create the 32bpp resolve EDRAM "
@@ -875,12 +962,14 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
       Shutdown();
       return false;
     }
-    resolve_fsi_clear_64bpp_pipeline_ = ui::vulkan::util::CreateComputePipeline(
-        vulkan_device, resolve_fsi_clear_pipeline_layout_,
+    resolve_fsi_clear_64bpp_pipeline_ = create_resolve_compute_pipeline(
+        resolve_fsi_clear_pipeline_layout_,
         draw_resolution_scaled ? shaders::resolve_clear_64bpp_scaled_cs
                                : shaders::resolve_clear_64bpp_cs,
         draw_resolution_scaled ? sizeof(shaders::resolve_clear_64bpp_scaled_cs)
-                               : sizeof(shaders::resolve_clear_64bpp_cs));
+                               : sizeof(shaders::resolve_clear_64bpp_cs),
+        draw_resolution_scaled ? "resolve_clear_64bpp (scaled)"
+                               : "resolve_clear_64bpp (unscaled)");
     if (resolve_fsi_clear_64bpp_pipeline_ == VK_NULL_HANDLE) {
       REXGPU_ERROR(
           "VulkanRenderTargetCache: Failed to create the 64bpp resolve EDRAM "
@@ -969,6 +1058,17 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
   last_update_framebuffer_ = VK_NULL_HANDLE;
 
   InitializeCommon();
+  if (extended_edram) {
+    std::string patched_shader_list;
+    for (const std::string& shader_name : patched_resolve_shader_names) {
+      if (!patched_shader_list.empty()) {
+        patched_shader_list += ", ";
+      }
+      patched_shader_list += shader_name;
+    }
+    REXGPU_INFO("[rex-edram] Vulkan 4096-tile prebuilt resolve SPIR-V patched: {}",
+                patched_shader_list);
+  }
   return true;
 }
 
@@ -1096,6 +1196,7 @@ void VulkanRenderTargetCache::Shutdown(bool from_destructor) {
 }
 
 void VulkanRenderTargetCache::ClearCache() {
+  InvalidateUpdateFastPath();
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
@@ -1118,6 +1219,7 @@ void VulkanRenderTargetCache::ClearCache() {
 }
 
 void VulkanRenderTargetCache::CompletedSubmissionUpdated() {
+  InvalidateUpdateFastPath();
   if (edram_snapshot_restore_pool_) {
     edram_snapshot_restore_pool_->Reclaim(command_processor_.GetCompletedSubmission());
   }
@@ -1127,6 +1229,7 @@ void VulkanRenderTargetCache::CompletedSubmissionUpdated() {
 }
 
 void VulkanRenderTargetCache::EndSubmission() {
+  InvalidateUpdateFastPath();
   if (edram_snapshot_restore_pool_) {
     edram_snapshot_restore_pool_->FlushWrites();
   }
@@ -1148,6 +1251,7 @@ void VulkanRenderTargetCache::ResetTraceDownload() {
 }
 
 bool VulkanRenderTargetCache::InitializeTraceSubmitDownloads() {
+  InvalidateUpdateFastPath();
   ResetTraceDownload();
 
   if (IsDrawResolutionScaled()) {
@@ -1156,7 +1260,7 @@ bool VulkanRenderTargetCache::InitializeTraceSubmitDownloads() {
   }
 
   if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
-          command_processor_.GetVulkanDevice(), xenos::kEdramSizeBytes,
+          command_processor_.GetVulkanDevice(), xenos::GetEdramSizeBytes(),
           VK_BUFFER_USAGE_TRANSFER_DST_BIT, ui::vulkan::util::MemoryPurpose::kReadback,
           edram_snapshot_download_buffer_, edram_snapshot_download_buffer_memory_,
           &edram_snapshot_download_buffer_memory_type_,
@@ -1170,7 +1274,7 @@ bool VulkanRenderTargetCache::InitializeTraceSubmitDownloads() {
 
   if (GetPath() == Path::kHostRenderTargets) {
     // Dump all host render targets to edram_buffer_.
-    if (!DumpRenderTargets(0, xenos::kEdramTileCount, 1, xenos::kEdramTileCount)) {
+    if (!DumpRenderTargets(0, xenos::GetEdramTileCount(), 1, xenos::GetEdramTileCount())) {
       REXGPU_ERROR("VulkanRenderTargetCache: Failed to dump host render targets for trace");
       ResetTraceDownload();
       return false;
@@ -1183,7 +1287,7 @@ bool VulkanRenderTargetCache::InitializeTraceSubmitDownloads() {
   VkBufferCopy edram_download_copy;
   edram_download_copy.srcOffset = 0;
   edram_download_copy.dstOffset = 0;
-  edram_download_copy.size = xenos::kEdramSizeBytes;
+  edram_download_copy.size = xenos::GetEdramSizeBytes();
   command_buffer.CmdVkCopyBuffer(edram_buffer_, edram_snapshot_download_buffer_, 1,
                                  &edram_download_copy);
   command_processor_.PushBufferMemoryBarrier(
@@ -1193,6 +1297,7 @@ bool VulkanRenderTargetCache::InitializeTraceSubmitDownloads() {
 }
 
 void VulkanRenderTargetCache::InitializeTraceCompleteDownloads() {
+  InvalidateUpdateFastPath();
   if (edram_snapshot_download_buffer_memory_ == VK_NULL_HANDLE) {
     return;
   }
@@ -1210,7 +1315,7 @@ void VulkanRenderTargetCache::InitializeTraceCompleteDownloads() {
       edram_snapshot_download_memory_range.memory = edram_snapshot_download_buffer_memory_;
       edram_snapshot_download_memory_range.offset = 0;
       edram_snapshot_download_memory_range.size =
-          std::min(rex::round_up(VkDeviceSize(xenos::kEdramSizeBytes),
+          std::min(rex::round_up(VkDeviceSize(xenos::GetEdramSizeBytes()),
                                  vulkan_device->properties().nonCoherentAtomSize),
                    edram_snapshot_download_buffer_memory_size_);
       dfn.vkInvalidateMappedMemoryRanges(device, 1, &edram_snapshot_download_memory_range);
@@ -1228,6 +1333,7 @@ void VulkanRenderTargetCache::InitializeTraceCompleteDownloads() {
 }
 
 void VulkanRenderTargetCache::RestoreEdramSnapshot(const void* snapshot) {
+  InvalidateUpdateFastPath();
   if (IsDrawResolutionScaled()) {
     // No 1:1 mapping.
     return;
@@ -1236,12 +1342,12 @@ void VulkanRenderTargetCache::RestoreEdramSnapshot(const void* snapshot) {
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
   if (!edram_snapshot_restore_pool_) {
     edram_snapshot_restore_pool_ = std::make_unique<ui::vulkan::VulkanUploadBufferPool>(
-        vulkan_device, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, xenos::kEdramSizeBytes);
+        vulkan_device, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, xenos::GetEdramSizeBytes());
   }
   VkBuffer upload_buffer;
   VkDeviceSize upload_buffer_offset;
   uint8_t* upload_buffer_mapping = edram_snapshot_restore_pool_->Request(
-      command_processor_.GetCurrentSubmission(), xenos::kEdramSizeBytes, 1, upload_buffer,
+      command_processor_.GetCurrentSubmission(), xenos::GetEdramSizeBytes(), 1, upload_buffer,
       upload_buffer_offset);
   if (!upload_buffer_mapping) {
     REXGPU_ERROR(
@@ -1264,8 +1370,8 @@ void VulkanRenderTargetCache::RestoreEdramSnapshot(const void* snapshot) {
       assert_false(full_edram_render_target->key().is_depth);
       assert_false(full_edram_render_target->key().Is64bpp());
       uint32_t pitch_tiles = full_edram_render_target->key().pitch_tiles_at_32bpp;
-      uint32_t tile_rows = xenos::kEdramTileCount / pitch_tiles;
-      assert_true(pitch_tiles * tile_rows == xenos::kEdramTileCount);
+      uint32_t tile_rows = xenos::GetEdramTileCount() / pitch_tiles;
+      assert_true(pitch_tiles * tile_rows == xenos::GetEdramTileCount());
       uint32_t row_pitch_samples = pitch_tiles * xenos::kEdramTileWidthSamples;
       VkDeviceSize row_pitch_bytes = VkDeviceSize(row_pitch_samples) * sizeof(uint32_t);
       const uint8_t* snapshot_sample_row = reinterpret_cast<const uint8_t*>(snapshot);
@@ -1313,13 +1419,13 @@ void VulkanRenderTargetCache::RestoreEdramSnapshot(const void* snapshot) {
     } break;
 
     case Path::kPixelShaderInterlock: {
-      std::memcpy(upload_buffer_mapping, snapshot, xenos::kEdramSizeBytes);
+      std::memcpy(upload_buffer_mapping, snapshot, xenos::GetEdramSizeBytes());
       UseEdramBuffer(EdramBufferUsage::kTransferWrite);
       command_processor_.SubmitBarriers(true);
       VkBufferCopy copy_region = {};
       copy_region.srcOffset = upload_buffer_offset;
       copy_region.dstOffset = 0;
-      copy_region.size = xenos::kEdramSizeBytes;
+      copy_region.size = xenos::GetEdramSizeBytes();
       command_buffer.CmdVkCopyBuffer(upload_buffer, edram_buffer_, 1, &copy_region);
     } break;
 
@@ -1332,6 +1438,7 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
                                       VulkanSharedMemory& shared_memory,
                                       VulkanTextureCache& texture_cache,
                                       uint32_t& written_address_out, uint32_t& written_length_out) {
+  InvalidateUpdateFastPath();
   written_address_out = 0;
   written_length_out = 0;
 
@@ -1348,6 +1455,7 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
   if (!resolve_info.coordinate_info.width_div_8 || !resolve_info.height_div_8) {
     return true;
   }
+  command_processor_.SetGpuTimingCategory(GpuTimingCategory::kResolve);
 
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
@@ -1455,7 +1563,8 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
           write_descriptor_set_dest.pTexelBufferView = nullptr;
           dfn.vkUpdateDescriptorSets(device, 1, &write_descriptor_set_dest, 0, nullptr);
 
-          // Submit the resolve.
+        // Submit the resolve.
+          command_processor_.SetGpuTimingCategory(GpuTimingCategory::kResolve);
           if (draw_resolution_scaled) {
             texture_cache.UseScaledResolveBufferForWrite(copy_dest_use_start, copy_dest_use_length);
           } else {
@@ -1491,10 +1600,19 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
 
           // Invalidate textures and mark the range as scaled if needed.
           texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
-                                            resolve_info.copy_dest_extent_length);
+                                            resolve_info.copy_dest_extent_length,
+                                            copy_shader_info.dest_pixel_size_log2,
+                                            draw_resolution_scaled);
           written_address_out = resolve_info.copy_dest_extent_start;
           written_length_out = resolve_info.copy_dest_extent_length;
           copied = true;
+          // Content probe: after the resolve copy dispatch, record a deferred
+          // readback sample of the destination (cvar default off; guest
+          // physical memory is never touched).
+          if (resolve_info.copy_dest_extent_length && REXCVAR_GET(gpu_content_probe) &&
+              !draw_resolution_scaled) {
+            command_processor_.ContentProbeRecordResolveSample(resolve_info);
+          }
         }
       }
     }
@@ -1526,6 +1644,7 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
         cleared = true;
       } break;
       case Path::kPixelShaderInterlock: {
+        command_processor_.SetGpuTimingCategory(GpuTimingCategory::kResolve);
         UseEdramBuffer(EdramBufferUsage::kComputeWrite);
         // Should be safe to only commit once (if was accessed as unordered or
         // with fragment shader interlock previously - if there was nothing to
@@ -1574,6 +1693,9 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
       default:
         assert_unhandled_case(GetPath());
     }
+    if (cleared && REXCVAR_GET(gpu_content_probe)) {
+      command_processor_.IncrementClearCount();
+    }
   } else {
     cleared = true;
   }
@@ -1584,6 +1706,42 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
 bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
                                      reg::RB_DEPTHCONTROL normalized_depth_control,
                                      uint32_t normalized_color_mask, const Shader& vertex_shader) {
+  // Fast path: every input of RenderTargetCache::Update and of the host render target part below - the render
+  // target registers, the normalized masks, and the registers DrawExtentEstimator::EstimateMaxY reads. Clip-disabled
+  // draws may estimate the extent from vertex data on the CPU, so they always take the full path.
+  UpdateFastPathKey fast_path_key;
+  bool fast_path_key_valid = false;
+  if (REXCVAR_GET(vulkan_rt_update_fast_path) && GetPath() == Path::kHostRenderTargets &&
+      !REXCVAR_GET(debug_rt_cache_ownership)) {
+    const RegisterFile& regs = register_file();
+    if (!regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable) {
+      static constexpr uint32_t kKeyRegisters[] = {
+          XE_GPU_REG_RB_SURFACE_INFO,         XE_GPU_REG_RB_DEPTH_INFO,
+          XE_GPU_REG_RB_COLOR_INFO,           XE_GPU_REG_RB_COLOR1_INFO,
+          XE_GPU_REG_RB_COLOR2_INFO,          XE_GPU_REG_RB_COLOR3_INFO,
+          XE_GPU_REG_RB_MODECONTROL,          XE_GPU_REG_PA_SC_WINDOW_OFFSET,
+          XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL, XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR,
+          XE_GPU_REG_PA_SC_SCREEN_SCISSOR_BR, XE_GPU_REG_PA_CL_CLIP_CNTL,
+          XE_GPU_REG_PA_CL_VTE_CNTL,          XE_GPU_REG_PA_SU_SC_MODE_CNTL,
+          XE_GPU_REG_PA_SU_VTX_CNTL,          XE_GPU_REG_PA_CL_VPORT_YOFFSET,
+          XE_GPU_REG_PA_CL_VPORT_YSCALE,
+      };
+      static_assert(sizeof(kKeyRegisters) / sizeof(kKeyRegisters[0]) ==
+                    sizeof(fast_path_key.registers) / sizeof(fast_path_key.registers[0]));
+      for (size_t i = 0; i < sizeof(kKeyRegisters) / sizeof(kKeyRegisters[0]); ++i) {
+        fast_path_key.registers[i] = regs[kKeyRegisters[i]];
+      }
+      fast_path_key.normalized_depth_control = normalized_depth_control.value;
+      fast_path_key.normalized_color_mask = normalized_color_mask;
+      fast_path_key.is_rasterization_done = is_rasterization_done;
+      fast_path_key_valid = true;
+      if (update_fast_path_valid_ && fast_path_key == last_update_fast_path_key_) {
+        return true;
+      }
+    }
+  }
+  update_fast_path_valid_ = false;
+
   if (!RenderTargetCache::Update(is_rasterization_done, normalized_depth_control,
                                  normalized_color_mask, vertex_shader)) {
     return false;
@@ -1713,6 +1871,10 @@ bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
       return false;
   }
 
+  if (fast_path_key_valid) {
+    last_update_fast_path_key_ = fast_path_key;
+    update_fast_path_valid_ = true;
+  }
   return true;
 }
 
@@ -2061,6 +2223,15 @@ uint32_t VulkanRenderTargetCache::GetMaxRenderTargetHeight() const {
 }
 
 RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(RenderTargetKey key) {
+  // Diagnostic (WWE2K16_GPU_STATS=1): every host render target created, with its MSAA sample count.
+  static const bool gpu_stats = [] {
+    const char* v = std::getenv("WWE2K16_GPU_STATS");
+    return v && v[0] == '1';
+  }();
+  if (gpu_stats) {
+    REXGPU_INFO("[gpu-stats] render target {} base {} pitch {} tiles msaa {}x", key.GetFormatName(),
+                uint32_t(key.base_tiles), key.GetPitchTiles(), 1u << uint32_t(key.msaa_samples));
+  }
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
@@ -3192,8 +3363,8 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
 
   // Transform the destination 32bpp tile index into the source. After the
   // addition, it may be negative - in which case, the transfer is done across
-  // EDRAM addressing wrapping, and xenos::kEdramTileCount must be added to it,
-  // but `& (xenos::kEdramTileCount - 1)` handles that regardless of the sign.
+  // EDRAM addressing wrapping, and GetEdramTileCount() must be added to it,
+  // but the mask by GetEdramTileCount() - 1 handles that regardless of the sign.
   spv::Id source_tile_index = builder.createBinOp(
       spv::OpBitwiseAnd, type_uint,
       builder.createUnaryOp(
@@ -3205,7 +3376,7 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
                                   builder.createUnaryOp(spv::OpBitcast, type_int, address_constant),
                                   builder.makeUintConstant(xenos::kEdramPitchTilesBits * 2),
                                   builder.makeUintConstant(xenos::kEdramBaseTilesBits + 1)))),
-      builder.makeUintConstant(xenos::kEdramTileCount - 1));
+      builder.makeUintConstant(xenos::GetEdramTileCount() - 1));
   // Split the source 32bpp tile index into X and Y tile index within the source
   // image.
   spv::Id source_pitch_tiles =
@@ -4194,8 +4365,8 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
             // Transform the destination tile index into the host depth source.
             // After the addition, it may be negative - in which case, the
             // transfer is done across EDRAM addressing wrapping, and
-            // xenos::kEdramTileCount must be added to it, but
-            // `& (xenos::kEdramTileCount - 1)` handles that regardless of the
+            // GetEdramTileCount() must be added to it, but
+            // masking by GetEdramTileCount() - 1 handles that regardless of the
             // sign.
             spv::Id host_depth_source_tile_index = builder.createBinOp(
                 spv::OpBitwiseAnd, type_uint,
@@ -4210,7 +4381,7 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
                                                   host_depth_address_constant),
                             builder.makeUintConstant(xenos::kEdramPitchTilesBits * 2),
                             builder.makeUintConstant(xenos::kEdramBaseTilesBits + 1)))),
-                builder.makeUintConstant(xenos::kEdramTileCount - 1));
+                builder.makeUintConstant(xenos::GetEdramTileCount() - 1));
             // Split the host depth source tile index into X and Y tile index
             // within the source image.
             spv::Id host_depth_source_pitch_tiles =
@@ -4414,7 +4585,13 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
         }
       } break;
       case TransferOutput::kStencilBit: {
-        if (packed) {
+        // Depth-to-stencil-bit transfers only need the stencil aspect, so the
+        // depth image and the combined depth/stencil `packed` value are not
+        // created for this mode. Use the separately loaded stencil sample in
+        // that case; color-to-stencil-bit transfers continue to use `packed`.
+        spv::Id stencil_bit_value =
+            source_stencil[0] != spv::NoResult ? source_stencil[0] : packed;
+        if (stencil_bit_value != spv::NoResult) {
           // Kill the sample if the needed stencil bit is not set.
           assert_true(push_constants_member_stencil_mask != UINT32_MAX);
           id_vector_temp.clear();
@@ -4427,7 +4604,8 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
           SpirvBuilder::IfBuilder stencil_kill_if(
               builder.createBinOp(
                   spv::OpIEqual, type_bool,
-                  builder.createBinOp(spv::OpBitwiseAnd, type_uint, packed, stencil_mask_constant),
+                  builder.createBinOp(spv::OpBitwiseAnd, type_uint, stencil_bit_value,
+                                      stencil_mask_constant),
                   builder.makeUintConstant(0)),
               spv::SelectionControlMaskNone, builder);
           builder.createNoResultOp(spv::OpKill);
@@ -4755,6 +4933,7 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
     const std::vector<Transfer>* render_target_transfers,
     const uint64_t* render_target_resolve_clear_values,
     const Transfer::Rectangle* resolve_clear_rectangle) {
+  command_processor_.SetGpuTimingCategory(GpuTimingCategory::kRtTransfer);
   assert_true(GetPath() == Path::kHostRenderTargets);
 
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
@@ -5781,7 +5960,7 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
       builder.createBinOp(
           spv::OpIMul, type_uint, builder.makeUintConstant(tile_width * tile_height),
           builder.createBinOp(spv::OpBitwiseAnd, type_uint, edram_tile_index_non_wrapped,
-                              builder.makeUintConstant(xenos::kEdramTileCount - 1))),
+                              builder.makeUintConstant(xenos::GetEdramTileCount() - 1))),
       builder.createBinOp(
           spv::OpIAdd, type_uint,
           builder.createBinOp(spv::OpIMul, type_uint, const_tile_width, tile_sample_y),
@@ -6225,6 +6404,7 @@ bool VulkanRenderTargetCache::TryResolveCopyDirectly(const draw_util::ResolveInf
 
 bool VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dump_row_length_used,
                                                 uint32_t dump_rows, uint32_t dump_pitch) {
+  command_processor_.SetGpuTimingCategory(GpuTimingCategory::kEdramDump);
   assert_true(GetPath() == Path::kHostRenderTargets);
 
   GetResolveCopyRectanglesToDump(dump_base, dump_row_length_used, dump_rows, dump_pitch,

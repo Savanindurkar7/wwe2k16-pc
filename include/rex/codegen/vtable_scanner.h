@@ -68,8 +68,13 @@ class VTableScanner {
   // Find all Complete Object Locators in .rdata
   std::vector<uint32_t> findCompleteObjectLocators();
 
-  // Find the vtable that references a given COL (COL is at vtable[-1])
-  std::optional<uint32_t> findVTableForCOL(uint32_t colAddr);
+  // Find EVERY vtable that references a given COL (the COL sits at vtable[-1]).
+  // Returns all matches, not just the first: a class with multiple inheritance
+  // has one vtable per base subobject with a vfptr, and the linker may fold
+  // identical COLs (/OPT:ICF) so several vtables share one. Returning only the
+  // first silently drops every secondary-base vtable -- and adjustor/dispatch
+  // thunks live precisely in those.
+  std::vector<uint32_t> findVTablesForCOL(uint32_t colAddr);
 
   // Read all function slots from a vtable (until non-executable address)
   std::vector<uint32_t> readVTableSlots(uint32_t vtableStart);

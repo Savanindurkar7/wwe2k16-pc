@@ -50,7 +50,7 @@ class WindowedApp {
 
   WindowedAppContext& app_context() const { return app_context_; }
 
-  // Same as the executable (project), xenia-library-app.
+  // Same as the executable (project), runtime-library-app.
   const std::string& GetName() const { return name_; }
   const std::string& GetPositionalOptionsUsage() const { return positional_options_usage_; }
   const std::vector<std::string>& GetPositionalOptions() const { return positional_options_; }

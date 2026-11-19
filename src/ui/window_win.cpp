@@ -20,6 +20,7 @@
 #include <rex/graphics/flags.h>
 #include <rex/graphics/video_mode_util.h>
 #include <rex/logging.h>
+#include <rex/ui/clipboard.h>
 #include <rex/ui/flags.h>
 #include <rex/ui/surface_win.h>
 #include <rex/ui/window_win.h>
@@ -35,6 +36,9 @@
 #include <dwmapi.h>
 #include <shellapi.h>
 #include <tpcshrd.h>
+
+REXCVAR_DEFINE_BOOL(display_refresh_match, true, "UI/Window",
+                    "Match non-60-multiple fullscreen display refresh rates to a multiple of 60");
 
 namespace {
 
@@ -97,6 +101,35 @@ HMONITOR GetMonitorByIndex(int32_t index) {
 namespace rex {
 namespace ui {
 
+std::optional<std::u16string> GetClipboardText() {
+  if (!OpenClipboard(nullptr)) {
+    return std::nullopt;
+  }
+
+  HANDLE clipboard_data = GetClipboardData(CF_UNICODETEXT);
+  if (!clipboard_data) {
+    CloseClipboard();
+    return std::nullopt;
+  }
+
+  const auto* clipboard_text = static_cast<const wchar_t*>(GlobalLock(clipboard_data));
+  if (!clipboard_text) {
+    CloseClipboard();
+    return std::nullopt;
+  }
+
+  static_assert(sizeof(wchar_t) == sizeof(char16_t));
+  const SIZE_T text_capacity = GlobalSize(clipboard_data) / sizeof(wchar_t);
+  std::u16string text;
+  for (SIZE_T i = 0; i < text_capacity && clipboard_text[i] != L'\0'; ++i) {
+    text.push_back(static_cast<char16_t>(clipboard_text[i]));
+  }
+
+  GlobalUnlock(clipboard_data);
+  CloseClipboard();
+  return text;
+}
+
 std::unique_ptr<Window> Window::Create(WindowedAppContext& app_context,
                                        const std::string_view title, uint32_t desired_logical_width,
                                        uint32_t desired_logical_height) {
@@ -115,6 +148,7 @@ Win32Window::Win32Window(WindowedAppContext& app_context, const std::string_view
 
 Win32Window::~Win32Window() {
   EnterDestructor();
+  RestoreDisplayRefreshMode();
   if (cursor_auto_hide_timer_) {
     DeleteTimerQueueTimer(nullptr, cursor_auto_hide_timer_, nullptr);
     cursor_auto_hide_timer_ = nullptr;
@@ -420,6 +454,16 @@ void Win32Window::ApplyNewFullscreen() {
     // WM_SIZE).
     BeginBatchedSizeUpdate();
 
+    // Restore the display mode while size notifications are batched so the
+    // windowed placement is restored against the monitor's normal geometry.
+    RestoreDisplayRefreshMode(&destruction_receiver);
+    if (destruction_receiver.IsWindowDestroyedOrClosed()) {
+      if (!destruction_receiver.IsWindowDestroyed()) {
+        EndBatchedSizeUpdate(destruction_receiver);
+      }
+      return;
+    }
+
     // Reinstate the non-client area.
     SetWindowLong(hwnd_, GWL_STYLE, GetWindowLong(hwnd_, GWL_STYLE) | WS_OVERLAPPEDWINDOW);
     if (destruction_receiver.IsWindowDestroyedOrClosed()) {
@@ -692,6 +736,123 @@ uint32_t Win32Window::GetCurrentDpi() const {
   return GetCurrentSystemDpi();
 }
 
+void Win32Window::ApplyDisplayRefreshMatch(
+    const WCHAR* device_name, WindowDestructionReceiver& destruction_receiver) {
+  DEVMODEW original_mode = {};
+  original_mode.dmSize = sizeof(original_mode);
+  if (!EnumDisplaySettingsExW(device_name, ENUM_CURRENT_SETTINGS, &original_mode, 0)) {
+    REXLOG_INFO(
+        "[display-refresh-match] original mode: unavailable (EnumDisplaySettingsExW failed)");
+    REXLOG_INFO("[display-refresh-match] chosen mode: none (original mode unavailable)");
+    REXLOG_INFO("[display-refresh-match] apply result: not attempted");
+    return;
+  }
+
+  REXLOG_INFO("[display-refresh-match] original mode: {}x{}x{} @ {} Hz",
+              original_mode.dmPelsWidth, original_mode.dmPelsHeight,
+              original_mode.dmBitsPerPel, original_mode.dmDisplayFrequency);
+
+  if (!REXCVAR_GET(display_refresh_match)) {
+    REXLOG_INFO("[display-refresh-match] chosen mode: none (display_refresh_match=false)");
+    REXLOG_INFO("[display-refresh-match] apply result: not attempted");
+    return;
+  }
+  if (display_refresh_mode_changed_ || display_refresh_operation_in_progress_) {
+    REXLOG_INFO(
+        "[display-refresh-match] chosen mode: none (a display mode change is already active)");
+    REXLOG_INFO("[display-refresh-match] apply result: not attempted");
+    return;
+  }
+  if (!(original_mode.dmFields & DM_DISPLAYFREQUENCY) || !original_mode.dmDisplayFrequency) {
+    REXLOG_INFO("[display-refresh-match] chosen mode: none (original refresh rate unavailable)");
+    REXLOG_INFO("[display-refresh-match] apply result: not attempted");
+    return;
+  }
+  if (original_mode.dmDisplayFrequency % 60 == 0) {
+    REXLOG_INFO(
+        "[display-refresh-match] chosen mode: none (original refresh is already a multiple of 60)");
+    REXLOG_INFO("[display-refresh-match] apply result: not attempted");
+    return;
+  }
+  // 59/119/239 Hz are NTSC-style 59.94 Hz multiples (common on TVs over HDMI). Switching them
+  // to 60/120/240 Hz makes the display re-sync, and on an Intel UHD 630 the swapchain created
+  // right after the switch stayed black until Alt+Tab (an Intel UHD 630 test PC, 2026-10-03). They
+  // are within 0.1% of a 60 Hz multiple, so keep the original mode.
+  if ((original_mode.dmDisplayFrequency + 1) % 60 == 0) {
+    REXLOG_INFO(
+        "[display-refresh-match] chosen mode: none (original refresh is a 59.94 Hz-style multiple of 60)");
+    REXLOG_INFO("[display-refresh-match] apply result: not attempted");
+    return;
+  }
+
+  DEVMODEW chosen_mode = {};
+  DWORD chosen_refresh = 0;
+  const DWORD required_fields =
+      DM_PELSWIDTH | DM_PELSHEIGHT | DM_BITSPERPEL | DM_DISPLAYFREQUENCY;
+  for (DWORD mode_index = 0;; ++mode_index) {
+    DEVMODEW candidate = {};
+    candidate.dmSize = sizeof(candidate);
+    if (!EnumDisplaySettingsExW(device_name, mode_index, &candidate, 0)) {
+      break;
+    }
+    if ((candidate.dmFields & required_fields) != required_fields ||
+        candidate.dmPelsWidth != original_mode.dmPelsWidth ||
+        candidate.dmPelsHeight != original_mode.dmPelsHeight ||
+        candidate.dmBitsPerPel != original_mode.dmBitsPerPel ||
+        !candidate.dmDisplayFrequency || candidate.dmDisplayFrequency % 60 != 0 ||
+        candidate.dmDisplayFrequency <= chosen_refresh) {
+      continue;
+    }
+    chosen_mode = candidate;
+    chosen_refresh = candidate.dmDisplayFrequency;
+  }
+
+  if (!chosen_refresh) {
+    REXLOG_INFO(
+        "[display-refresh-match] chosen mode: none (no supported 60 Hz multiple at the same resolution and bit depth)");
+    REXLOG_INFO("[display-refresh-match] apply result: not attempted");
+    return;
+  }
+
+  REXLOG_INFO("[display-refresh-match] chosen mode: {}x{}x{} @ {} Hz",
+              chosen_mode.dmPelsWidth, chosen_mode.dmPelsHeight,
+              chosen_mode.dmBitsPerPel, chosen_mode.dmDisplayFrequency);
+
+  display_refresh_device_name_ = device_name;
+  display_refresh_mode_changed_ = true;
+  display_refresh_operation_in_progress_ = true;
+  LONG result =
+      ChangeDisplaySettingsExW(device_name, &chosen_mode, nullptr, CDS_FULLSCREEN, nullptr);
+  REXLOG_INFO("[display-refresh-match] apply result: {}", result);
+  if (destruction_receiver.IsWindowDestroyed()) {
+    return;
+  }
+  display_refresh_operation_in_progress_ = false;
+  if (result != DISP_CHANGE_SUCCESSFUL && !destruction_receiver.IsWindowDestroyedOrClosed()) {
+    display_refresh_mode_changed_ = false;
+    display_refresh_device_name_.clear();
+  }
+}
+
+void Win32Window::RestoreDisplayRefreshMode(WindowDestructionReceiver* destruction_receiver) {
+  if (!display_refresh_mode_changed_ || display_refresh_operation_in_progress_) {
+    return;
+  }
+
+  display_refresh_operation_in_progress_ = true;
+  const std::wstring device_name = display_refresh_device_name_;
+  LONG result = ChangeDisplaySettingsExW(device_name.c_str(), nullptr, nullptr, 0, nullptr);
+  REXLOG_INFO("[display-refresh-match] restore result: {}", result);
+  if (destruction_receiver && destruction_receiver->IsWindowDestroyed()) {
+    return;
+  }
+  display_refresh_operation_in_progress_ = false;
+  if (result == DISP_CHANGE_SUCCESSFUL) {
+    display_refresh_mode_changed_ = false;
+    display_refresh_device_name_.clear();
+  }
+}
+
 void Win32Window::ApplyFullscreenEntry(WindowDestructionReceiver& destruction_receiver) {
   if (!IsFullscreen()) {
     return;
@@ -703,12 +864,17 @@ void Win32Window::ApplyFullscreenEntry(WindowDestructionReceiver& destruction_re
   pre_fullscreen_dpi_ = dpi_;
   pre_fullscreen_placement_.length = sizeof(pre_fullscreen_placement_);
   HMONITOR monitor;
-  MONITORINFO monitor_info;
+  MONITORINFOEXW monitor_info = {};
   monitor_info.cbSize = sizeof(monitor_info);
   if (!GetWindowPlacement(hwnd_, &pre_fullscreen_placement_) ||
       !(monitor = MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST)) ||
-      !GetMonitorInfo(monitor, &monitor_info)) {
+      !GetMonitorInfoW(monitor, &monitor_info)) {
     OnDesiredFullscreenUpdate(false);
+    return;
+  }
+
+  ApplyDisplayRefreshMatch(monitor_info.szDevice, destruction_receiver);
+  if (destruction_receiver.IsWindowDestroyedOrClosed()) {
     return;
   }
   // Preserve values for DPI rescaling of the window in the non-maximized state
@@ -1053,6 +1219,13 @@ LRESULT Win32Window::WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lPar
       if (cursor_auto_hide_timer_) {
         DeleteTimerQueueTimer(nullptr, cursor_auto_hide_timer_, nullptr);
         cursor_auto_hide_timer_ = nullptr;
+      }
+      {
+        WindowDestructionReceiver destruction_receiver(this);
+        RestoreDisplayRefreshMode(&destruction_receiver);
+        if (destruction_receiver.IsWindowDestroyed()) {
+          break;
+        }
       }
       {
         WindowDestructionReceiver destruction_receiver(this);

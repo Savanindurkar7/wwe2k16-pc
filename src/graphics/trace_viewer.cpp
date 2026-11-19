@@ -113,7 +113,7 @@ bool TraceViewer::Setup() {
 
   // Main display window.
   assert_true(app_context().IsInUIThread());
-  window_ = rex::ui::Window::Create(app_context(), "xenia-gpu-trace-viewer", 1920, 1080);
+  window_ = rex::ui::Window::Create(app_context(), "wwe2k16-gpu-trace-viewer", 1920, 1080);
   window_->AddListener(&window_listener_);
   window_->AddInputListener(&window_listener_, kZOrderTraceViewerInput);
   if (!window_->Open()) {
@@ -176,7 +176,7 @@ void TraceViewer::TraceViewerDialog::OnDraw(ImGuiIO& io) {
 }
 
 bool TraceViewer::Load(const std::string_view trace_file_path) {
-  window_->SetTitle("Xenia GPU Trace Viewer: " + std::string(trace_file_path));
+  window_->SetTitle("WWE 2K16 GPU Trace Viewer: " + std::string(trace_file_path));
 
   if (!player_->Open(trace_file_path)) {
     REXGPU_ERROR("Could not load trace file");

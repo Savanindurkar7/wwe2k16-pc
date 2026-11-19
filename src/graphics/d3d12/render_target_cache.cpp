@@ -174,6 +174,16 @@ bool D3D12RenderTargetCache::Initialize() {
   const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
   ID3D12Device* device = provider.GetDevice();
 
+  // The prebuilt D3D12 resolve/clear bytecode retains 2048-tile EDRAM wraps.
+  // Until those DXBC shaders can be rebuilt for the extended ring, do not let
+  // the dynamically sized 4096-tile buffer be used with this backend.
+  if (xenos::GetEdramTileCount() == xenos::kEdramMaxTileCount) {
+    REXGPU_ERROR(
+        "[rex-edram] refusing edram_tiles=4096 on D3D12: prebuilt resolve/clear shaders "
+        "wrap at 2048 tiles; use Vulkan for 4096-tile mode");
+    return false;
+  }
+
   if (REXCVAR_GET(render_target_path_d3d12) == "rtv") {
     path_ = Path::kHostRenderTargets;
   } else if (REXCVAR_GET(render_target_path_d3d12) == "rov") {
@@ -192,7 +202,7 @@ bool D3D12RenderTargetCache::Initialize() {
                 ? Path::kPixelShaderInterlock
                 : Path::kHostRenderTargets;
 #else
-    // The AMD shader compiler crashes very often with Xenia's custom
+    // The AMD shader compiler crashes very often with the runtime's custom
     // output-merger code as of March 2021.
     path_ = provider.GetAdapterVendorID() == ui::GraphicsProvider::GpuVendorID::kAMD
                 ? Path::kHostRenderTargets
@@ -205,7 +215,7 @@ bool D3D12RenderTargetCache::Initialize() {
 
   // Create the buffer for reinterpreting EDRAM contents.
   uint32_t edram_buffer_size =
-      xenos::kEdramSizeBytes * (draw_resolution_scale_x() * draw_resolution_scale_y());
+      xenos::GetEdramSizeBytes() * (draw_resolution_scale_x() * draw_resolution_scale_y());
   D3D12_RESOURCE_DESC edram_buffer_desc;
   ui::d3d12::util::FillBufferResourceDesc(edram_buffer_desc, edram_buffer_size,
                                           D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
@@ -575,7 +585,7 @@ bool D3D12RenderTargetCache::Initialize() {
     transfer_vertex_buffer_pool_ = std::make_unique<ui::d3d12::D3D12UploadBufferPool>(
         provider, std::max(ui::d3d12::D3D12UploadBufferPool::kDefaultPageSize,
                            sizeof(float) * 2 * 6 * Transfer::kMaxCutoutBorderRectangles *
-                               xenos::kEdramTileCount));
+                                xenos::GetEdramTileCount()));
 
     // Transfer root signatures.
     D3D12_DESCRIPTOR_RANGE transfer_root_color_srv_range;
@@ -1318,7 +1328,9 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
 
           // Invalidate textures and mark the range as scaled if needed.
           texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
-                                            resolve_info.copy_dest_extent_length);
+                                            resolve_info.copy_dest_extent_length,
+                                            copy_shader_info.dest_pixel_size_log2,
+                                            draw_resolution_scaled);
           written_address_out = resolve_info.copy_dest_extent_start;
           written_length_out = resolve_info.copy_dest_extent_length;
           copied = true;
@@ -1432,7 +1444,8 @@ bool D3D12RenderTargetCache::InitializeTraceSubmitDownloads() {
   if (!edram_snapshot_download_buffer_) {
     D3D12_RESOURCE_DESC edram_snapshot_download_buffer_desc;
     ui::d3d12::util::FillBufferResourceDesc(edram_snapshot_download_buffer_desc,
-                                            xenos::kEdramSizeBytes, D3D12_RESOURCE_FLAG_NONE);
+                                            xenos::GetEdramSizeBytes(),
+                                            D3D12_RESOURCE_FLAG_NONE);
     const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
     ID3D12Device* device = provider.GetDevice();
     if (FAILED(device->CreateCommittedResource(
@@ -1447,7 +1460,7 @@ bool D3D12RenderTargetCache::InitializeTraceSubmitDownloads() {
   }
   if (GetPath() == Path::kHostRenderTargets) {
     // Dump all host render targets to edram_buffer_.
-    if (!DumpRenderTargets(0, xenos::kEdramTileCount, 1, xenos::kEdramTileCount)) {
+    if (!DumpRenderTargets(0, xenos::GetEdramTileCount(), 1, xenos::GetEdramTileCount())) {
       REXGPU_ERROR("D3D12RenderTargetCache: Failed to dump host render targets for trace");
       return false;
     }
@@ -1455,7 +1468,7 @@ bool D3D12RenderTargetCache::InitializeTraceSubmitDownloads() {
   TransitionEdramBuffer(D3D12_RESOURCE_STATE_COPY_SOURCE);
   command_processor_.SubmitBarriers();
   command_processor_.GetDeferredCommandList().D3DCopyBufferRegion(
-      edram_snapshot_download_buffer_, 0, edram_buffer_, 0, xenos::kEdramSizeBytes);
+      edram_snapshot_download_buffer_, 0, edram_buffer_, 0, xenos::GetEdramSizeBytes());
   return true;
 }
 
@@ -1488,12 +1501,13 @@ void D3D12RenderTargetCache::RestoreEdramSnapshot(const void* snapshot) {
   const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
   if (!edram_snapshot_restore_pool_) {
     edram_snapshot_restore_pool_ =
-        std::make_unique<ui::d3d12::D3D12UploadBufferPool>(provider, xenos::kEdramSizeBytes);
+        std::make_unique<ui::d3d12::D3D12UploadBufferPool>(provider,
+                                                          xenos::GetEdramSizeBytes());
   }
   ID3D12Resource* upload_buffer;
   size_t upload_buffer_offset;
   void* upload_buffer_mapping = edram_snapshot_restore_pool_->Request(
-      command_processor_.GetCurrentSubmission(), xenos::kEdramSizeBytes, 1, &upload_buffer,
+      command_processor_.GetCurrentSubmission(), xenos::GetEdramSizeBytes(), 1, &upload_buffer,
       &upload_buffer_offset, nullptr);
   if (!upload_buffer_mapping) {
     REXGPU_ERROR(
@@ -1525,11 +1539,11 @@ void D3D12RenderTargetCache::RestoreEdramSnapshot(const void* snapshot) {
                                                   nullptr, &copy_total_bytes);
       // 1280 width * sizeof(uint32_t) is aligned to
       // D3D12_TEXTURE_DATA_PITCH_ALIGNMENT (256).
-      assert_true(copy_total_bytes <= xenos::kEdramSizeBytes);
+      assert_true(copy_total_bytes <= xenos::GetEdramSizeBytes());
       assert_false(full_edram_render_target->key().Is64bpp());
       uint32_t pitch_tiles = full_edram_render_target->key().pitch_tiles_at_32bpp;
-      uint32_t tile_rows = xenos::kEdramTileCount / pitch_tiles;
-      assert_true(pitch_tiles * tile_rows == xenos::kEdramTileCount);
+      uint32_t tile_rows = xenos::GetEdramTileCount() / pitch_tiles;
+      assert_true(pitch_tiles * tile_rows == xenos::GetEdramTileCount());
       const uint8_t* snapshot_sample_row = reinterpret_cast<const uint8_t*>(snapshot);
       for (uint32_t y_tile = 0; y_tile < tile_rows; ++y_tile) {
         uint8_t* upload_buffer_tile_row_origin =
@@ -1563,11 +1577,12 @@ void D3D12RenderTargetCache::RestoreEdramSnapshot(const void* snapshot) {
     } break;
 
     case Path::kPixelShaderInterlock: {
-      std::memcpy(upload_buffer_mapping, snapshot, xenos::kEdramSizeBytes);
+      std::memcpy(upload_buffer_mapping, snapshot, xenos::GetEdramSizeBytes());
       TransitionEdramBuffer(D3D12_RESOURCE_STATE_COPY_DEST);
       command_processor_.SubmitBarriers();
       command_list.D3DCopyBufferRegion(edram_buffer_, 0, upload_buffer,
-                                       UINT64(upload_buffer_offset), xenos::kEdramSizeBytes);
+                                        UINT64(upload_buffer_offset),
+                                        xenos::GetEdramSizeBytes());
     } break;
 
     default:
@@ -2011,7 +2026,7 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
   // Allocate space for the RDEF header.
   built_shader_.resize(rdef_position_dwords + sizeof(dxbc::RdefHeader) / sizeof(uint32_t));
   // Generator name.
-  dxbc::AppendAlignedString(built_shader_, "Xenia");
+  dxbc::AppendAlignedString(built_shader_, "WWE2K16");
 
   // Constant types - uint (aka "dword" when it's scalar) only.
   // Names.
@@ -2930,7 +2945,7 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
            dxbc::Src::R(1, dxbc::Src::kWWWW));
   // r1.w = 32bpp tile index within the source
   a.OpAnd(dxbc::Dest::R(1, 0b1000), dxbc::Src::R(1, dxbc::Src::kWWWW),
-          dxbc::Src::LU(xenos::kEdramTileCount - 1));
+           dxbc::Src::LU(xenos::GetEdramTileCount() - 1));
   // r2.x = source pitch in 32bpp tiles
   a.OpUBFE(dxbc::Dest::R(2, 0b0001), dxbc::Src::LU(xenos::kEdramPitchTilesBits),
            dxbc::Src::LU(xenos::kEdramPitchTilesBits),
@@ -3518,7 +3533,7 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
                        dxbc::Src::R(0, dxbc::Src::kWWWW));
               // r0.z = tile index relative to the host depth source base
               a.OpAnd(dxbc::Dest::R(0, 0b0100), dxbc::Src::R(0, dxbc::Src::kZZZZ),
-                      dxbc::Src::LU(xenos::kEdramTileCount - 1));
+                       dxbc::Src::LU(xenos::GetEdramTileCount() - 1));
               // Convert position and sample index from within the destination
               // tile to within the host depth source tile, like for the guest
               // render target, but for 32bpp -> 32bpp only.
@@ -4941,7 +4956,7 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelin
   // Allocate space for the RDEF header.
   built_shader_.resize(rdef_position_dwords + sizeof(dxbc::RdefHeader) / sizeof(uint32_t));
   // Generator name.
-  dxbc::AppendAlignedString(built_shader_, "Xenia");
+  dxbc::AppendAlignedString(built_shader_, "WWE2K16");
 
   // Constant types - uint (aka "dword" when it's scalar) only.
   // Names.
@@ -5293,7 +5308,7 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelin
   // r0.z = wrapped tile index in the EDRAM
   // r0.w = non-wrapped tile index in the EDRAM
   a.OpAnd(dxbc::Dest::R(0, 0b0100), dxbc::Src::R(0, dxbc::Src::kWWWW),
-          dxbc::Src::LU(xenos::kEdramTileCount - 1));
+          dxbc::Src::LU(xenos::GetEdramTileCount() - 1));
   // Convert the tile index to samples and add the X sample index to it to r0.z.
   // r0.x = X sample position within the tile
   // r0.y = Y sample position within the tile

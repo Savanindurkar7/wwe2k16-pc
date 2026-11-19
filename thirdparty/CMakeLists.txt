@@ -90,6 +90,21 @@ target_include_directories(simde INTERFACE
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 
 #=============================================================================
+# Custom music decoders - single-file MP3/FLAC/WAV/Vorbis decoders used by the
+# XMP custom-music player (rexaudio). Vendored because the FFmpeg build here
+# has no FLAC/Vorbis decoders and no OGG/WAV demuxers. See decoders/README.md.
+#=============================================================================
+add_library(rexdecoders STATIC
+    decoders/decoder_impl.cpp
+)
+target_include_directories(rexdecoders INTERFACE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>)
+target_compile_options(rexdecoders PRIVATE -w)
+if(WIN32)
+    # The decoders use stdio; nothing else required.
+endif()
+
+#=============================================================================
 # Compiled libraries (vendored sources)
 #=============================================================================
 
@@ -235,8 +250,16 @@ set(SDL_STATIC ON CACHE BOOL "" FORCE)
 set(SDL_TEST OFF CACHE BOOL "" FORCE)
 set(SDL_UNIX_CONSOLE_BUILD ON CACHE BOOL "" FORCE)
 
+# Android requires native video and Vulkan presentation.
+if(ANDROID)
+    set(SDL_VIDEO ON CACHE BOOL "" FORCE)
+    set(SDL_VULKAN ON CACHE BOOL "" FORCE)
+else()
+    set(SDL_VIDEO OFF CACHE BOOL "" FORCE)
+    set(SDL_VULKAN OFF CACHE BOOL "" FORCE)
+endif()
+
 # Disable unused subsystems
-set(SDL_VIDEO OFF CACHE BOOL "" FORCE)
 set(SDL_RENDER OFF CACHE BOOL "" FORCE)
 set(SDL_HAPTIC OFF CACHE BOOL "" FORCE)
 set(SDL_SENSOR OFF CACHE BOOL "" FORCE)
@@ -246,14 +269,13 @@ set(SDL_LOCALE OFF CACHE BOOL "" FORCE)
 set(SDL_FILE OFF CACHE BOOL "" FORCE)
 set(SDL_MISC OFF CACHE BOOL "" FORCE)
 
-# Disable graphics APIs (unused without video)
+# Disable unused graphics APIs
 set(SDL_OPENGL OFF CACHE BOOL "" FORCE)
 set(SDL_OPENGLES OFF CACHE BOOL "" FORCE)
-set(SDL_VULKAN OFF CACHE BOOL "" FORCE)
 set(SDL_METAL OFF CACHE BOOL "" FORCE)
 
-# Disable dummy drivers
-set(SDL_DISKAUDIO OFF CACHE BOOL "" FORCE)
+# Audio driver: disk enabled for capture; dummy disabled
+set(SDL_DISKAUDIO ON CACHE BOOL "" FORCE)
 set(SDL_DUMMYAUDIO OFF CACHE BOOL "" FORCE)
 set(SDL_DUMMYVIDEO OFF CACHE BOOL "" FORCE)
 
@@ -332,6 +354,62 @@ endif()
 
 set(FFMPEG_DIR "${CMAKE_CURRENT_SOURCE_DIR}/FFmpeg")
 
+# The vendored FFmpeg config headers describe the existing static build. For
+# shared builds, shadow config.h in the build tree and flip only the two build
+# mode flags after including the selected platform config. This keeps the
+# read-only FFmpeg submodule untouched while enabling its Windows dllimport
+# declarations for cross-library references.
+if(REXGLUE_FFMPEG_SHARED)
+  set(FFMPEG_SHARED_CONFIG_DIR "${CMAKE_CURRENT_BINARY_DIR}/ffmpeg-shared-config")
+  file(MAKE_DIRECTORY "${FFMPEG_SHARED_CONFIG_DIR}")
+  file(WRITE "${FFMPEG_SHARED_CONFIG_DIR}/config.h"
+    "#include \"${FFMPEG_DIR}/config.h\"\n"
+    "#undef CONFIG_SHARED\n#define CONFIG_SHARED 1\n"
+    "#undef CONFIG_STATIC\n#define CONFIG_STATIC 0\n")
+  # FFmpeg's reverse.h does not use av_export_avutil on its private const
+  # table. Shadow it in the build tree so libavcodec emits a data import
+  # reference for this cross-DLL dependency (the vendored header is untouched).
+  file(MAKE_DIRECTORY "${FFMPEG_SHARED_CONFIG_DIR}/libavutil")
+  file(WRITE "${FFMPEG_SHARED_CONFIG_DIR}/libavutil/reverse.h"
+    "#ifndef AVUTIL_REVERSE_H\n#define AVUTIL_REVERSE_H\n"
+    "#include <stdint.h>\n"
+    "#if defined(_WIN32) && !defined(BUILDING_avutil)\n"
+    "extern __declspec(dllimport) const uint8_t ff_reverse[256];\n"
+    "#else\nextern const uint8_t ff_reverse[256];\n#endif\n"
+    "#endif /* AVUTIL_REVERSE_H */\n")
+  # FFmpeg's upstream avutil version script hides non-av* symbols, but
+  # libavcodec directly reads this shared const table from libavutil. Preserve
+  # upstream exports and expose this one required cross-DSO data symbol in the
+  # generated build-tree script; never edit the read-only FFmpeg checkout.
+  file(READ "${FFMPEG_DIR}/libavutil/libavutil.v" FFMPEG_AVUTIL_VERSION_SCRIPT)
+  string(REPLACE "        av*;"
+    "        av*;\n        ff_reverse;"
+    FFMPEG_AVUTIL_VERSION_SCRIPT "${FFMPEG_AVUTIL_VERSION_SCRIPT}")
+  file(WRITE "${FFMPEG_SHARED_CONFIG_DIR}/libavutil.v"
+    "${FFMPEG_AVUTIL_VERSION_SCRIPT}")
+  set(FFMPEG_LIBRARY_TYPE SHARED)
+else()
+  set(FFMPEG_LIBRARY_TYPE STATIC)
+endif()
+
+function(ffmpeg_read_version_component out_var header component)
+  file(STRINGS "${header}" _version_line
+    REGEX "^#define [A-Z0-9_]+_VERSION_${component}[ \t]+[0-9]+")
+  if(NOT _version_line)
+    message(FATAL_ERROR "Could not read FFmpeg ${component} version from ${header}")
+  endif()
+  string(REGEX REPLACE ".*VERSION_${component}[ \t]+([0-9]+).*" "\\1"
+    _version_value "${_version_line}")
+  set(${out_var} "${_version_value}" PARENT_SCOPE)
+endfunction()
+
+foreach(_ffmpeg_component MAJOR MINOR MICRO)
+  ffmpeg_read_version_component(FFMPEG_AVUTIL_${_ffmpeg_component}
+    "${FFMPEG_DIR}/libavutil/version.h" "${_ffmpeg_component}")
+  ffmpeg_read_version_component(FFMPEG_AVCODEC_${_ffmpeg_component}
+    "${FFMPEG_DIR}/libavcodec/version.h" "${_ffmpeg_component}")
+endforeach()
+
 # Overlay generated FFmpeg list files
 set(FFMPEG_OVERLAY_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ffmpeg-overlay")
 set(FFMPEG_OVERLAY_BUILD_DIR "${CMAKE_CURRENT_BINARY_DIR}/ffmpeg-overlay")
@@ -371,7 +449,7 @@ if(IS_ARM64)
 endif()
 
 # libavutil - FFmpeg utility library (must build first)
-add_library(libavutil STATIC
+add_library(libavutil ${FFMPEG_LIBRARY_TYPE}
     ${FFMPEG_DIR}/libavutil/adler32.c
     ${FFMPEG_DIR}/libavutil/aes.c
     ${FFMPEG_DIR}/libavutil/aes_ctr.c
@@ -481,14 +559,47 @@ target_include_directories(libavutil
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
     PRIVATE ${FFMPEG_ATOMICS_INCLUDE}
 )
+if(REXGLUE_FFMPEG_SHARED)
+    target_include_directories(libavutil BEFORE PRIVATE "${FFMPEG_SHARED_CONFIG_DIR}")
+endif()
 target_compile_definitions(libavutil PRIVATE ${FFMPEG_COMMON_DEFINES})
 target_compile_options(libavutil PRIVATE -w)  # Suppress warnings in third-party code
 if(WIN32)
     target_link_libraries(libavutil PRIVATE bcrypt)
 endif()
 
+set_target_properties(libavutil PROPERTIES
+    OUTPUT_NAME avutil
+    DEBUG_POSTFIX ""
+    RELWITHDEBINFO_POSTFIX ""
+)
+if(REXGLUE_FFMPEG_SHARED)
+    set_target_properties(libavutil PROPERTIES
+        VERSION "${FFMPEG_AVUTIL_MAJOR}.${FFMPEG_AVUTIL_MINOR}.${FFMPEG_AVUTIL_MICRO}"
+        SOVERSION "${FFMPEG_AVUTIL_MAJOR}"
+    )
+    if(WIN32)
+        # CMake generates the module-definition export file from the compiled
+        # object symbols for clang-cl/lld-link. This exports FFmpeg's av* ABI
+        # without editing the vendored MSVC-style sources.
+        target_compile_definitions(libavutil PRIVATE BUILDING_avutil)
+        target_sources(libavutil PRIVATE
+            "${PROJECT_SOURCE_DIR}/cmake/ffmpeg-avutil-private.def"
+        )
+        set_target_properties(libavutil PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
+        set_target_properties(libavutil PROPERTIES
+            PREFIX ""
+            OUTPUT_NAME "avutil-${FFMPEG_AVUTIL_MAJOR}"
+        )
+    else()
+        target_link_options(libavutil PRIVATE
+            "LINKER:--version-script=${FFMPEG_SHARED_CONFIG_DIR}/libavutil.v"
+        )
+    endif()
+endif()
+
 # libavcodec - FFmpeg codec library (depends on libavutil)
-add_library(libavcodec STATIC
+add_library(libavcodec ${FFMPEG_LIBRARY_TYPE}
     ${FFMPEG_DIR}/libavcodec/ac3_parser.c
     ${FFMPEG_DIR}/libavcodec/adts_parser.c
     ${FFMPEG_DIR}/libavcodec/allcodecs.c
@@ -586,6 +697,7 @@ endif()
 # ARM64 optimizations for libavcodec
 if(IS_ARM64)
     target_sources(libavcodec PRIVATE
+        ${FFMPEG_DIR}/libavcodec/aarch64/idctdsp_init_aarch64.c
         ${FFMPEG_DIR}/libavcodec/aarch64/fft_init_aarch64.c
         ${FFMPEG_DIR}/libavcodec/aarch64/fft_neon.S
         ${FFMPEG_DIR}/libavcodec/aarch64/mdct_neon.S
@@ -610,11 +722,38 @@ target_include_directories(libavcodec
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
     PRIVATE ${FFMPEG_ATOMICS_INCLUDE}
 )
+if(REXGLUE_FFMPEG_SHARED)
+    target_include_directories(libavcodec BEFORE PRIVATE "${FFMPEG_SHARED_CONFIG_DIR}")
+endif()
 target_compile_definitions(libavcodec PRIVATE ${FFMPEG_COMMON_DEFINES})
 target_compile_options(libavcodec PRIVATE -w)  # Suppress warnings in third-party code
 target_link_libraries(libavcodec PUBLIC libavutil)
 if(WIN32)
     target_link_libraries(libavcodec PRIVATE bcrypt)
+endif()
+
+set_target_properties(libavcodec PROPERTIES
+    OUTPUT_NAME avcodec
+    DEBUG_POSTFIX ""
+    RELWITHDEBINFO_POSTFIX ""
+)
+if(REXGLUE_FFMPEG_SHARED)
+    set_target_properties(libavcodec PROPERTIES
+        VERSION "${FFMPEG_AVCODEC_MAJOR}.${FFMPEG_AVCODEC_MINOR}.${FFMPEG_AVCODEC_MICRO}"
+        SOVERSION "${FFMPEG_AVCODEC_MAJOR}"
+    )
+    if(WIN32)
+        target_compile_definitions(libavcodec PRIVATE BUILDING_avcodec)
+        set_target_properties(libavcodec PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
+        set_target_properties(libavcodec PROPERTIES
+            PREFIX ""
+            OUTPUT_NAME "avcodec-${FFMPEG_AVCODEC_MAJOR}"
+        )
+    else()
+        target_link_options(libavcodec PRIVATE
+            "LINKER:--version-script=${FFMPEG_DIR}/libavcodec/libavcodec.v"
+        )
+    endif()
 endif()
 
 # IDE folder organization

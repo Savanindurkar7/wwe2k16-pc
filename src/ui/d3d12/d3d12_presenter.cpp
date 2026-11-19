@@ -436,7 +436,7 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
         assert_unhandled_case(surface_type);
         REXLOG_ERROR(
             "D3D12Presenter: Tried to create a swap chain for an unsupported "
-            "Xenia surface type");
+            "the runtime surface type");
         return SurfacePaintConnectResult::kFailureSurfaceUnusable;
     }
     if (FAILED(swap_chain_1->QueryInterface(IID_PPV_ARGS(&paint_context_.swap_chain)))) {

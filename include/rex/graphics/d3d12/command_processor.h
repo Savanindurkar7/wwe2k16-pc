@@ -524,7 +524,7 @@ class D3D12CommandProcessor : public CommandProcessor {
   // samplers (due to Nvidia addressing). However, there's also possibly a weird
   // bug in the Nvidia driver (tested on 440.97 and earlier on Windows 10 1803)
   // that caused the sampler with index 2047 not to work if a heap with 8 or
-  // less samplers also exists - in case of Xenia, it's the immediate drawer's
+  // less samplers also exists - in case of the runtime, it's the immediate drawer's
   // sampler heap.
   // FIXME(Triang3l): Investigate the issue with the sampler 2047 on Nvidia.
   static constexpr uint32_t kSamplerHeapSize = 2000;

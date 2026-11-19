@@ -13,8 +13,10 @@
 #include "commands/test_recompiler.h"
 
 #include <chrono>
+#include <cstdio>
 #include <iostream>
 #include <map>
+#include <utility>
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
@@ -59,7 +61,15 @@ void PrintUsage() {
 }
 
 int main(int argc, char** argv) {
-  auto remaining = rex::cvar::Init(argc, argv);
+  auto init_result = rex::cvar::Init(argc, argv);
+  if (init_result.parse_error) {
+    std::fprintf(stderr, "rexglue: invalid launch option: %s\n", init_result.parse_error->c_str());
+    return 1;
+  }
+  if (init_result.exit_requested) {
+    return 0;
+  }
+  auto remaining = std::move(init_result.remaining);
   rex::cvar::ApplyEnvironment();
 
   std::string command;

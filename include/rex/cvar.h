@@ -103,7 +103,13 @@ namespace rex::cvar {
 // Initialization API
 //=============================================================================
 
-std::vector<std::string> Init(int argc, char** argv);
+struct InitResult {
+  std::vector<std::string> remaining;
+  std::optional<std::string> parse_error;
+  bool exit_requested = false;
+};
+
+InitResult Init(int argc, char** argv);
 void LoadConfig(const std::filesystem::path& config_path);
 void ApplyEnvironment();
 void FinalizeInit();

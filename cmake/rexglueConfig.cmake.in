@@ -10,6 +10,7 @@ include("${CMAKE_CURRENT_LIST_DIR}/rexglue_helpers.cmake")
 
 # Ensure bundled dependencies are found from the SDK install prefix
 list(PREPEND CMAKE_PREFIX_PATH "${PACKAGE_PREFIX_DIR}")
+set(REXGLUE_FFMPEG_SHARED @REXGLUE_FFMPEG_SHARED@)
 
 # Required dependencies
 find_dependency(fmt CONFIG)

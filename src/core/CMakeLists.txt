@@ -9,11 +9,13 @@ add_library(rexcore STATIC
     clock.cpp
     cvar.cpp
     exception_handler.cpp
+    freeze_logger.cpp
     filesystem.cpp
     filesystem_wildcard.cpp
     logging.cpp
     memory.cpp
     mutex.cpp
+    rate_census.cpp
     ring_buffer.cpp
     sha256.cpp
     string.cpp
@@ -42,6 +44,25 @@ if(WIN32)
         socket_win.cpp
         string_win.cpp
         threading_win.cpp
+    )
+elseif(ANDROID)
+    target_sources(rexcore PRIVATE
+        atomic_posix.cpp
+        clock_posix.cpp
+        dbg_posix.cpp
+        dynlib_posix.cpp
+        exception_handler_posix.cpp
+        filesystem_posix.cpp
+        filesystem_android.cpp
+        fiber_android.cpp
+        fiber_android.S
+        mapped_memory_posix.cpp
+        math_gcc.cpp
+        memory_posix.cpp
+        socket_posix.cpp
+        string_posix.cpp
+        seh_posix.cpp
+        threading_posix.cpp
     )
 elseif(UNIX)
     target_sources(rexcore PRIVATE
@@ -74,7 +95,13 @@ target_include_directories(rexcore PRIVATE
 )
 
 if(UNIX)
+    if(ANDROID)
+    target_link_libraries(rexcore PRIVATE dl SDL3::SDL3 android log)
+else()
     target_link_libraries(rexcore PRIVATE pthread rt dl)
+endif()
+elseif(WIN32)
+    target_link_libraries(rexcore PRIVATE winmm)
 endif()
 
 target_link_libraries(rexcore
@@ -87,6 +114,10 @@ target_link_libraries(rexcore
         disruptorplus
         utf8cpp
 )
+
+if(REXGLUE_BUILD_TESTS)
+    target_compile_definitions(rexcore PRIVATE REXGLUE_BUILD_TESTS)
+endif()
 
 if(REXGLUE_ENABLE_TRACY)
     target_link_libraries(rexcore PUBLIC TracyClient)

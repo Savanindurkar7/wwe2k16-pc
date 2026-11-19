@@ -340,8 +340,10 @@ class VulkanPresenter final : public Presenter {
       VkFramebuffer framebuffer;
     };
 
-    explicit PaintContext(const VulkanDevice* const vulkan_device)
-        : vulkan_device(vulkan_device), submission_tracker(vulkan_device) {}
+    explicit PaintContext(const VulkanDevice* const vulkan_device,
+                          VulkanSubmissionTracker::FailureCallback failure_callback)
+        : vulkan_device(vulkan_device),
+          submission_tracker(vulkan_device, std::move(failure_callback)) {}
     PaintContext(const PaintContext& paint_context) = delete;
     PaintContext& operator=(const PaintContext& paint_context) = delete;
 
@@ -423,9 +425,10 @@ class VulkanPresenter final : public Presenter {
       : Presenter(host_gpu_loss_callback),
         vulkan_device_(vulkan_device),
         ui_samplers_(ui_samplers),
-        guest_output_image_refresher_submission_tracker_(vulkan_device),
-        ui_submission_tracker_(vulkan_device),
-        paint_context_(vulkan_device) {
+        guest_output_image_refresher_submission_tracker_(vulkan_device,
+                                                        [this] { ReportHostGpuFailure(); }),
+        ui_submission_tracker_(vulkan_device, [this] { ReportHostGpuFailure(); }),
+        paint_context_(vulkan_device, [this] { ReportHostGpuFailure(); }) {
     assert_not_null(vulkan_device);
     assert_not_null(ui_samplers);
   }
