@@ -1,0 +1,72 @@
+name: WWE 2K16 Android Release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout game source
+        uses: actions/checkout@v4
+
+      - name: Checkout ReXGlue Android SDK
+        run: |
+          mkdir -p sdk
+          git clone --branch rexglue-android --single-branch \
+            https://github.com/${GITHUB_REPOSITORY}.git sdk/rexglue
+          git -C sdk/rexglue submodule update --init --recursive
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK
+        run: sdkmanager "ndk;28.2.13676358" "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Configure Android build
+        run: |
+          NDK="$ANDROID_SDK_ROOT/ndk/28.2.13676358"
+          cmake -S . -B sdk/rexglue/out/build/android-arm64 \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-29 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_EXTERNAL=ON \
+            -DBUILD_TESTING=OFF
+
+      - name: Build native library
+        run: cmake --build sdk/rexglue/out/build/android-arm64 --parallel 2
+
+      - name: Apply SDL Android integration patch
+        run: |
+          cd sdk/rexglue/thirdparty/sdl3
+          git apply ../../android-sdl3-android.patch
+
+      - name: Stage native library
+        run: |
+          mkdir -p sdk/rexglue/thirdparty/sdl3/android-project/app/libs/arm64-v8a
+          cp sdk/rexglue/out/build/android-arm64/libmain.so \
+            sdk/rexglue/thirdparty/sdl3/android-project/app/libs/arm64-v8a/libmain.so
+
+      - name: Build APK
+        working-directory: sdk/rexglue/thirdparty/sdl3/android-project
+        run: ./gradlew assembleDebug -PEXCLUDE_NATIVE_LIBS
+
+      - name: Publish APK to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: android-${{ github.run_number }}
+          name: "WWE 2K16 Android Build #${{ github.run_number }}"
+          prerelease: true
+          files: sdk/rexglue/thirdparty/sdl3/android-project/app/build/outputs/apk/debug/app-debug.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
