@@ -49,7 +49,7 @@ jobs:
             -DCMAKE_CXX_COMPILER=clang++-18 \
             -DCMAKE_BUILD_TYPE=Release \
             -DREXSDK_DIR="${GITHUB_WORKSPACE}/sdk/rexglue" \
-              -DCMAKE_CXX_FLAGS=-mssse3 \
+              -DCMAKE_CXX_FLAGS="-mssse3 -D__cpp_concepts=202002L -Wno-builtin-macro-redefined" \
             -DBUILD_TESTING=OFF
 
       - name: Generate WWE 2K16 code
