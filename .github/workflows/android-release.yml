@@ -34,6 +34,23 @@ jobs:
       - name: Install Android NDK
         run: sdkmanager "ndk;28.2.13676358" "platforms;android-35" "build-tools;35.0.0"
 
+      - name: Install host build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-18 libvulkan-dev
+
+      - name: Configure Linux host code generator
+        run: |
+          cmake -S . -B sdk/rexglue/out/build/host \
+            -DCMAKE_C_COMPILER=clang-18 \
+            -DCMAKE_CXX_COMPILER=clang++-18 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DREXSDK_DIR="${GITHUB_WORKSPACE}/sdk/rexglue" \
+            -DBUILD_TESTING=OFF
+
+      - name: Generate WWE 2K16 code
+        run: cmake --build sdk/rexglue/out/build/host --target wwe2k16_codegen --parallel 2
+
       - name: Configure Android build
         run: |
           NDK="$ANDROID_SDK_ROOT/ndk/28.2.13676358"
@@ -45,9 +62,6 @@ jobs:
             -DREXSDK_DIR="${GITHUB_WORKSPACE}/sdk/rexglue" \
             -DBUILD_EXTERNAL=ON \
             -DBUILD_TESTING=OFF
-
-      - name: Generate WWE 2K16 code
-        run: cmake --build sdk/rexglue/out/build/android-arm64 --target wwe2k16_codegen --parallel 2
 
       - name: Build native library
         run: cmake --build sdk/rexglue/out/build/android-arm64 --parallel 2
