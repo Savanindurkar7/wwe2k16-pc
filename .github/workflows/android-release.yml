@@ -1,6 +1,9 @@
 name: WWE 2K16 Android Release
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
