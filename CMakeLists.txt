@@ -26,7 +26,10 @@ set(WWE2K16_SOURCES
     src/display_refresh_rate.cpp
 )
 
-if(WIN32)
+if(ANDROID)
+    add_library(wwe2k16 SHARED ${WWE2K16_SOURCES})
+    set_target_properties(wwe2k16 PROPERTIES OUTPUT_NAME main)
+elseif(WIN32)
     add_executable(wwe2k16 WIN32 ${WWE2K16_SOURCES})
 else()
     add_executable(wwe2k16 ${WWE2K16_SOURCES})
