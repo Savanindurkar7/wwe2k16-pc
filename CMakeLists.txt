@@ -7,6 +7,14 @@ project(wwe2k16 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Clang < 19 reports __cpp_concepts=201907L, which makes GCC 13's libstdc++ hide std::expected. Raise the macro only
+# for targets compiled as C++20 or later: dependencies pinned to older standards (glslang forces C++11) must not see
+# it, or libstdc++ emits concept/requires code those standards cannot parse. Not needed on Android (NDK libc++).
+if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 19 AND NOT ANDROID)
+    set(_wwe2k16_cxx20 "$<AND:$<COMPILE_LANGUAGE:CXX>,$<VERSION_GREATER_EQUAL:$<TARGET_PROPERTY:CXX_STANDARD>,20>>")
+    add_compile_options("$<${_wwe2k16_cxx20}:-D__cpp_concepts=202002L>" "$<${_wwe2k16_cxx20}:-Wno-builtin-macro-redefined>")
+endif()
+
 include(generated/rexglue.cmake)
 
 set(WWE2K16_SOURCES
