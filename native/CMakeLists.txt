@@ -62,7 +62,6 @@ set(WWE2K16_SOURCES
     frame_rate.cpp
     launcher_settings.cpp
     screenshot.cpp
-    achievement_sound.cpp
     fps_overlay.cpp
     shadows.cpp
     cp_profiler.cpp
