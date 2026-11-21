@@ -82,6 +82,9 @@ public class GameActivity extends SDLActivity {
             return;
         }
         applyEnvironment();
+        // Landscape only: SDL may otherwise pick the orientation from its window size or its own hint.
+        setenv("SDL_ORIENTATIONS", "LandscapeLeft LandscapeRight");
+        setRequestedOrientation(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
         super.onCreate(savedInstanceState);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         if ("1".equals(System.getenv("WWE2K16_SUSTAINED"))) {

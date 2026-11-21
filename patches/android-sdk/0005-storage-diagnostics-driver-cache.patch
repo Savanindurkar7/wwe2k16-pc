@@ -1,0 +1,98 @@
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+index 984b495..5054d65 100644
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -10,6 +10,9 @@
+  */
+ 
+ #include <algorithm>
++#include <cerrno>
++#include <filesystem>
++#include <system_error>
+ #include <array>
+ #include <atomic>
+ #include <chrono>
+@@ -437,6 +440,16 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
+   auto pipeline_storage_file_path =
+       shader_storage_shareable_root /
+       fmt::format("{:08X}.{}.vk.xpso", title_id, edram_fragment_shader_interlock ? "fsi" : "fbo");
++  {
++    // WWE 2K16 Android diagnostics: what the stored files hold before they are read.
++    std::error_code size_ec;
++    const auto pso_size = std::filesystem::file_size(pipeline_storage_file_path, size_ec);
++    std::error_code xsh_ec;
++    const auto xsh_size = std::filesystem::file_size(
++        shader_storage_shareable_root / fmt::format("{:08X}.xsh", title_id), xsh_ec);
++    REXGPU_INFO("VulkanPipelineCache: storage files before loading: pipelines {} bytes, shaders {} bytes",
++                size_ec ? -1 : int64_t(pso_size), xsh_ec ? -1 : int64_t(xsh_size));
++  }
+   pipeline_storage_file_ = rex::filesystem::OpenFile(pipeline_storage_file_path, "a+b");
+   if (!pipeline_storage_file_) {
+     REXGPU_ERROR(
+@@ -456,8 +469,18 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
+     uint32_t magic_api;
+     uint32_t version_swapped;
+   } pipeline_storage_file_header;
+-  if (fread(&pipeline_storage_file_header, sizeof(pipeline_storage_file_header), 1,
+-            pipeline_storage_file_) &&
++  const size_t pipeline_header_read =
++      fread(&pipeline_storage_file_header, sizeof(pipeline_storage_file_header), 1, pipeline_storage_file_);
++  if (pipeline_header_read != 1 || pipeline_storage_file_header.magic != pipeline_storage_magic ||
++      pipeline_storage_file_header.magic_api != pipeline_storage_magic_api ||
++      pipeline_storage_file_header.version_swapped != pipeline_storage_version_swapped) {
++    REXGPU_INFO("VulkanPipelineCache: pipeline storage header not accepted (read {}, magic {:08X}/{:08X}, api {}/{}, "
++                "version {:08X}/{:08X}): starting it again",
++                pipeline_header_read, pipeline_storage_file_header.magic, pipeline_storage_magic,
++                pipeline_storage_file_header.magic_api, pipeline_storage_magic_api,
++                pipeline_storage_file_header.version_swapped, pipeline_storage_version_swapped);
++  }
++  if (pipeline_header_read == 1 &&
+       pipeline_storage_file_header.magic == pipeline_storage_magic &&
+       pipeline_storage_file_header.magic_api == pipeline_storage_magic_api &&
+       pipeline_storage_file_header.version_swapped == pipeline_storage_version_swapped) {
+@@ -759,7 +782,10 @@ void VulkanPipelineCache::LoadDriverPipelineCache(const std::filesystem::path& s
+   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+   const VkDevice device = vulkan_device->device();
+   const auto& properties = vulkan_device->properties();
+-  driver_pipeline_cache_path_ = shader_storage_root / "vk_pipeline_cache.bin";
++  // One file per GPU and driver version: switching between the phone's driver and a custom one (Turnip) keeps both.
++  driver_pipeline_cache_path_ =
++      shader_storage_root / fmt::format("vk_pipeline_cache_{:04X}_{:08X}_{:08X}.bin", properties.vendorID,
++                                        properties.deviceID, properties.driverVersion);
+ 
+   // Only data this driver wrote is handed back: some phone drivers crash on another driver's cache (after a driver
+   // update, or with a custom driver chosen), so the header is checked here rather than trusting the driver to.
+@@ -3890,7 +3916,18 @@ void VulkanPipelineCache::StorageWriteThread() {
+ 
+     if (write_pipeline) {
+       assert_not_null(pipeline_storage_file_);
+-      fwrite(&pipeline_description, sizeof(pipeline_description), 1, pipeline_storage_file_);
++      if (fwrite(&pipeline_description, sizeof(pipeline_description), 1, pipeline_storage_file_) != 1) {
++        static bool reported = false;
++        if (!reported) {
++          reported = true;
++          REXGPU_ERROR("VulkanPipelineCache: writing the pipeline storage failed (errno {})", errno);
++        }
++      } else {
++        static uint32_t written = 0;
++        if ((++written & 63) == 1) {
++          REXGPU_INFO("VulkanPipelineCache: {} pipeline descriptions written to the storage this run", written);
++        }
++      }
+     }
+   }
+ }
+diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
+index c0dea4d..0b74dea 100644
+--- a/src/ui/vulkan/vulkan_presenter.cpp
++++ b/src/ui/vulkan/vulkan_presenter.cpp
+@@ -2245,7 +2245,8 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+         vulkan_device_->AcquireQueue(paint_context_.present_queue_family, 0);
+     present_result = dfn.vkQueuePresentKHR(queue_acquisition.queue(), &present_info);
+   }
+-  if (present_result != VK_SUCCESS) {
++  // WWE 2K16 Android: SUBOPTIMAL is not a failure (on phones it means the compositor rotates the picture).
++  if (present_result != VK_SUCCESS && present_result != VK_SUBOPTIMAL_KHR) {
+     util::LogVkResultFailure(vulkan_device_, "vkQueuePresentKHR", present_result);
+   }
+   if (present_result == VK_SUCCESS || present_result == VK_SUBOPTIMAL_KHR) {

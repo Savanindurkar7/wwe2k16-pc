@@ -43,6 +43,7 @@ public class OptionsActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         requestWindowFeature(Window.FEATURE_NO_TITLE);
+        setRequestedOrientation(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
         Ui.init(this);
         build();
     }
@@ -320,7 +321,9 @@ public class OptionsActivity extends Activity {
         TextView info = Ui.body(this, "Custom Vulkan drivers (Turnip) can be faster on Snapdragon (Adreno) phones. "
                 + "Import a driver zip in the adrenotools format, e.g. from Banners-Turnip or K11MCH1/AdrenoToolsDrivers on "
                 + "GitHub. Pick the build for your GPU (A6xx/A7xx, or A8xx for Adreno 8xx). Mali phones (MediaTek, Exynos) "
-                + "keep the System driver. If a driver crashes the game, the launcher switches back to System by itself.",
+                + "keep the System driver. If a driver crashes the game, the launcher switches back to System by itself.\n\n"
+                + "Measured on an Adreno 810 (Nothing Phone 3a): Turnip A8xx gave about 19 FPS in a match against 6 to 11 "
+                + "FPS with the System driver, but it builds shaders more slowly, so the first match stutters more.",
                 12.5f, Ui.GREY);
         info.setPadding(0, Ui.dp(this, 4), 0, Ui.dp(this, 6));
         p.addView(info);
