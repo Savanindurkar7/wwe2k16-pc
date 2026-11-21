@@ -13,7 +13,7 @@
 
 #include <rex/logging.h>
 #include <rex/ppc/context.h>
-#include <rex/ppc/memory.h>
+#include "ppc_compat.h"
 
 #ifdef WWE2K16_TU
 #define WWE2K16_FN_PlaneShadowPass sub_82B5F7F0

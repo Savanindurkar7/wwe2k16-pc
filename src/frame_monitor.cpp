@@ -22,7 +22,28 @@
 #include <fmt/format.h>
 
 #include <rex/logging.h>
+#if __has_include(<rex/perf/stall_counters.h>)
 #include <rex/perf/stall_counters.h>
+#else
+// The WWE 2K14 SDK has no stall counters (they come with this project's 0.7 SDK patch): frame times are still logged,
+// the per-frame loading columns stay 0.
+#include <atomic>
+namespace rex::perf {
+struct StallCounters {
+  std::atomic<uint64_t> pipelines_created{0}, pipeline_create_ns{0}, pipeline_cache_hits{0}, texture_loads{0},
+      texture_load_ns{0}, file_reads{0}, file_read_bytes{0}, file_read_ns{0};
+};
+inline StallCounters& GetStallCounters() {
+  static StallCounters counters;
+  return counters;
+}
+inline uint64_t StallNowNs() {
+  return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      std::chrono::steady_clock::now().time_since_epoch())
+                      .count());
+}
+}  // namespace rex::perf
+#endif
 
 #if defined(__linux__) || defined(__ANDROID__)
 #include <dirent.h>

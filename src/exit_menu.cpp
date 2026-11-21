@@ -54,7 +54,7 @@
 #include <rex/memory.h>
 #include <rex/ppc/context.h>
 #include <rex/ppc/function.h>
-#include <rex/ppc/memory.h>
+#include "ppc_compat.h"
 #include <rex/runtime.h>
 #include <rex/ui/window.h>
 #include <rex/ui/windowed_app_context.h>

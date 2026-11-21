@@ -17,4 +17,9 @@ bool UseDiscImage(std::filesystem::path& game_root, const std::filesystem::path&
 // default.xex is loaded. Does nothing when the game runs from a folder.
 void MountDiscImage(rex::Runtime* runtime);
 
+// The Xbox utility cache partition (cache:\EditEx.cac, cache:\CAR.cac: Create mode and arena data), backed by
+// <user data>/cache_drive. ReXGlue 0.7 (this project's SDK patch) mounts it itself with --mount_cache; the WWE 2K14
+// SDK has no such setting, so the app mounts it there. Does nothing when the drive is already mounted.
+void MountUtilityCache(rex::Runtime* runtime);
+
 }  // namespace wwe2k16

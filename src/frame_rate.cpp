@@ -40,7 +40,7 @@
 
 #include <rex/logging.h>
 #include <rex/ppc/context.h>
-#include <rex/ppc/memory.h>
+#include "ppc_compat.h"
 
 #include "fps_overlay.h"
 #include "android_driver.h"
@@ -269,6 +269,10 @@ struct FlipStats {
 }  // namespace
 
 extern "C" PPC_FUNC(WWE2K16_IMP_ChooseFlip);
+namespace wwe2k16 {
+void ResolveCoherencyOnFrame();  // resolve_coherency.cpp
+}
+
 extern "C" PPC_FUNC(WWE2K16_FN_ChooseFlip) {
   wwe2k16::RecordGameFrame();
   FrameCapOnFrame();
@@ -277,6 +281,7 @@ extern "C" PPC_FUNC(WWE2K16_FN_ChooseFlip) {
     if (SpeedFixEnabled()) SpeedFixOnFrame(base, now_ns);
     wwe2k16::frame_monitor::OnGameFrame(now_ns);
     wwe2k16::android_driver::OnFrame();
+    wwe2k16::ResolveCoherencyOnFrame();
   }
   static uint32_t last_threshold = UINT32_MAX;
   static FlipStats stats;

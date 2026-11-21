@@ -16,13 +16,17 @@
 // Kill switch: WWE2K16_UNTILE_COHERENCY=0.
 
 #include <cstdint>
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
+#include <string>
 
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/graphics_system.h>
+#include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/ppc/context.h>
-#include <rex/ppc/memory.h>
+#include "ppc_compat.h"
 #include <rex/runtime.h>
 #include <rex/system/kernel_state.h>
 
@@ -55,6 +59,36 @@ uint64_t HashGuestRange(uint32_t address, uint64_t length) {
   return hash;
 }
 
+#if WWE2K16_SDK_K14
+std::atomic<int64_t> g_readback_until_ns{0};
+std::atomic<int> g_readback_mode{-1};
+
+int64_t NowNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+void SetReadbackMode(int mode) {
+  if (g_readback_mode.exchange(mode) != mode) {
+    rex::cvar::SetFlagByName("readback_resolve_override", std::to_string(mode));
+    REXLOG_INFO("[wwe2k16] readback_resolve_override {}", mode);
+  }
+}
+
+bool ReadbackAlways() {
+  static const bool on = [] {
+    const char* v = std::getenv("WWE2K16_READBACK_ALWAYS");
+    return v && v[0] == '1';
+  }();
+  return on;
+}
+
+void ResolveReadbackHold() {
+  g_readback_until_ns.store(NowNs() + 3'000'000'000ll, std::memory_order_relaxed);
+  SetReadbackMode(3);
+}
+#endif
+
 bool MakeUntileSourceVisible(uint32_t source, uint32_t width, uint32_t height,
                              uint32_t texel_pitch) {
   static const bool enabled = [] {
@@ -69,6 +103,14 @@ bool MakeUntileSourceVisible(uint32_t source, uint32_t width, uint32_t height,
   if (!size || size > 64u * 1024 * 1024) {
     return false;
   }
+#if WWE2K16_SDK_K14
+  // The WWE 2K14 SDK has no targeted readback; it has the run-time readback mode the 2K14 port switches for the same
+  // problem (create_readback.h there). The first untile of a load turns exact readback on (override 3) and every
+  // later one extends it; ResolveCoherencyOnFrame turns it off 3 s after the last. The very first texture of a
+  // batch may still read stale memory (its resolve came before this call): WWE2K16_READBACK_ALWAYS=1 keeps it on.
+  ResolveReadbackHold();
+  return true;
+#else
   auto* runtime = rex::Runtime::instance();
   auto* graphics = runtime ? static_cast<rex::graphics::GraphicsSystem*>(runtime->graphics_system())
                            : nullptr;
@@ -77,6 +119,7 @@ bool MakeUntileSourceVisible(uint32_t source, uint32_t width, uint32_t height,
   }
   bool ok = graphics->command_processor()->MakeGpuWritesVisibleToCpu(source, uint32_t(size));
   return ok;
+#endif
 }
 
 }  // namespace
@@ -108,3 +151,17 @@ extern "C" PPC_FUNC(WWE2K16_FN_UntileSurface) {
         readback_ok ? "ok" : "failed", source_hash, dest_hash);
   }
 }
+
+namespace wwe2k16 {
+// Every game frame (ChooseFlip hook): ends the exact-readback window of the WWE 2K14 SDK build.
+void ResolveCoherencyOnFrame() {
+#if WWE2K16_SDK_K14
+  if (ReadbackAlways()) {
+    SetReadbackMode(3);
+  } else if (g_readback_mode.load(std::memory_order_relaxed) == 3 &&
+             NowNs() > g_readback_until_ns.load(std::memory_order_relaxed)) {
+    SetReadbackMode(-1);
+  }
+#endif
+}
+}  // namespace wwe2k16

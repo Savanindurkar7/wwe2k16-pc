@@ -1,0 +1,13 @@
+# WWE 2K16 for the ReXGlue 0.10 code generator (the WWE 2K14 SDK: tools/native-stage1.sh). Same game, same function
+# lists as wwe2k16_config.toml (the 0.7 build); 0.10 reads a manifest instead and writes generated_k14/.
+[project]
+name = "wwe2k16"
+sdk_version = "0.10.0"
+game_root = "game"
+
+[entrypoint]
+file_path = "game/default.xex"
+out_directory_path = "generated_k14"
+setjmp_address = 0x831EFB10
+longjmp_address = 0x831EF7F0
+includes = ["config/functions.toml", "config/functions_fptrs.toml", "config/functions_thunks.toml", "config/hooks.toml"]

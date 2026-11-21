@@ -135,7 +135,12 @@ bool WritePng(const std::filesystem::path& path, rex::ui::RawImage& image, uint3
 }  // namespace
 
 void TakeScreenshot(rex::Runtime* runtime) {
+#if __has_include(<rex/system/gpu_plugin.h>)
+  // ReXGlue 0.10: the graphics system lives in the GPU plugin; only its interface is visible here.
+  auto* graphics = runtime ? runtime->graphics_system() : nullptr;
+#else
   auto* graphics = runtime ? static_cast<rex::graphics::GraphicsSystem*>(runtime->graphics_system()) : nullptr;
+#endif
   rex::ui::Presenter* presenter = graphics ? graphics->presenter() : nullptr;
   if (!presenter) {
     REXLOG_WARN("[wwe2k16-screenshot] no presenter yet");

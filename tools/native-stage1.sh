@@ -50,12 +50,12 @@ fi
 step "3/4 Host build of the SDK's code generator"
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libxss-dev libxrandr-dev libxcursor-dev libxi-dev \
     libxinerama-dev libxtst-dev >/dev/null 2>&1 || true
-# Clang 18 + GCC 13 headers: the concepts macro for C++20+ targets only (as in the root CMakeLists.txt).
+# Clang 18 + GCC 13 headers: the concepts macro for C++20+ targets only (as in the root CMakeLists.txt). This file runs
+# as CMAKE_PROJECT_TOP_LEVEL_INCLUDES, before the compiler is known, so no compiler check here (clang-18 is forced
+# below anyway).
 cat > out/k14-concepts.cmake <<'EOF'
-if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 19)
-    set(_cxx20 "$<AND:$<COMPILE_LANGUAGE:CXX>,$<VERSION_GREATER_EQUAL:$<TARGET_PROPERTY:CXX_STANDARD>,20>>")
-    add_compile_options("$<${_cxx20}:-D__cpp_concepts=202002L>" "$<${_cxx20}:-Wno-builtin-macro-redefined>")
-endif()
+set(_cxx20 "$<AND:$<COMPILE_LANGUAGE:CXX>,$<VERSION_GREATER_EQUAL:$<TARGET_PROPERTY:CXX_STANDARD>,20>>")
+add_compile_options("$<${_cxx20}:-D__cpp_concepts=202002L>" "$<${_cxx20}:-Wno-builtin-macro-redefined>")
 EOF
 GEN=(); command -v ninja >/dev/null && [ ! -f "$BUILD/CMakeCache.txt" ] && GEN=(-G Ninja)
 cmake -S "$SDK" -B "$BUILD" "${GEN[@]}" -DCMAKE_C_COMPILER=clang-18 -DCMAKE_CXX_COMPILER=clang++-18 \
@@ -68,12 +68,16 @@ REXGLUE="$(find "$SDK/out" "$BUILD" -name rexglue -type f -perm -u+x 2>/dev/null
 echo "code generator: $REXGLUE ($("$REXGLUE" --version 2>&1 | head -1))"
 
 step "4/4 Recompile WWE 2K16 with it (into generated_k14/)"
-sed 's#^out_directory_path *=.*#out_directory_path = "generated_k14"#' wwe2k16_config.toml > out/wwe2k16_k14_config.toml
-cp out/wwe2k16_k14_config.toml wwe2k16_k14_config.toml   # includes are relative to the repo root
+# 0.10 reads a manifest ([project] / [entrypoint]): wwe2k16_k14_manifest.toml. Skipped when generated_k14/ is complete
+# (FORCE_CODEGEN=1 redoes it).
+if [ -f generated_k14/sources.cmake ] && [ -f generated_k14/wwe2k16_init.h ] && [ "${FORCE_CODEGEN:-0}" != 1 ]; then
+    echo "generated_k14/ is already there ($(ls generated_k14 | wc -l) files): skipped (FORCE_CODEGEN=1 to redo)"
+    echo "==== DONE."
+    exit 0
+fi
 rm -rf generated_k14
 start=$(date +%s)
-"$REXGLUE" codegen wwe2k16_k14_config.toml > out/k14-codegen.log 2>&1 || { tail -40 out/k14-codegen.log; rm -f wwe2k16_k14_config.toml; die "codegen failed (out/k14-codegen.log)"; }
-rm -f wwe2k16_k14_config.toml
+"$REXGLUE" codegen wwe2k16_k14_manifest.toml > out/k14-codegen.log 2>&1 || { tail -40 out/k14-codegen.log; die "codegen failed (out/k14-codegen.log)"; }
 echo "codegen took $(( $(date +%s) - start )) s"
 grep -E "Recompiling|functions|complete|error|warning" out/k14-codegen.log | grep -vi "debug" | tail -12 || true
 echo "generated_k14: $(ls generated_k14 | wc -l) files, $(du -sh generated_k14 | cut -f1)"

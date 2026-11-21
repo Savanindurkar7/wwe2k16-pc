@@ -15,16 +15,28 @@
 
 #include <rex/cvar.h>
 #include <rex/filesystem.h>
+#if __has_include(<rex/system/gpu_plugin.h>)
+#include <rex/system/gpu_plugin.h>  // ReXGlue 0.10: the GPU is a plugin
+#else
 #include <rex/graphics/vulkan/graphics_system.h>
+#endif
 #include <rex/logging.h>
 #include <rex/runtime.h>
 #include <rex/rex_app.h>
+#if __has_include(<rex/system/xam/achievements.h>)
 #include <rex/system/xam/achievements.h>
+#define WWE2K16_HAVE_ACHIEVEMENT_API 1
+#else
+#define WWE2K16_HAVE_ACHIEVEMENT_API 0  // WWE 2K14 SDK: achievements are its own overlay
+#endif
 #include <rex/ui/keybinds.h>
+#include "ppc_compat.h"  // WWE2K16_SDK_K14
 #include <rex/input/input_system.h>
 
 #include "achievement_sound.h"
+#if WWE2K16_HAVE_ACHIEVEMENT_API
 #include "achievement_toast.h"
+#endif
 #include "android_driver.h"
 #include "disc_image.h"
 #include "display_refresh_rate.h"
@@ -32,6 +44,7 @@
 #include "frame_monitor.h"
 #include "launcher_settings.h"
 #include "screenshot.h"
+#include "native_renderer.h"
 #include "script_input.h"
 #include "touch_input.h"
 
@@ -48,7 +61,9 @@ class Wwe2k16App : public rex::ReXApp {
     return std::unique_ptr<Wwe2k16App>(new Wwe2k16App(ctx, "wwe2k16", PPCImageConfig));
   }
 
+#if !WWE2K16_SDK_K14
   std::string_view GetWindowTitle() const override { return "WWE 2K16"; }
+#endif
 
   // Started without the launcher (no game folder argument, e.g. double-clicking the exe): use the settings last
   // saved in the launcher (launcher_settings.cpp).
@@ -69,14 +84,29 @@ class Wwe2k16App : public rex::ReXApp {
   void OnLoadXexImage(std::string& xex_image) override {
     (void)xex_image;
     wwe2k16::MountDiscImage(runtime());
+    wwe2k16::MountUtilityCache(runtime());
   }
 
   void OnPreSetup(rex::RuntimeConfig& config) override {
     // The SDK picks D3D12 whenever it is built in; it hangs the GPU when the Play menu loads (DEVICE_HUNG,
     // 2026-10-16). Vulkan is the default; WWE2K16_GPU=d3d12 for comparison.
+#if WWE2K16_SDK_K14
+    // WWE 2K14 SDK: the GPU is the runtime-loaded "xenos" plugin (librexgpu-xenos.so next to libmain.so). Loaded here,
+    // not after this hook, so its settings (Vulkan present modes, readback, the native renderer) exist before the
+    // lines below set them; command-line values for them are replayed by the SDK as they register.
+    if (config.gpu_plugin.empty()) config.gpu_plugin = "xenos";
+    if (!config.graphics) {
+      config.graphics = rex::system::LoadGpuPlugin(config.gpu_plugin, EnvIs("WWE2K16_GPU", "d3d12") ? "d3d12" : "vulkan");
+      if (!config.graphics) config.graphics = rex::system::LoadGpuPlugin(config.gpu_plugin, "any");
+    }
+#endif
+    // Renderer profile (native_renderer.h): classic / native / native_plus.
+    wwe2k16::native_renderer::Apply();
+#if !WWE2K16_SDK_K14
     if (!EnvIs("WWE2K16_GPU", "d3d12")) {
       config.graphics = REX_GRAPHICS_BACKEND(rex::graphics::vulkan::VulkanGraphicsSystem);
     }
+#endif
     REXLOG_INFO("[wwe2k16] graphics backend: {}", EnvIs("WWE2K16_GPU", "d3d12") ? "D3D12" : "Vulkan");
 
     // Render target path: "fbo" (fast, default); WWE2K16_RT_PATH=fsi selects fragment shader interlock (exact EDRAM
@@ -299,12 +329,14 @@ class Wwe2k16App : public rex::ReXApp {
     if (window()) display_refresh_rate_.SwitchTo60Hz(window()->GetNativeWindowHandle());
 #endif
     fps_overlay_.Attach(drawer);
+#if WWE2K16_HAVE_ACHIEVEMENT_API
     achievement_toasts_.Attach(&app_context(), drawer, window()->GetNativeWindowHandle());
     achievement_toasts_.SetSound(
         wwe2k16::LoadOggAsWav(rex::filesystem::GetExecutableFolder() / "achievement.ogg"));
     rex::system::xam::SetAchievementUnlockedHandler([this](const rex::system::xam::AchievementInfo& a) {
       achievement_toasts_.Push(a.name, a.description, a.icon_path);
     });
+#endif
   }
 
   // The title's achievement table is readable once the module is set up for launch (not in
@@ -312,7 +344,9 @@ class Wwe2k16App : public rex::ReXApp {
   // unlock state, plus the icons, for the launcher's Achievements panel.
   void OnPostLaunchModule(rex::system::XThread* thread) override {
     (void)thread;
+#if WWE2K16_HAVE_ACHIEVEMENT_API
     rex::system::xam::WriteAchievementSummary();
+#endif
   }
 
   void OnShutdown() override {
@@ -320,8 +354,10 @@ class Wwe2k16App : public rex::ReXApp {
     rex::ui::UnregisterBind("bind_toggle_fullscreen");
     rex::ui::UnregisterBind("bind_screenshot");
     fps_overlay_.Detach();
+#if WWE2K16_HAVE_ACHIEVEMENT_API
     rex::system::xam::SetAchievementUnlockedHandler(nullptr);
     achievement_toasts_.Detach();
+#endif
 #if defined(_WIN32)
     display_refresh_rate_.Restore();
 #endif
@@ -334,7 +370,9 @@ class Wwe2k16App : public rex::ReXApp {
   }
 
  private:
+#if WWE2K16_HAVE_ACHIEVEMENT_API
   wwe2k16::AchievementToasts achievement_toasts_;
+#endif
   wwe2k16::FpsOverlay fps_overlay_;
   wwe2k16::DisplayRefreshRate display_refresh_rate_;
 

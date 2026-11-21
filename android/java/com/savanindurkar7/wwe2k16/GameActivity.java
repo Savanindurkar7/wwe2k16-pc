@@ -151,6 +151,8 @@ public class GameActivity extends SDLActivity {
 
     private void applyEnvironment() {
         setenv("HOME", getFilesDir().getAbsolutePath());
+        // The 0.10 SDK's SDL_main makes this the working folder (its logs\ and config file go there).
+        setenv("WWE2K14_FILES_DIR", getFilesDir().getAbsolutePath());
         setenv("TMPDIR", getCacheDir().getAbsolutePath());
         setenv("WWE2K16_NATIVE_LIB_DIR", getApplicationInfo().nativeLibraryDir + "/");
         setenv("WWE2K16_TMP_DIR", getCacheDir().getAbsolutePath() + "/");
@@ -198,7 +200,10 @@ public class GameActivity extends SDLActivity {
 
     @Override
     protected String[] getLibraries() {
-        // SDL is linked into libmain.so (static), so the game library is the only one to load.
+        // Classic APK: SDL is linked into libmain.so (static), the game library is the only one to load. Native APK
+        // (WWE 2K14 SDK): libmain.so links the shared C++ library and the SDK runtime (SDL is inside the runtime); the
+        // GPU plugin (librexgpu-xenos.so) is loaded by the runtime itself.
+        if (Settings.isNativeBuild(this)) return new String[] {"c++_shared", "rexruntime", "main"};
         return new String[] {"main"};
     }
 

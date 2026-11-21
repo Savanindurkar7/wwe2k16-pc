@@ -4,8 +4,12 @@
 #pragma once
 
 #include <cstdlib>
+#include <vector>
 
 #include <rex/input/input_driver.h>
+#if __has_include(<rex/input/device.h>)
+#include <rex/input/device.h>
+#endif
 
 #include "test_input.h"
 
@@ -26,30 +30,60 @@ class ScriptInputDriver : public rex::input::InputDriver {
 
   X_STATUS Setup() override { return X_STATUS_SUCCESS; }
 
-  X_RESULT GetCapabilities(uint32_t user_index, uint32_t, X_INPUT_CAPABILITIES* out_caps) override {
-    if (user_index != 0) return X_ERROR_DEVICE_NOT_CONNECTED;
-    *out_caps = {};
-    out_caps->type = 0x01;     // gamepad
-    out_caps->sub_type = 0x01;  // standard controller
+#if __has_include(<rex/input/device.h>)
+  // ReXGlue 0.10: one synthetic device, merged into player 1.
+  static constexpr DeviceId kDevice = static_cast<DeviceId>(0x53435249);  // 'SCRI'
+  void EnumerateDevices(std::vector<DeviceInfo>& out) override {
+    DeviceInfo info;
+    info.id = kDevice;
+    info.name = "Test script";
+    info.synthetic = true;
+    out.push_back(info);
+  }
+  X_RESULT GetDeviceCapabilities(DeviceId id, uint32_t, X_INPUT_CAPABILITIES* out_caps) override {
+    if (id != kDevice) return X_ERROR_DEVICE_NOT_CONNECTED;
+    if (out_caps) Caps(out_caps);
     return X_ERROR_SUCCESS;
   }
-
+  X_RESULT GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) override {
+    if (id != kDevice) return X_ERROR_DEVICE_NOT_CONNECTED;
+    if (out_state) State(out_state);
+    return X_ERROR_SUCCESS;
+  }
+  X_RESULT SetDeviceVibration(DeviceId id, X_INPUT_VIBRATION*) override {
+    return id == kDevice ? X_ERROR_SUCCESS : X_ERROR_DEVICE_NOT_CONNECTED;
+  }
+  X_RESULT GetDeviceKeystroke(DeviceId, uint32_t, X_INPUT_KEYSTROKE*) override { return X_ERROR_EMPTY; }
+#else
+  X_RESULT GetCapabilities(uint32_t user_index, uint32_t, X_INPUT_CAPABILITIES* out_caps) override {
+    if (user_index != 0) return X_ERROR_DEVICE_NOT_CONNECTED;
+    Caps(out_caps);
+    return X_ERROR_SUCCESS;
+  }
   X_RESULT GetState(uint32_t user_index, X_INPUT_STATE* out_state) override {
     if (user_index != 0) return X_ERROR_DEVICE_NOT_CONNECTED;
+    State(out_state);
+    return X_ERROR_SUCCESS;
+  }
+  X_RESULT SetState(uint32_t user_index, X_INPUT_VIBRATION*) override {
+    return user_index == 0 ? X_ERROR_SUCCESS : X_ERROR_DEVICE_NOT_CONNECTED;
+  }
+  X_RESULT GetKeystroke(uint32_t, uint32_t, X_INPUT_KEYSTROKE*) override { return X_ERROR_EMPTY; }
+#endif
+
+ private:
+  static void Caps(X_INPUT_CAPABILITIES* out_caps) {
+    *out_caps = {};
+    out_caps->type = 0x01;      // gamepad
+    out_caps->sub_type = 0x01;  // standard controller
+  }
+  void State(X_INPUT_STATE* out_state) {
     const TestInput in = PollTestInput();
     *out_state = {};
     out_state->packet_number = ++packet_;
     out_state->gamepad.buttons = in.buttons;
-    return X_ERROR_SUCCESS;
   }
 
-  X_RESULT SetState(uint32_t user_index, X_INPUT_VIBRATION*) override {
-    return user_index == 0 ? X_ERROR_SUCCESS : X_ERROR_DEVICE_NOT_CONNECTED;
-  }
-
-  X_RESULT GetKeystroke(uint32_t, uint32_t, X_INPUT_KEYSTROKE*) override { return X_ERROR_EMPTY; }
-
- private:
   uint32_t packet_ = 0;
 };
 

@@ -24,8 +24,8 @@ TouchPadState& GetTouchPad() {
 
 X_STATUS TouchInputDriver::Setup() { return X_STATUS_SUCCESS; }
 
-X_RESULT TouchInputDriver::GetCapabilities(uint32_t user_index, uint32_t, X_INPUT_CAPABILITIES* out_caps) {
-  if (user_index != 0 || !GetTouchPad().enabled.load(std::memory_order_relaxed)) return X_ERROR_DEVICE_NOT_CONNECTED;
+namespace {
+void FillCaps(X_INPUT_CAPABILITIES* out_caps) {
   *out_caps = {};
   out_caps->type = 0x01;      // gamepad
   out_caps->sub_type = 0x01;  // standard controller
@@ -38,12 +38,9 @@ X_RESULT TouchInputDriver::GetCapabilities(uint32_t user_index, uint32_t, X_INPU
   out_caps->gamepad.thumb_ry = int16_t(0x7FFF);
   out_caps->vibration.left_motor_speed = 0xFFFF;
   out_caps->vibration.right_motor_speed = 0xFFFF;
-  return X_ERROR_SUCCESS;
 }
-
-X_RESULT TouchInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
+void FillState(X_INPUT_STATE* out_state) {
   TouchPadState& pad = GetTouchPad();
-  if (user_index != 0 || !pad.enabled.load(std::memory_order_relaxed)) return X_ERROR_DEVICE_NOT_CONNECTED;
   *out_state = {};
   out_state->packet_number = pad.version.load(std::memory_order_acquire);
   out_state->gamepad.buttons = uint16_t(pad.buttons.load(std::memory_order_relaxed));
@@ -53,20 +50,74 @@ X_RESULT TouchInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_stat
   out_state->gamepad.thumb_ly = int16_t(pad.ly.load(std::memory_order_relaxed));
   out_state->gamepad.thumb_rx = int16_t(pad.rx.load(std::memory_order_relaxed));
   out_state->gamepad.thumb_ry = int16_t(pad.ry.load(std::memory_order_relaxed));
+}
+void StoreRumble(X_INPUT_VIBRATION* vibration) {
+  if (vibration) {
+    GetTouchPad().rumble.store((uint32_t(vibration->left_motor_speed) << 16) | vibration->right_motor_speed,
+                               std::memory_order_relaxed);
+  }
+}
+bool Enabled() { return GetTouchPad().enabled.load(std::memory_order_relaxed); }
+}  // namespace
+
+#if WWE2K16_INPUT_DEVICE_API
+
+namespace {
+constexpr DeviceId kTouchDevice = static_cast<DeviceId>(0x544F5543);  // 'TOUC'
+}
+
+void TouchInputDriver::EnumerateDevices(std::vector<DeviceInfo>& out) {
+  DeviceInfo info;
+  info.id = kTouchDevice;
+  info.name = "Touch controls";
+  info.guid = "wwe2k16-touch";
+  info.synthetic = true;  // merged into player 1, so a real pad (player 1 by order) still works alongside
+  out.push_back(info);
+}
+
+X_RESULT TouchInputDriver::GetDeviceCapabilities(DeviceId id, uint32_t, X_INPUT_CAPABILITIES* out_caps) {
+  if (id != kTouchDevice || !Enabled()) return X_ERROR_DEVICE_NOT_CONNECTED;
+  if (out_caps) FillCaps(out_caps);
+  return X_ERROR_SUCCESS;
+}
+
+X_RESULT TouchInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
+  if (id != kTouchDevice || !Enabled()) return X_ERROR_DEVICE_NOT_CONNECTED;
+  if (out_state) FillState(out_state);
+  return X_ERROR_SUCCESS;
+}
+
+X_RESULT TouchInputDriver::SetDeviceVibration(DeviceId id, X_INPUT_VIBRATION* vibration) {
+  if (id != kTouchDevice || !Enabled()) return X_ERROR_DEVICE_NOT_CONNECTED;
+  StoreRumble(vibration);
+  return X_ERROR_SUCCESS;
+}
+
+X_RESULT TouchInputDriver::GetDeviceKeystroke(DeviceId, uint32_t, X_INPUT_KEYSTROKE*) { return X_ERROR_EMPTY; }
+
+#else
+
+X_RESULT TouchInputDriver::GetCapabilities(uint32_t user_index, uint32_t, X_INPUT_CAPABILITIES* out_caps) {
+  if (user_index != 0 || !Enabled()) return X_ERROR_DEVICE_NOT_CONNECTED;
+  FillCaps(out_caps);
+  return X_ERROR_SUCCESS;
+}
+
+X_RESULT TouchInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
+  if (user_index != 0 || !Enabled()) return X_ERROR_DEVICE_NOT_CONNECTED;
+  FillState(out_state);
   return X_ERROR_SUCCESS;
 }
 
 X_RESULT TouchInputDriver::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration) {
-  TouchPadState& pad = GetTouchPad();
-  if (user_index != 0 || !pad.enabled.load(std::memory_order_relaxed)) return X_ERROR_DEVICE_NOT_CONNECTED;
-  if (vibration) {
-    pad.rumble.store((uint32_t(vibration->left_motor_speed) << 16) | vibration->right_motor_speed,
-                     std::memory_order_relaxed);
-  }
+  if (user_index != 0 || !Enabled()) return X_ERROR_DEVICE_NOT_CONNECTED;
+  StoreRumble(vibration);
   return X_ERROR_SUCCESS;
 }
 
 X_RESULT TouchInputDriver::GetKeystroke(uint32_t, uint32_t, X_INPUT_KEYSTROKE*) { return X_ERROR_EMPTY; }
+
+#endif
 
 }  // namespace wwe2k16
 

@@ -9,6 +9,7 @@
 #include "disc_image.h"
 
 #include <algorithm>
+#include <filesystem>
 #include <cctype>
 #include <cstdlib>
 #include <memory>
@@ -21,7 +22,13 @@
 #include <rex/logging.h>
 #include <rex/runtime.h>
 
-#include "filesystem/devices/disc_image_device.h"
+#include "ppc_compat.h"  // WWE2K16_SDK_K14
+
+#if __has_include(<rex/filesystem/devices/disc_image_device.h>)
+#include <rex/filesystem/devices/disc_image_device.h>  // ReXGlue 0.10
+#else
+#include "filesystem/devices/disc_image_device.h"  // ReXGlue 0.7 (from the SDK's src/)
+#endif
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -134,6 +141,57 @@ void MountDiscImage(rex::Runtime* runtime) {
       "\\Device\\Harddisk0", std::initializer_list<std::string>{"\\Partition0", "\\Cache0", "\\Cache1"});
   if (null_device->Initialize()) fs->RegisterDevice(std::move(null_device));
   REXLOG_INFO("[wwe2k16] mounted the disc image as the game drive");
+}
+
+namespace {
+// A folder on the phone / PC as the utility cache, with the free space of that disk (the game checks it has room).
+class UtilityCacheDevice final : public rex::filesystem::HostPathDevice {
+ public:
+  explicit UtilityCacheDevice(const std::filesystem::path& host_path)
+      : HostPathDevice("\\Device\\Harddisk0\\Cache0", host_path, false) {}
+  uint32_t total_allocation_units() const override { return Units(Space().capacity); }
+  uint32_t available_allocation_units() const override {
+    const auto s = Space();
+    return Units(std::min(s.available, s.capacity));
+  }
+
+ private:
+  static uint32_t Units(std::uintmax_t bytes) {
+    return uint32_t(std::min<std::uintmax_t>(bytes / 512, 0xFFFFFFFFu));
+  }
+  std::filesystem::space_info Space() const {
+    std::error_code ec;
+    auto s = std::filesystem::space(host_path(), ec);
+    return ec ? std::filesystem::space_info{} : s;
+  }
+};
+}  // namespace
+
+void MountUtilityCache(rex::Runtime* runtime) {
+  if (!runtime || !runtime->file_system() || runtime->user_data_root().empty()) return;
+  auto* fs = runtime->file_system();
+#if !WWE2K16_SDK_K14
+  return;  // ReXGlue 0.7: --mount_cache (OnPreSetup) mounts it in the runtime
+#endif
+  const auto host_path = std::filesystem::absolute(runtime->user_data_root()) / "cache_drive";
+  std::error_code ec;
+  std::filesystem::create_directories(host_path, ec);
+  auto device = std::make_unique<UtilityCacheDevice>(host_path);
+  if (!device->Initialize()) {
+    REXLOG_WARN("[wwe2k16] utility cache: cannot use {}", rex::path_to_utf8(host_path));
+    return;
+  }
+  // Devices resolve in registration order and the runtime's NullDevice covers all of \Device\Harddisk0 (Cache0
+  // included): put the cache drive first, then the NullDevice again for the other partitions.
+  const bool had_null = fs->UnregisterDevice("\\Device\\Harddisk0");
+  fs->RegisterDevice(std::move(device));
+  if (had_null) {
+    auto null_device = std::make_unique<rex::filesystem::NullDevice>(
+        "\\Device\\Harddisk0", std::initializer_list<std::string>{"\\Partition0", "\\Cache1"});
+    if (null_device->Initialize()) fs->RegisterDevice(std::move(null_device));
+  }
+  fs->RegisterSymbolicLink("cache:", "\\Device\\Harddisk0\\Cache0");
+  REXLOG_INFO("[wwe2k16] utility cache: {} mounted at cache:", rex::path_to_utf8(host_path));
 }
 
 }  // namespace wwe2k16

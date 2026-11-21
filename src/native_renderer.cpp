@@ -1,0 +1,156 @@
+// wwe2k16 - renderer profiles for the WWE 2K14 SDK build (ReXGlue 0.10 + the WWE 2K14 port's 118 SDK patches).
+// See native_renderer.h.
+//
+// The lists are the 2K14 port's (src/gfx_settings.h NativeRendererFlags and the Android block of wwe2k14_app.h, by
+// Jarrod Feng, BSD-3), with the settings that are 2K14-only left out: wwe2k14_* (its own game hooks),
+// gpu_native_shader_swap (2K14's own copy of its post-processing pass, keyed to 2K14's shaders) and
+// gpu_native_truth_color_none (white patches on the Adreno 830 in their runs). Everything else is SDK-side: it works on
+// the Xbox 360 GPU command stream, not on one game.
+//
+// WWE 2K16 builds character textures on the GPU and untiles them on the CPU (resolve_coherency.cpp). The settings that
+// skip a resolve's write-back to guest memory ("texture-only" resolves) are therefore only in the "native_plus"
+// profile; "native" keeps every write-back, so those textures stay right.
+
+#include "native_renderer.h"
+
+#include <cstdlib>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include <rex/cvar.h>
+#include <rex/logging.h>
+
+#include "ppc_compat.h"  // WWE2K16_SDK_K14
+
+namespace wwe2k16::native_renderer {
+namespace {
+
+using Flag = std::pair<const char*, const char*>;
+
+// Phone basics, every profile (2K14 Android, Sessions 63-74).
+const std::vector<Flag> kPhone = {
+    // Mali and PowerVR drivers lack these; nothing in a boot or a match needs them (2K14 Session 73 / 95).
+    {"vulkan_require_vertex_pipeline_stores_and_atomics", "false"},
+    {"vulkan_require_fill_mode_non_solid", "false"},
+    {"vulkan_require_geometry_shader", "false"},
+    // Separate submit thread + submit before fence waits: 39.7 -> 47.7 fps in a 2K14 match (Session 63).
+    {"vulkan_async_submit", "true"},
+    {"vulkan_submit_on_wait", "true"},
+    {"vulkan_deferred_descriptor_writes", "true"},
+    {"gpu_wait_reg_mem_spin", "true"},
+    // Resolve readbacks batched, small one-off copies still exact (Session 74).
+    {"readback_resolve_batch", "true"},
+    {"readback_resolve_batch_min_bytes", "16385"},
+    // Adreno keeps no shader cache of its own: the SDK's VkPipelineCache on disk.
+    {"vulkan_disk_pipeline_cache", "true"},
+};
+
+// The native renderer: the scene drawn by the SDK's own renderer with the game's shaders (no EDRAM emulation), on the
+// host render-target path (phones have no fragment shader interlock).
+const std::vector<Flag> kNative = {
+    {"gpu_native", "2"},
+    {"gpu_native_truth", "true"},
+    {"gpu_native_truth_host_rt", "true"},
+    {"gpu_fast_clear", "true"},
+    {"gpu_native_half2", "2"},
+    {"gpu_native_half2_skip_gpr_draws", "true"},
+    {"gpu_native_lean_draws", "true"},
+    {"gpu_native_lean_benign_writes", "true"},
+    {"gpu_native_trust_geometry_pages", "true"},
+    {"gpu_native_gpu_timers", "false"},
+    {"vulkan_merge_adjacent_barriers", "true"},
+    {"gpu_native_truth_batch_resolves", "true"},
+    {"gpu_native_truth_batch_rename", "true"},
+    {"gpu_native_truth_batch_fills", "true"},
+    {"gpu_native_truth_lazy_pass_deps", "true"},
+    {"gpu_native_truth_lazy_pass_style", "1"},
+    {"gpu_native_truth_rename_depth", "true"},
+    {"gpu_native_truth_pass_dont_care", "true"},
+    {"gpu_native_truth_skip_restores", "true"},
+    {"gpu_native_truth_fill_rename_check", "true"},
+    {"gpu_native_vertex_endian_spec", "true"},
+    {"vulkan_uniform_pool_device_local", "true"},
+    {"vulkan_device_local_upload_min_heap_mb", "128"},
+};
+
+// More speed, less margin: resolves only a texture reads skip their write-back, textures load straight into their
+// storage, shader specialisations. Try it after "native" is right.
+const std::vector<Flag> kNativePlus = {
+    {"gpu_native_truth_skip_writeback", "true"},
+    {"gpu_native_truth_skip_writeback_scaled", "true"},
+    {"gpu_native_truth_skip_repeat_resolves", "true"},
+    {"gpu_native_truth_drop_dead_resolves", "1"},
+    {"gpu_native_truth_direct_resolve_scaled", "true"},
+    {"gpu_native_truth_direct_resolve_scaled_full", "true"},
+    {"gpu_native_truth_direct_resolve_scaled_texture", "true"},
+    {"gpu_native_truth_direct_resolve_scaled_full_texture", "true"},
+    {"gpu_native_truth_direct_resolve_scaled_small", "true"},
+    {"gpu_native_truth_direct_resolve_full_1x", "true"},
+    {"gpu_native_truth_direct_resolve_depth", "true"},
+    {"gpu_native_truth_fill_direct", "true"},
+    {"gpu_native_truth_fill_direct_small", "true"},
+    {"gpu_native_truth_fill_direct_depth", "true"},
+    {"gpu_native_truth_defer_dest_use", "true"},
+    {"gpu_native_truth_defer_dest_use_scaled", "true"},
+    {"gpu_native_truth_texture_fill_scaled", "true"},
+    {"gpu_native_truth_texture_fill_scaled_kinds", "32"},
+    {"vulkan_texture_load_direct_unscaled", "true"},
+    {"vulkan_texture_load_direct_unscaled_any_page", "true"},
+    {"vulkan_texture_native_storage_small", "true"},
+    {"vulkan_texture_sample_written_early", "true"},
+    {"gpu_native_ps_texture_spec", "true"},
+    {"gpu_native_ps_mul_mode", "2"},
+    {"gpu_native_ps_implicit_lod", "true"},
+    {"gpu_native_ps_epilogue_spec", "true"},
+    {"gpu_native_vs_mul_mode", "1"},
+    {"gpu_native_vs_mul_fetch_finite", "true"},
+    {"gpu_native_fma", "3"},
+};
+
+// A value from the launcher's extra arguments (or the command line) wins: only settings still at default are set.
+int Apply(const std::vector<Flag>& flags) {
+  int set = 0;
+  for (const auto& [name, value] : flags) {
+    if (rex::cvar::HasNonDefaultValue(name)) continue;
+    if (rex::cvar::SetFlagByName(name, value)) {
+      ++set;
+    } else {
+      REXLOG_WARN("[wwe2k16-renderer] {} is not a setting of this SDK", name);
+    }
+  }
+  return set;
+}
+
+}  // namespace
+
+std::string_view Profile() {
+  const char* v = std::getenv("WWE2K16_RENDERER");
+  const std::string_view p = v ? v : "";
+  if (p == "native" || p == "native_plus") return p;
+  return "classic";
+}
+
+void Apply() {
+#if WWE2K16_SDK_K14
+  const std::string_view profile = Profile();
+  int set = 0;
+#if defined(__ANDROID__)
+  set += Apply(kPhone);
+#endif
+  if (profile == "native" || profile == "native_plus") set += Apply(kNative);
+  if (profile == "native_plus") set += Apply(kNativePlus);
+  REXLOG_INFO("[wwe2k16-renderer] profile {}: {} settings applied; gpu_native={} truth={} host_rt={}", profile, set,
+              rex::cvar::GetFlagByName("gpu_native"), rex::cvar::GetFlagByName("gpu_native_truth"),
+              rex::cvar::GetFlagByName("gpu_native_truth_host_rt"));
+#else
+  if (Profile() != "classic") {
+    REXLOG_WARN("[wwe2k16-renderer] WWE2K16_RENDERER={} needs the native build (tools/android-build-k14.sh); this "
+                "build has the classic renderer only",
+                Profile());
+  }
+#endif
+}
+
+}  // namespace wwe2k16::native_renderer

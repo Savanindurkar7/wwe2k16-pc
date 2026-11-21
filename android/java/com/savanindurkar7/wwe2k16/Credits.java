@@ -19,7 +19,7 @@ final class Credits {
             {"Android port", PORT_BY + " (" + GITHUB + ")"},
             {"WWE 2K16 PC recompilation", "Banshee (the PC port this Android version is built on)"},
             {"ReXGlue SDK", "The recompiler and runtime, with parts from the Xenia project"},
-            {"WWE 2K14 recompilation", "Jarrod Feng: Android driver loader and SDK fixes (BSD 3-Clause)"},
+            {"WWE 2K14 recompilation", "Jarrod Feng: the WWE 2K14 SDK and native renderer (native APK), Android driver loader and SDK fixes (BSD 3-Clause)"},
             {"WWE '12 PC / Android", "iMrBurn: Android audio, timer, UI and thread fixes"},
             {"WWE 2K17 port", "Xav: the game speed fix method (time step from the real frame time)"},
             {"libadrenotools", "bylaws: custom Vulkan driver loading (BSD 2-Clause)"},

@@ -6,24 +6,40 @@
 
 #include <atomic>
 #include <cstdint>
+#include <vector>
 
 #include <rex/input/input_driver.h>
 
 namespace wwe2k16 {
+
+#if __has_include(<rex/input/device.h>)
+#define WWE2K16_INPUT_DEVICE_API 1  // ReXGlue 0.10 (WWE 2K14 SDK): drivers list devices, the input system assigns them
+#include <rex/input/device.h>
+#else
+#define WWE2K16_INPUT_DEVICE_API 0  // ReXGlue 0.7: drivers answer per controller slot
+#endif
 
 class TouchInputDriver : public rex::input::InputDriver {
  public:
   explicit TouchInputDriver(rex::ui::Window* window) : InputDriver(window, 0) {}
 
   rex::X_STATUS Setup() override;
+#if WWE2K16_INPUT_DEVICE_API
+  // One synthetic device: the input system merges synthetic devices into player 1 next to any real pad.
+  void EnumerateDevices(std::vector<rex::input::DeviceInfo>& out) override;
+  rex::X_RESULT GetDeviceState(rex::input::DeviceId id, rex::input::X_INPUT_STATE* out_state) override;
+  rex::X_RESULT GetDeviceCapabilities(rex::input::DeviceId id, uint32_t flags,
+                                      rex::input::X_INPUT_CAPABILITIES* out_caps) override;
+  rex::X_RESULT SetDeviceVibration(rex::input::DeviceId id, rex::input::X_INPUT_VIBRATION* vibration) override;
+  rex::X_RESULT GetDeviceKeystroke(rex::input::DeviceId id, uint32_t flags,
+                                   rex::input::X_INPUT_KEYSTROKE* out) override;
+#else
   rex::X_RESULT GetCapabilities(uint32_t user_index, uint32_t flags,
                                 rex::input::X_INPUT_CAPABILITIES* out_caps) override;
   rex::X_RESULT GetState(uint32_t user_index, rex::input::X_INPUT_STATE* out_state) override;
   rex::X_RESULT SetState(uint32_t user_index, rex::input::X_INPUT_VIBRATION* vibration) override;
   rex::X_RESULT GetKeystroke(uint32_t user_index, uint32_t flags, rex::input::X_INPUT_KEYSTROKE* out) override;
-
- private:
-  uint32_t packet_ = 0;
+#endif
 };
 
 // The pad's state, written by the Java side (any thread), read by the driver.

@@ -35,6 +35,7 @@ set(WWE2K16_SOURCES
     src/frame_monitor.cpp
     src/android_driver.cpp
     src/touch_input.cpp
+    src/native_renderer.cpp
 )
 
 if(ANDROID)

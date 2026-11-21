@@ -57,12 +57,21 @@ public final class Settings {
 
     private static String[] a(String... s) { return s; }
 
+    public static final Choice RENDERER = new Choice(S_GRAPHICS, "renderer", "RENDERER", 1,
+            a("classic", "native", "native_plus"),
+            a("CLASSIC", "NATIVE", "NATIVE+"),
+            a("The emulated Xbox 360 GPU. The only renderer of the classic APK.",
+              "Native APK: the SDK's native renderer draws the scene (from the WWE 2K14 port). Lower resolutions and "
+              + "SGSR need it. The classic APK ignores this.",
+              "Native APK: Native plus the faster resolve and texture paths. Fastest, least tested: if a wrestler looks "
+              + "wrong, go back to NATIVE."));
+
     public static final Choice RESOLUTION = new Choice(S_GRAPHICS, "resolution", "RESOLUTION", 3,
             a("360", "480", "540", "720", "1080", "1440"),
             a("360p", "480p", "540p", "720p", "1080p", "1440p"),
-            a("Below 720p comes with the native renderer (next update). This build draws at 720p.",
-              "Below 720p comes with the native renderer (next update). This build draws at 720p.",
-              "Below 720p comes with the native renderer (next update). This build draws at 720p.",
+            a("Native APK with the NATIVE renderer: the scene drawn at 360p and scaled up (SGSR recommended). Else 720p.",
+              "Native APK with the NATIVE renderer: the scene drawn at 480p and scaled up (SGSR recommended). Else 720p.",
+              "Native APK with the NATIVE renderer: the scene drawn at 540p and scaled up (SGSR recommended). Else 720p.",
               "The game's own resolution. Best balance for phones.",
               "Drawn at 1440p (2x) and scaled to your screen: sharp, but only for the strongest phones.",
               "Drawn at 1440p (2x). Only for the strongest phones."));
@@ -91,8 +100,8 @@ public final class Settings {
     public static final Choice UPSCALER = new Choice(S_GRAPHICS, "upscaler", "UPSCALER", 0,
             a("bilinear", "sgsr", "fsr"),
             a("BILINEAR", "SGSR", "FSR"),
-            a("Plain scaling to your screen. Works now.",
-              "Snapdragon Game Super Resolution comes with the native renderer update. This build uses bilinear.",
+            a("Plain scaling to your screen. Works in both APKs.",
+              "Native APK: Snapdragon Game Super Resolution, sharp upscaling made for Adreno. The classic APK uses bilinear.",
               "FSR needs AMD's FidelityFX library, which is not in the Android build yet. This build uses bilinear."));
 
     public static final Choice TEXTURES = new Choice(S_GRAPHICS, "texture_quality", "TEXTURE QUALITY", 0,
@@ -129,11 +138,8 @@ public final class Settings {
     public static final Choice SHARPNESS = new Choice(S_DISPLAY, "sharpness", "SHARPNESS", 2,
             a("0", "25", "50", "75", "100"),
             a("0%", "25%", "50%", "75%", "100%"),
-            a("Used by the SGSR / FSR upscalers (not active in this build).",
-              "Used by the SGSR / FSR upscalers (not active in this build).",
-              "Used by the SGSR / FSR upscalers (not active in this build).",
-              "Used by the SGSR / FSR upscalers (not active in this build).",
-              "Used by the SGSR / FSR upscalers (not active in this build)."));
+            a("SGSR edge sharpness (native APK). Softest.", "SGSR edge sharpness (native APK).", "SGSR edge sharpness (native APK). Default.",
+              "SGSR edge sharpness (native APK).", "SGSR edge sharpness (native APK). Sharpest."));
 
     public static final Choice CPU_CORES = new Choice(S_PERFORMANCE, "cpu_cores", "CPU CORES", 1,
             a("all", "auto", "big"),
@@ -190,6 +196,13 @@ public final class Settings {
             a("The phone vibrates when the game rumbles the controller (hits, slams, finishers).",
               "No rumble on the phone."));
 
+    public static final Choice READBACK = new Choice(S_ADVANCED, "readback", "CHARACTER TEXTURE FIX", 0,
+            a("auto", "always"),
+            a("AUTO", "ALWAYS EXACT"),
+            a("Native APK: exact GPU readback while wrestler textures are built (loads), off in play.",
+              "Native APK: exact readback all the time. Use it if a wrestler or attire shows noise or black / magenta "
+              + "patches; it costs speed."));
+
     public static final Choice VK_DEBUG = new Choice(S_ADVANCED, "vk_debug", "VULKAN DEBUG MESSAGES", 1,
             a("1", "0"),
             a("ON", "OFF"),
@@ -197,17 +210,34 @@ public final class Settings {
               "Off: the Adreno driver alone sends about a million messages per match."));
 
     public static final Choice[] CHOICES = {
-            RESOLUTION, FRAME_RATE, MSAA, FAST_AA, UPSCALER, TEXTURES, FILTER,
+            RENDERER, RESOLUTION, FRAME_RATE, MSAA, FAST_AA, UPSCALER, TEXTURES, FILTER,
             DISPLAY, SCREEN_SHAPE, VSYNC, SHARPNESS,
             CPU_CORES, SPEED_FIX, SHADER_CACHE, FRAME_MONITOR, PERF_HINT, SUSTAINED,
             TOUCH, TOUCH_VIBRATE, RUMBLE,
-            VK_DEBUG,
+            READBACK, VK_DEBUG,
     };
 
     public static final String KEY_EXTRA_ARGS = "extra_args";
     public static final String KEY_DRIVER = "gpu_driver";  // "" = the phone's driver, else the driver folder's name
 
     private Settings() {}
+
+    private static Boolean nativeBuild;
+
+    /** True in the native renderer APK (tools/android-build-k14.sh puts assets/sdk.txt = "k14" into it). */
+    public static boolean isNativeBuild(Context c) {
+        if (nativeBuild == null) {
+            boolean k14 = false;
+            try (java.io.InputStream in = c.getAssets().open("sdk.txt")) {
+                byte[] b = new byte[16];
+                int n = in.read(b);
+                k14 = n > 0 && new String(b, 0, n).trim().equals("k14");
+            } catch (java.io.IOException ignored) {
+            }
+            nativeBuild = k14;
+        }
+        return nativeBuild;
+    }
 
     public static SharedPreferences prefs(Context c) {
         return c.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
@@ -254,10 +284,25 @@ public final class Settings {
         SharedPreferences p = prefs(ctx);
         Launch l = new Launch();
         // Resolution: the SDK draws at whole multiples of the game's 720p.
+        final boolean nat = isNativeBuild(ctx);
+        final String renderer = RENDERER.value(p);
+        final boolean nativeRenderer = nat && !"classic".equals(renderer);
+        if (nat) l.env.put("WWE2K16_RENDERER", renderer);
         String res = RESOLUTION.value(p);
         int scale = ("1080".equals(res) || "1440".equals(res)) ? 2 : 1;
         cvar(l, "draw_resolution_scale_x", String.valueOf(scale));
         cvar(l, "draw_resolution_scale_y", String.valueOf(scale));
+        if (nat) cvar(l, "resolution_scale", String.valueOf(scale));
+        // Below 720p: the native renderer draws the scene smaller and scales it up (gpu_native_truth_draw_height).
+        int height = Integer.parseInt(res);
+        if (nativeRenderer && height < 720) cvar(l, "gpu_native_truth_draw_height", res);
+        if (nat) {
+            boolean sgsr = "sgsr".equals(UPSCALER.value(p));
+            cvar(l, "present_effect", sgsr ? "sgsr" : "bilinear");
+            // 0..100% -> SGSR's edge sharpness 1..2.
+            double sharp = 1.0 + Integer.parseInt(SHARPNESS.value(p)) / 100.0;
+            if (sgsr) cvar(l, "present_sgsr_edge_sharpness", String.valueOf(sharp));
+        }
 
         String fr = FRAME_RATE.value(p);
         l.env.put("WWE2K16_KEEP_60", "classic".equals(fr) ? "0" : "1");
@@ -279,7 +324,7 @@ public final class Settings {
         l.env.put("WWE2K16_CPU_CORES", CPU_CORES.value(p));
         l.env.put("WWE2K16_SPEED_FIX", SPEED_FIX.value(p));
         boolean cache = "1".equals(SHADER_CACHE.value(p));
-        cvar(l, "vulkan_pipeline_cache", cache ? "true" : "false");
+        cvar(l, nat ? "vulkan_disk_pipeline_cache" : "vulkan_pipeline_cache", cache ? "true" : "false");
         cvar(l, "async_shader_compilation", "true");
         l.env.put("WWE2K16_FRAME_MONITOR", FRAME_MONITOR.value(p));
         l.env.put("WWE2K16_PERF_HINT", PERF_HINT.value(p));
@@ -292,6 +337,11 @@ public final class Settings {
         l.env.put("WWE2K16_LOG_DIR", logs.getAbsolutePath());
         l.env.put("WWE2K16_LOG_FILE", new File(logs, "wwe2k16.log").getAbsolutePath());
         cvar(l, "user_data_root", userDataDir(ctx).getAbsolutePath());
+        if (nat) {
+            // The 0.10 SDK names its log with --log_file (0.7 reads WWE2K16_LOG_FILE).
+            cvar(l, "log_file", new File(logs, "wwe2k16.log").getAbsolutePath());
+            l.env.put("WWE2K16_READBACK_ALWAYS", "always".equals(READBACK.value(p)) ? "1" : "0");
+        }
 
         // Custom driver.
         String driver = p.getString(KEY_DRIVER, "");
@@ -321,9 +371,12 @@ public final class Settings {
         }
 
         String game = p.getString(KEY_GAME_PATH, "");
-        l.args.add(game);
+        // 0.7 takes the game folder / .iso as the first plain argument; 0.10 as --game_data_root.
+        if (nat) cvar(l, "game_data_root", game);
+        else l.args.add(game);
 
         for (Choice c : CHOICES) l.summary.append(c.title).append(": ").append(c.labels[c.index(p)]).append('\n');
+        l.summary.append("BUILD: ").append(nat ? "native (WWE 2K14 SDK)" : "classic (ReXGlue 0.7)").append('\n');
         l.summary.append("GPU DRIVER: ").append(driver.isEmpty() ? "System" : driver).append('\n');
         l.summary.append("EXTRA ARGUMENTS: ").append(extra).append('\n');
         l.summary.append("GAME: ").append(game).append('\n');
