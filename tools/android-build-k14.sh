@@ -109,7 +109,7 @@ step "3/8 The WWE 2K14 SDK for Android arm64 (-> out/k14-android-sdk)"
 # As the 2K14 port builds it (tools/android/build_sdk_android.ps1): shared libc++, ARMv8.2, no Tracy / FidelityFX / tests.
 echo "disk free: $(free_gb) GB"
 if [ -f "$SDK_STAMP" ] && [ "$(cat "$SDK_STAMP")" = "$SDK_ID" ] && [ -f "$SDK_INSTALL/lib/librexruntime.so" ] \
-    && [ -f "$SDK_INSTALL/lib/librexgpu-xenos.so" ] && [ ! -d "$SDK_BUILD" ]; then
+    && [ -f "$SDK_INSTALL/lib/librexgpu-xenos.so" ]; then
     echo "already built and installed ($SDK_INSTALL): skipped"
 else
 [ "$(free_gb)" -ge 4 ] || die "only $(free_gb) GB free: the SDK build needs about 4 GB (see the clean-up command in the chat / docs/ANDROID_NATIVE.md)"
@@ -124,8 +124,12 @@ if [ ! -f "$SDK_BUILD/CMakeCache.txt" ]; then
 fi
 cmake --build "$SDK_BUILD" --target install --parallel "$JOBS"
 echo "$SDK_ID" > "$SDK_STAMP"
-if [ "${KEEP_SDK_BUILD:-0}" != 1 ]; then
+# The build folder makes the next SDK change (patches/k14-sdk) an incremental build: kept while there is room
+# (KEEP_SDK_BUILD=1 always keeps it, =0 always deletes it).
+if [ "${KEEP_SDK_BUILD:-auto}" = 0 ] || { [ "${KEEP_SDK_BUILD:-auto}" = auto ] && [ "$(free_gb)" -lt 10 ]; }; then
     rm -rf "$SDK_BUILD"; echo "SDK installed; its build folder deleted to save space (now $(free_gb) GB free)"
+else
+    echo "SDK installed; build folder kept for incremental SDK builds ($(free_gb) GB free)"
 fi
 fi
 for so in librexruntime.so librexgpu-xenos.so; do

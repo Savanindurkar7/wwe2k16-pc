@@ -1,0 +1,74 @@
+--- a/include/rex/ui/vulkan/presenter.h
++++ b/include/rex/ui/vulkan/presenter.h
+@@ -562,6 +562,12 @@
+     bool pending_real = false;
+     uint64_t last_new_ns = 0;
+     double interval_ns = 0.0;
++    // Recent gaps between new guest frames (the median paces the real frame; an average was pulled up by entrances
++    // and loads and the real frame came after the next new one: almost no in-between frames in matches).
++    static constexpr uint32_t kGapCount = 9;
++    uint64_t gaps[kGapCount] = {};
++    uint32_t gap_next = 0, gap_count = 0;
++    uint64_t pending_dropped = 0;  // new frames that came before the pending real frame was shown
+     uint64_t generated = 0, skipped = 0, log_window_start_ns = 0;
+   };
+   FrameGen frame_gen_;
+--- a/src/ui/vulkan/vulkan_presenter_framegen.cpp
++++ b/src/ui/vulkan/vulkan_presenter_framegen.cpp
+@@ -441,7 +441,13 @@
+   fg.last_new_seq = refresh_seq;
+   const uint64_t max_gap = uint64_t(REXCVAR_GET(present_frame_generation_max_gap_ms)) * 1000000ull;
+   if (gap && gap < max_gap) {
+-    fg.interval_ns = fg.interval_ns > 0.0 ? fg.interval_ns * 0.85 + double(gap) * 0.15 : double(gap);
++    fg.gaps[fg.gap_next] = gap;
++    fg.gap_next = (fg.gap_next + 1) % FrameGen::kGapCount;
++    fg.gap_count = std::min(fg.gap_count + 1, FrameGen::kGapCount);
++    uint64_t sorted[FrameGen::kGapCount];
++    std::copy(fg.gaps, fg.gaps + fg.gap_count, sorted);
++    std::sort(sorted, sorted + fg.gap_count);
++    fg.interval_ns = double(sorted[fg.gap_count / 2]);
+   }
+   const VkExtent2D extent = current->extent();
+   const uint32_t width = extent.width, height = extent.height;
+@@ -451,8 +457,11 @@
+   const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+   const VkDevice device = vulkan_device_->device();
+ 
+-  // Generate only with a previous frame of this size, a normal gap, and the last real frame already shown.
+-  const bool generate = fg.history_slot >= 0 && gap && gap < max_gap && !fg.pending_real;
++  // Generate with a previous frame of this size and a normal gap, while the game is slower than about 50 frames a
++  // second (at 60 there is no room for a frame in between on a 120 Hz screen). A real frame still pending (this new one
++  // came first) is simply not shown: the in-between frame of the new pair follows the last one shown.
++  if (fg.pending_real) ++fg.pending_dropped;
++  const bool generate = fg.history_slot >= 0 && gap && gap < max_gap && fg.interval_ns > 20.0e6;
+   if (!generate && fg.history_slot >= 0) ++fg.skipped;
+   const int prev_slot = fg.history_slot;            // read: the previous real frame
+   const int next_slot = prev_slot >= 0 ? 1 - prev_slot : 0;  // written: the current frame, for next time
+@@ -608,8 +617,9 @@
+     fg.pending_real = true;
+     ++fg.generated;
+     // The real frame half a frame interval later (a little less: the paint itself takes time).
++    // (0.85: the paint of the real frame, the present and the next vblank take some of the half interval.)
+     const double half = fg.interval_ns > 0.0 ? fg.interval_ns * 0.5 : 8.0e6;
+-    const uint64_t delay = uint64_t(std::clamp(half * 0.92, 2.0e6, 40.0e6));
++    const uint64_t delay = uint64_t(std::clamp(half * 0.85, 2.0e6, 40.0e6));
+     ScheduleFrameGenRepaint(delay);
+   }
+   // 4. The current frame into the other history image (the copy set of `next_slot` reads `current` at binding 1).
+@@ -622,11 +632,13 @@
+     if (!fg.log_window_start_ns) fg.log_window_start_ns = now;
+     if (now - fg.log_window_start_ns >= uint64_t(log_s) * 1000000000ull) {
+       const double seconds = double(now - fg.log_window_start_ns) / 1.0e9;
+-      REXLOG_INFO("[framegen] {:.1f} s: {} in-between frames ({:.1f}/s), {} new frames without one; game frame "
+-                  "interval {:.1f} ms",
+-                  seconds, fg.generated, double(fg.generated) / seconds, fg.skipped, fg.interval_ns / 1.0e6);
++      REXLOG_INFO("[framegen] {:.1f} s: {} in-between frames ({:.1f}/s), {} new frames without one, {} real frames "
++                  "overtaken by the next; game frame interval {:.1f} ms (median)",
++                  seconds, fg.generated, double(fg.generated) / seconds, fg.skipped, fg.pending_dropped,
++                  fg.interval_ns / 1.0e6);
+       fg.generated = 0;
+       fg.skipped = 0;
++      fg.pending_dropped = 0;
+       fg.log_window_start_ns = now;
+     }
+   }
