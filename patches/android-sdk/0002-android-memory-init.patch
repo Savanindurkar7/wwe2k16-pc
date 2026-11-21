@@ -1,0 +1,48 @@
+diff --git a/src/core/fiber_android.S b/src/core/fiber_android.S
+index da6f79c..41dc764 100644
+--- a/src/core/fiber_android.S
++++ b/src/core/fiber_android.S
+@@ -37,3 +37,6 @@ rex_fiber_switch:
+ 
+ .size rex_fiber_switch, .-rex_fiber_switch
+ #endif
++
++// WWE 2K16 Android: no executable stack for the library (Android denies execstack).
++.section .note.GNU-stack,"",%progbits
+diff --git a/src/core/memory_posix.cpp b/src/core/memory_posix.cpp
+index e8a559b..567228b 100644
+--- a/src/core/memory_posix.cpp
++++ b/src/core/memory_posix.cpp
+@@ -326,6 +326,10 @@ bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
+ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, size_t length,
+                                           PageAccess access, bool commit) {
+ #if REX_PLATFORM_ANDROID
++  // WWE 2K16 Android: set up ASharedMemory on first use if the app did not call AndroidInitialize.
++  if (!android_ASharedMemory_create_) {
++    AndroidInitialize();
++  }
+   // TODO(Triang3l): Check if memfd can be used instead on API 30+.
+   if (android_ASharedMemory_create_) {
+     int sharedmem_fd = android_ASharedMemory_create_(path.c_str(), length);
+diff --git a/src/ui/windowed_app_main_android.cpp b/src/ui/windowed_app_main_android.cpp
+index 712b6f0..525b4c1 100644
+--- a/src/ui/windowed_app_main_android.cpp
++++ b/src/ui/windowed_app_main_android.cpp
+@@ -12,10 +12,17 @@
+ #include <rex/cvar.h>
+ #include <rex/filesystem.h>
+ #include <rex/logging.h>
++#include <rex/memory/utils.h>
++#include <rex/thread.h>
+ #include <rex/ui/windowed_app.h>
+ #include <rex/ui/windowed_app_context_android.h>
+ 
+ extern "C" int main(int argc, char** argv) {
++  // WWE 2K16 Android: the platform helpers load Android's supported APIs (ASharedMemory for the guest memory, the
++  // pthread name functions). Without this the guest memory falls back to /dev/ashmem, which Android blocks for apps
++  // targeting Android 10+: "Unable to reserve the 4gb guest address space".
++  rex::memory::AndroidInitialize();
++  rex::thread::AndroidInitialize();
+   auto init_result = rex::cvar::Init(argc, argv);
+   if (init_result.parse_error) {
+     std::fprintf(stderr, "WWE 2K16 launch option error: %s\n", init_result.parse_error->c_str());

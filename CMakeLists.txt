@@ -55,6 +55,8 @@ endif()
 
 if(ANDROID)
     target_link_libraries(wwe2k16 PRIVATE android log)
+    # Android denies libraries that ask for an executable stack (logcat: "denied { execstack }").
+    target_link_options(wwe2k16 PRIVATE "LINKER:-z,noexecstack")
     # Custom Vulkan drivers (src/android_driver.cpp): libadrenotools (BSD-2-Clause), cloned by tools/android-build.sh.
     # Its hook libraries (libhook_impl.so, libmain_hook.so) go into the APK next to libmain.so.
     set(WWE2K16_ADRENOTOOLS "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/libadrenotools")

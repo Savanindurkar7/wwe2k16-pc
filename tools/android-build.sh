@@ -49,11 +49,14 @@ fi
 echo "libadrenotools: $(git -C thirdparty/libadrenotools rev-parse --short HEAD)"
 
 step "2/9 Java and Android SDK"
-if ! java -version 2>&1 | grep -qE 'version "(1[7-9]|2[0-9])'; then
+# Gradle 8.12 runs on Java 17 to 23 (newer Java fails with "Unsupported class file major version"): use Java 17.
+JDK17=/usr/lib/jvm/java-17-openjdk-amd64
+if [ ! -x "$JDK17/bin/java" ]; then
     echo "Installing JDK 17"
     sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openjdk-17-jdk-headless
-    export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64 PATH="/usr/lib/jvm/java-17-openjdk-amd64/bin:$PATH"
 fi
+[ -x "$JDK17/bin/java" ] || die "JDK 17 is not installed at $JDK17"
+export JAVA_HOME="$JDK17" PATH="$JDK17/bin:$PATH"
 command -v unzip >/dev/null || sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq unzip
 java -version 2>&1 | head -1
 ASDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
