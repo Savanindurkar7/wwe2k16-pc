@@ -57,16 +57,38 @@ public final class Settings {
 
     private static String[] a(String... s) { return s; }
 
-    public static final Choice RENDERER = new Choice(S_GRAPHICS, "renderer", "RENDERER", 1,
+    public static final Choice RENDERER = new Choice(S_GRAPHICS, "renderer", "RENDERER", 2,
             a("classic", "native", "native_plus"),
             a("CLASSIC", "NATIVE", "NATIVE+"),
             a("The emulated Xbox 360 GPU. The only renderer of the classic APK.",
               "Native APK: the SDK's native renderer draws the scene (from the WWE 2K14 port). Lower resolutions and "
               + "SGSR need it. The classic APK ignores this.",
-              "Native APK: Native plus the faster resolve and texture paths. Fastest, least tested: if a wrestler looks "
-              + "wrong, go back to NATIVE."));
+              "Native APK: Native plus the faster resolve and texture paths. Fastest (about 40 FPS in matches at 480p "
+              + "on an Adreno 810). Recommended."));
 
-    public static final Choice RESOLUTION = new Choice(S_GRAPHICS, "resolution", "RESOLUTION", 3,
+    public static final Choice CROWD = new Choice(S_GRAPHICS, "crowd", "CROWD", 0,
+            a("100", "70", "50", "30", "0"),
+            a("FULL", "70%", "50%", "30%", "OFF"),
+            a("The whole crowd. Native APK only (the classic APK always draws it).",
+              "Native APK: 70% of the crowd, spread evenly; the same people stay from frame to frame.",
+              "Native APK: half the crowd. A big help in entrances, where the crowd is hundreds of draws a frame.",
+              "Native APK: 30% of the crowd. Entrances run noticeably faster.",
+              "Native APK: no crowd at all. Fastest entrances."));
+
+    public static final Choice SHADOWS = new Choice(S_GRAPHICS, "shadows", "DYNAMIC SHADOWS", 0,
+            a("on", "half", "off"),
+            a("ON", "HALF RATE", "OFF"),
+            a("Wrestler and prop shadows every frame.",
+              "Native APK: the wrestlers' shadow maps drawn every other frame (the frame between reuses the last).",
+              "Native APK: no moving shadows (baked arena lighting stays). Saves GPU time in every scene."));
+
+    public static final Choice DOF = new Choice(S_GRAPHICS, "dof", "DEPTH OF FIELD", 0,
+            a("on", "off"),
+            a("ON", "OFF"),
+            a("The game's blur of out-of-focus areas (entrance close-ups, replays).",
+              "Native APK: no depth-of-field blur: sharper and a little faster."));
+
+    public static final Choice RESOLUTION = new Choice(S_GRAPHICS, "resolution", "RESOLUTION", 1,
             a("360", "480", "540", "720", "1080", "1440"),
             a("360p", "480p", "540p", "720p", "1080p", "1440p"),
             a("Native APK with the NATIVE renderer: the scene drawn at 360p and scaled up (SGSR recommended). Else 720p.",
@@ -97,7 +119,7 @@ public final class Settings {
               "FXAA smooths edges for a small cost.",
               "Stronger FXAA, a little more cost."));
 
-    public static final Choice UPSCALER = new Choice(S_GRAPHICS, "upscaler", "UPSCALER", 0,
+    public static final Choice UPSCALER = new Choice(S_GRAPHICS, "upscaler", "UPSCALER", 1,
             a("bilinear", "sgsr", "fsr"),
             a("BILINEAR", "SGSR", "FSR"),
             a("Plain scaling to your screen. Works in both APKs.",
@@ -203,6 +225,13 @@ public final class Settings {
               "Native APK: exact readback all the time. Use it if a wrestler or attire shows noise or black / magenta "
               + "patches; it costs speed."));
 
+    public static final Choice SHORTCUTS = new Choice(S_ADVANCED, "native_shortcuts", "NATIVE SHORTCUTS", 0,
+            a("safe", "all"),
+            a("SAFE", "ALL (TEST)"),
+            a("Native APK: the model-data shortcuts that stretched near-camera models into spikes stay off.",
+              "Native APK: those shortcuts on again (geometry page trust, GPR-flush draw skip, vertex endian baking): "
+              + "a little faster, but expect the spike glitch. Only for testing."));
+
     public static final Choice VK_DEBUG = new Choice(S_ADVANCED, "vk_debug", "VULKAN DEBUG MESSAGES", 1,
             a("1", "0"),
             a("ON", "OFF"),
@@ -210,11 +239,11 @@ public final class Settings {
               "Off: the Adreno driver alone sends about a million messages per match."));
 
     public static final Choice[] CHOICES = {
-            RENDERER, RESOLUTION, FRAME_RATE, MSAA, FAST_AA, UPSCALER, TEXTURES, FILTER,
+            RENDERER, RESOLUTION, CROWD, SHADOWS, DOF, FRAME_RATE, MSAA, FAST_AA, UPSCALER, TEXTURES, FILTER,
             DISPLAY, SCREEN_SHAPE, VSYNC, SHARPNESS,
             CPU_CORES, SPEED_FIX, SHADER_CACHE, FRAME_MONITOR, PERF_HINT, SUSTAINED,
             TOUCH, TOUCH_VIBRATE, RUMBLE,
-            READBACK, VK_DEBUG,
+            READBACK, SHORTCUTS, VK_DEBUG,
     };
 
     public static final String KEY_EXTRA_ARGS = "extra_args";
@@ -287,7 +316,18 @@ public final class Settings {
         final boolean nat = isNativeBuild(ctx);
         final String renderer = RENDERER.value(p);
         final boolean nativeRenderer = nat && !"classic".equals(renderer);
-        if (nat) l.env.put("WWE2K16_RENDERER", renderer);
+        if (nat) {
+            l.env.put("WWE2K16_RENDERER", renderer);
+            l.env.put("WWE2K16_NATIVE_SHORTCUTS", "all".equals(SHORTCUTS.value(p)) ? "1" : "0");
+            // SDK scene levers from the WWE 2K14 port (keyed on shader hashes that 2K16 shares: its crowd draws are the
+            // same three crowd shaders, the census shows).
+            String crowd = CROWD.value(p);
+            if (!"100".equals(crowd)) cvar(l, "gpu_scene_crowd_density", crowd);
+            String shadows = SHADOWS.value(p);
+            if ("off".equals(shadows)) cvar(l, "gpu_dynamic_shadows", "false");
+            if ("half".equals(shadows)) cvar(l, "gpu_shadow_half_rate", "true");
+            if ("off".equals(DOF.value(p))) cvar(l, "gpu_depth_of_field", "false");
+        }
         String res = RESOLUTION.value(p);
         int scale = ("1080".equals(res) || "1440".equals(res)) ? 2 : 1;
         cvar(l, "draw_resolution_scale_x", String.valueOf(scale));

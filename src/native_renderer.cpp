@@ -58,10 +58,8 @@ const std::vector<Flag> kNative = {
     {"gpu_native_truth_host_rt", "true"},
     {"gpu_fast_clear", "true"},
     {"gpu_native_half2", "2"},
-    {"gpu_native_half2_skip_gpr_draws", "true"},
     {"gpu_native_lean_draws", "true"},
     {"gpu_native_lean_benign_writes", "true"},
-    {"gpu_native_trust_geometry_pages", "true"},
     {"gpu_native_gpu_timers", "false"},
     {"vulkan_merge_adjacent_barriers", "true"},
     {"gpu_native_truth_batch_resolves", "true"},
@@ -73,9 +71,19 @@ const std::vector<Flag> kNative = {
     {"gpu_native_truth_pass_dont_care", "true"},
     {"gpu_native_truth_skip_restores", "true"},
     {"gpu_native_truth_fill_rename_check", "true"},
-    {"gpu_native_vertex_endian_spec", "true"},
     {"vulkan_uniform_pool_device_local", "true"},
     {"vulkan_device_local_upload_min_heap_mb", "128"},
+};
+
+// Model-data shortcuts, off by default since the 2026-11-21 phone tests: with them on, near-camera models (the ring
+// post, a wrestler's arm) came out as stretched spikes in NATIVE and NATIVE+ alike, at 480p and 720p. Each is a 2K14
+// measurement that never met 2K16's data: trusting geometry pages (2K16 may rewrite vertex data the trust then misses),
+// skipping the D3D library's GPR-flush draws, baking vertex endianness. Options > Advanced > Native shortcuts > ALL
+// (WWE2K16_NATIVE_SHORTCUTS=1) turns them back on for testing.
+const std::vector<Flag> kShortcuts = {
+    {"gpu_native_trust_geometry_pages", "true"},
+    {"gpu_native_half2_skip_gpr_draws", "true"},
+    {"gpu_native_vertex_endian_spec", "true"},
 };
 
 // More speed, less margin: resolves only a texture reads skip their write-back, textures load straight into their
@@ -144,7 +152,11 @@ void Apply() {
 #endif
   if (profile == "native" || profile == "native_plus") set += Apply(kNative);
   if (profile == "native_plus") set += Apply(kNativePlus);
-  REXLOG_INFO("[wwe2k16-renderer] profile {}: {} settings applied; gpu_native={} truth={} host_rt={}", profile, set,
+  const char* shortcuts = std::getenv("WWE2K16_NATIVE_SHORTCUTS");
+  const bool with_shortcuts = shortcuts && shortcuts[0] == '1' && profile != "classic";
+  if (with_shortcuts) set += Apply(kShortcuts);
+  REXLOG_INFO("[wwe2k16-renderer] profile {}{}: {} settings applied; gpu_native={} truth={} host_rt={}", profile,
+              with_shortcuts ? " + model shortcuts" : "", set,
               rex::cvar::GetFlagByName("gpu_native"), rex::cvar::GetFlagByName("gpu_native_truth"),
               rex::cvar::GetFlagByName("gpu_native_truth_host_rt"));
 #else
