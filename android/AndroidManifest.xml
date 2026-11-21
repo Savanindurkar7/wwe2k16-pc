@@ -35,7 +35,7 @@
             android:exported="true"
             android:label="@string/app_name"
             android:launchMode="singleTask"
-            android:screenOrientation="fullUser"
+            android:screenOrientation="sensorLandscape"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|uiMode|density">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
@@ -46,7 +46,13 @@
         <activity
             android:name="com.savanindurkar7.wwe2k16.OptionsActivity"
             android:exported="false"
-            android:screenOrientation="fullUser"
+            android:screenOrientation="sensorLandscape"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|uiMode|density" />
+
+        <activity
+            android:name="com.savanindurkar7.wwe2k16.TouchEditActivity"
+            android:exported="false"
+            android:screenOrientation="sensorLandscape"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|uiMode|density" />
 
         <activity

@@ -34,6 +34,7 @@ set(WWE2K16_SOURCES
     src/display_refresh_rate.cpp
     src/frame_monitor.cpp
     src/android_driver.cpp
+    src/touch_input.cpp
 )
 
 if(ANDROID)

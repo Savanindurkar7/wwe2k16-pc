@@ -2,6 +2,13 @@ package com.savanindurkar7.wwe2k16;
 
 import android.app.AlertDialog;
 import android.content.Context;
+import android.hardware.input.InputManager;
+import android.os.Handler;
+import android.os.Looper;
+import android.os.VibrationEffect;
+import android.os.Vibrator;
+import android.view.InputDevice;
+import android.view.ViewGroup;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.PowerManager;
@@ -30,6 +37,40 @@ public class GameActivity extends SDLActivity {
     private static final String TAG = "WWE2K16";
 
     private boolean windowed;
+    private TouchControls touch;
+    private String touchMode = "auto";  // auto | on | off
+    private boolean touchShown;
+    private final Handler handler = new Handler(Looper.getMainLooper());
+    private InputManager inputManager;
+    private Vibrator vibrator;
+    private int lastRumble;
+
+    private final InputManager.InputDeviceListener padListener = new InputManager.InputDeviceListener() {
+        @Override public void onInputDeviceAdded(int id) { updateTouchVisibility(); }
+        @Override public void onInputDeviceRemoved(int id) { updateTouchVisibility(); }
+        @Override public void onInputDeviceChanged(int id) { updateTouchVisibility(); }
+    };
+
+    // The game's rumble, played on the phone's vibrator (WWE2K16_RUMBLE=1).
+    private final Runnable rumblePoll = new Runnable() {
+        @Override public void run() {
+            if (touch != null && touchShown && vibrator != null) {
+                int r = 0;
+                try {
+                    r = TouchControls.nativeGetRumble();
+                } catch (UnsatisfiedLinkError ignored) {
+                }
+                int strength = Math.max(r >>> 16, r & 0xFFFF);
+                if (strength > 2000 && lastRumble <= 2000) {
+                    vibrator.vibrate(VibrationEffect.createOneShot(120, Math.max(1, Math.min(255, strength >> 8))));
+                } else if (strength <= 2000 && lastRumble > 2000) {
+                    vibrator.cancel();
+                }
+                lastRumble = strength;
+            }
+            handler.postDelayed(this, 100);
+        }
+    };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -57,6 +98,52 @@ public class GameActivity extends SDLActivity {
             getWindow().setAttributes(lp);
         }
         applyDisplayMode();
+        setupTouchControls();
+    }
+
+    // --- Touch controls -------------------------------------------------------------------------------------------
+
+    private void setupTouchControls() {
+        String mode = System.getenv("WWE2K16_TOUCH");
+        if (mode != null && !mode.isEmpty()) touchMode = mode;
+        if ("off".equals(touchMode)) return;
+        touch = new TouchControls(this, TouchLayout.load(this), false);
+        touch.setVibrate(!"0".equals(System.getenv("WWE2K16_TOUCH_VIBRATE")));
+        touch.setNativeReady(true);
+        addContentView(touch, new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        inputManager = (InputManager) getSystemService(Context.INPUT_SERVICE);
+        if (inputManager != null) inputManager.registerInputDeviceListener(padListener, handler);
+        if ("1".equals(System.getenv("WWE2K16_RUMBLE"))) {
+            vibrator = (Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
+            if (vibrator != null && vibrator.hasVibrator()) handler.postDelayed(rumblePoll, 500);
+            else vibrator = null;
+        }
+        updateTouchVisibility();
+    }
+
+    private static boolean gamepadConnected() {
+        for (int id : InputDevice.getDeviceIds()) {
+            InputDevice d = InputDevice.getDevice(id);
+            if (d == null || d.isVirtual()) continue;
+            int s = d.getSources();
+            if ((s & InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD
+                    || (s & InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK) return true;
+        }
+        return false;
+    }
+
+    private void updateTouchVisibility() {
+        if (touch == null) return;
+        boolean show = "on".equals(touchMode) || !gamepadConnected();
+        if (show == touchShown) return;
+        touchShown = show;
+        touch.setVisibility(show ? View.VISIBLE : View.GONE);
+        if (!show) touch.releaseAll();
+        try {
+            TouchControls.nativeSetEnabled(show);
+        } catch (UnsatisfiedLinkError e) {
+            Log.e(TAG, "touch controls: game library not ready", e);
+        }
     }
 
     private void applyEnvironment() {
@@ -129,7 +216,15 @@ public class GameActivity extends SDLActivity {
     }
 
     @Override
+    protected void onPause() {
+        super.onPause();
+        if (touch != null) touch.releaseAll();
+    }
+
+    @Override
     protected void onDestroy() {
+        handler.removeCallbacksAndMessages(null);
+        if (inputManager != null) inputManager.unregisterInputDeviceListener(padListener);
         super.onDestroy();
         // The launcher (below this activity) comes back; this process ends so the next PLAY starts clean.
         android.os.Process.killProcess(android.os.Process.myPid());

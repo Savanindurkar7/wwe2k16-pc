@@ -49,9 +49,11 @@ public final class Settings {
     public static final String S_GRAPHICS = "GRAPHICS";
     public static final String S_DISPLAY = "DISPLAY";
     public static final String S_PERFORMANCE = "PERFORMANCE";
+    public static final String S_CONTROLS = "CONTROLS";
     public static final String S_DRIVER = "GPU DRIVER";
     public static final String S_ADVANCED = "ADVANCED";
-    public static final String[] SECTIONS = {S_GRAPHICS, S_DISPLAY, S_PERFORMANCE, S_DRIVER, S_ADVANCED};
+    public static final String S_CREDITS = "CREDITS";
+    public static final String[] SECTIONS = {S_GRAPHICS, S_DISPLAY, S_PERFORMANCE, S_CONTROLS, S_DRIVER, S_ADVANCED, S_CREDITS};
 
     private static String[] a(String... s) { return s; }
 
@@ -170,6 +172,24 @@ public final class Settings {
             a("Asks Android for steady speed instead of short bursts (phones that support it).",
               "Normal Android power behaviour."));
 
+    public static final Choice TOUCH = new Choice(S_CONTROLS, "touch", "TOUCH CONTROLS", 0,
+            a("auto", "on", "off"),
+            a("AUTO", "ON", "OFF"),
+            a("Shown on screen, hidden while a gamepad is connected.",
+              "Always shown, even with a gamepad (both work at once).",
+              "Never shown: play with a gamepad."));
+
+    public static final Choice TOUCH_VIBRATE = new Choice(S_CONTROLS, "touch_vibrate", "BUTTON VIBRATION", 0,
+            a("1", "0"),
+            a("ON", "OFF"),
+            a("A short buzz when you press an on-screen control.", "No buzz on presses."));
+
+    public static final Choice RUMBLE = new Choice(S_CONTROLS, "rumble", "GAME RUMBLE", 0,
+            a("1", "0"),
+            a("ON", "OFF"),
+            a("The phone vibrates when the game rumbles the controller (hits, slams, finishers).",
+              "No rumble on the phone."));
+
     public static final Choice VK_DEBUG = new Choice(S_ADVANCED, "vk_debug", "VULKAN DEBUG MESSAGES", 1,
             a("1", "0"),
             a("ON", "OFF"),
@@ -180,6 +200,7 @@ public final class Settings {
             RESOLUTION, FRAME_RATE, MSAA, FAST_AA, UPSCALER, TEXTURES, FILTER,
             DISPLAY, SCREEN_SHAPE, VSYNC, SHARPNESS,
             CPU_CORES, SPEED_FIX, SHADER_CACHE, FRAME_MONITOR, PERF_HINT, SUSTAINED,
+            TOUCH, TOUCH_VIBRATE, RUMBLE,
             VK_DEBUG,
     };
 
@@ -262,6 +283,9 @@ public final class Settings {
         cvar(l, "async_shader_compilation", "true");
         l.env.put("WWE2K16_FRAME_MONITOR", FRAME_MONITOR.value(p));
         l.env.put("WWE2K16_PERF_HINT", PERF_HINT.value(p));
+        l.env.put("WWE2K16_TOUCH", TOUCH.value(p));
+        l.env.put("WWE2K16_TOUCH_VIBRATE", TOUCH_VIBRATE.value(p));
+        l.env.put("WWE2K16_RUMBLE", RUMBLE.value(p));
         cvar(l, "vulkan_log_debug_messages", "1".equals(VK_DEBUG.value(p)) ? "true" : "false");
 
         File logs = logsDir(ctx);

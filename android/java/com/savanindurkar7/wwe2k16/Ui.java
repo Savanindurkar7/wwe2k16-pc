@@ -110,6 +110,46 @@ final class Ui {
         return layers;
     }
 
+    /** Home-screen entry: translucent dark (red for PLAY), thin outline, red edge on the left; brighter when focused. */
+    static Drawable entryBackground(Context c, boolean primary) {
+        StateListDrawable states = new StateListDrawable();
+        Drawable focused = entryLayer(c, primary ? 0xF2E12236 : 0xE62A2A32, primary);
+        states.addState(new int[] {android.R.attr.state_pressed}, focused);
+        states.addState(new int[] {android.R.attr.state_focused}, focused);
+        states.addState(new int[] {}, entryLayer(c, primary ? 0xE6C81A2E : 0xCC0D0D11, primary));
+        return new RippleDrawable(ColorStateList.valueOf(0x55FFFFFF), states, null);
+    }
+
+    private static Drawable entryLayer(Context c, int color, boolean primary) {
+        GradientDrawable fill = rect(color, dp(c, 4));
+        fill.setStroke(Math.max(1, dp(c, 1)), primary ? 0x66FF8090 : 0x40FFFFFF);
+        GradientDrawable bar = rect(RED, dp(c, 2));
+        LayerDrawable layers = new LayerDrawable(new Drawable[] {fill, bar});
+        layers.setLayerWidth(1, dp(c, 6));
+        layers.setLayerGravity(1, Gravity.START | Gravity.FILL_VERTICAL);
+        return layers;
+    }
+
+    /** A sidebar entry in OPTIONS: light with dark text when selected (red edge), dark otherwise. */
+    static Drawable navBackground(Context c, boolean selected) {
+        StateListDrawable states = new StateListDrawable();
+        Drawable focus = navLayer(c, selected ? 0xFFFFFFFF : 0xFF2C2C34, selected);
+        states.addState(new int[] {android.R.attr.state_pressed}, focus);
+        states.addState(new int[] {android.R.attr.state_focused}, focus);
+        states.addState(new int[] {}, navLayer(c, selected ? 0xFFEDEDF0 : 0xE60F0F13, selected));
+        return new RippleDrawable(ColorStateList.valueOf(0x33FFFFFF), states, null);
+    }
+
+    private static Drawable navLayer(Context c, int color, boolean selected) {
+        GradientDrawable fill = rect(color, dp(c, 2));
+        if (!selected) return fill;
+        GradientDrawable bar = rect(RED, 0);
+        LayerDrawable layers = new LayerDrawable(new Drawable[] {fill, bar});
+        layers.setLayerWidth(1, dp(c, 5));
+        layers.setLayerGravity(1, Gravity.START | Gravity.FILL_VERTICAL);
+        return layers;
+    }
+
     /** A big menu entry: title and a one-line hint under it. */
     static LinearLayout menuButton(Context c, String title, String hint, boolean primary, View.OnClickListener click) {
         LinearLayout b = new LinearLayout(c);

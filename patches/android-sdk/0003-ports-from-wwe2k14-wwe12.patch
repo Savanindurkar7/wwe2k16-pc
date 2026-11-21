@@ -1,0 +1,652 @@
+WWE 2K16 Android: compatible SDK patches from the other ReXGlue wrestling ports
+
+From WWE 2K14 (Jarrod Feng, github.com/Jarrodfeng/wwe2k14-recomp, BSD-3), applied as-is:
+  018-session32         lock the STFS package seek+read pair (titantron streaming while a .pac loads)
+  091-session89         Win32 auto-reset event semantics on POSIX (2K14's phone pinfall freeze)
+From WWE '12 PC/Android (github.com/iMrBurn/wwe12-pc), applied as-is or with small offsets:
+  cores-warning, freespace, overlay, thread-name (Android start-up Scudo abort), wait-probe,
+  zz-android-crash-where, zz-android-oldkernel, zz-android-stereo
+From WWE '12, ported by hand to this SDK:
+  android2-cpu (sub-ms waits spun a core at 100 %; POLL_SENTINEL kept the UI thread awake),
+  zz-android-uiwake (the Android UI loop never sleeps more than 50 ms: lost wakeups froze loadings),
+  timer-sleep (the timer thread sleeps instead of spinning: ~20 % of a core)
+
+diff --git a/include/rex/filesystem/devices/host_path_device.h b/include/rex/filesystem/devices/host_path_device.h
+index 4e3c49b..41671a3 100644
+--- a/include/rex/filesystem/devices/host_path_device.h
++++ b/include/rex/filesystem/devices/host_path_device.h
+@@ -11,7 +11,10 @@
+ 
+ #pragma once
+ 
++#include <cstdint>
++#include <filesystem>
+ #include <string>
++#include <system_error>
+ 
+ #include <rex/filesystem/device.h>
+ 
+@@ -36,12 +39,23 @@ class HostPathDevice : public Device {
+   uint32_t attributes() const override { return 0; }
+   uint32_t component_name_max_length() const override { return 255; }
+ 
+-  uint32_t total_allocation_units() const override { return 128 * 1024; }
+-  uint32_t available_allocation_units() const override { return 128 * 1024; }
+-  uint32_t sectors_per_allocation_unit() const override { return 1; }
++  // The host disk's real size and free space, in 16 KiB units (32 sectors, like FATX). A fixed
++  // 64 MiB made WWE '12 turn its match highlights off: it wants 150 MB free on cache: for them.
++  uint32_t total_allocation_units() const override { return SpaceUnits(false); }
++  uint32_t available_allocation_units() const override { return SpaceUnits(true); }
++  uint32_t sectors_per_allocation_unit() const override { return 32; }
+   uint32_t bytes_per_sector() const override { return 0x200; }
+ 
+  private:
++  uint32_t SpaceUnits(bool available) const {
++    std::error_code ec;
++    const std::filesystem::space_info space = std::filesystem::space(host_path_, ec);
++    if (ec)
++      return 128 * 1024;  // 2 GiB
++    const uint64_t units = (available ? space.available : space.capacity) / (32 * 0x200);
++    return units > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(units);
++  }
++
+   void PopulateEntry(HostPathEntry* parent_entry);
+ 
+   std::string name_;
+diff --git a/include/rex/filesystem/vfs.h b/include/rex/filesystem/vfs.h
+index 96f86fe..938795d 100644
+--- a/include/rex/filesystem/vfs.h
++++ b/include/rex/filesystem/vfs.h
+@@ -34,6 +34,10 @@ class VirtualFileSystem {
+   bool RegisterDevice(std::unique_ptr<Device> device);
+   bool UnregisterDevice(const std::string_view path);
+ 
++  // Overlay over a registered device: paths under device_mount_path are looked up in the overlay
++  // first, so its files replace the device's (mods, title update files). Read-only use.
++  bool RegisterOverlay(const std::string_view device_mount_path, std::unique_ptr<Device> overlay);
++
+   bool RegisterSymbolicLink(const std::string_view path, const std::string_view target);
+   bool UnregisterSymbolicLink(const std::string_view path);
+   bool FindSymbolicLink(const std::string_view path, std::string& target);
+@@ -52,8 +56,11 @@ class VirtualFileSystem {
+   rex::thread::global_critical_region global_critical_region_;
+   std::vector<std::unique_ptr<Device>> devices_;
+   std::unordered_map<std::string, std::string> symlinks_;
++  std::vector<std::pair<std::string, std::unique_ptr<Device>>> overlays_;
+ 
+   bool ResolveSymbolicLink(const std::string_view path, std::string& result);
++  Entry* FindOverlayFile(const std::string_view mount_path, const std::string_view relative_path);
++  Entry* OverlayFileFor(const std::string_view absolute_path);
+ };
+ 
+ }  // namespace rex::filesystem
+diff --git a/src/audio/sdl/sdl_audio_driver.cpp b/src/audio/sdl/sdl_audio_driver.cpp
+index 521e5b9..e687a6e 100644
+--- a/src/audio/sdl/sdl_audio_driver.cpp
++++ b/src/audio/sdl/sdl_audio_driver.cpp
+@@ -145,6 +145,12 @@ bool SDLAudioDriver::OpenOutput() {
+   desired_spec.format = SDL_AUDIO_F32LE;
+   desired_spec.channels = frame_channels_;
+   sdl_device_channels_ = frame_channels_;
++#if defined(__ANDROID__)
++  // Phones play stereo: asking AAudio for 6 channels (low-latency path) left some of them silent
++  // (RedMagic 10S Pro, WWE '12 Android #45). Open in stereo; the callback folds the 5.1 mix.
++  desired_spec.channels = 2;
++  sdl_device_channels_ = 2;
++#endif
+   sdl_stream_ = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &desired_spec,
+                                           SDLCallback, this);
+   if (!sdl_stream_) {
+diff --git a/src/core/memory_posix.cpp b/src/core/memory_posix.cpp
+index 567228b..5555240 100644
+--- a/src/core/memory_posix.cpp
++++ b/src/core/memory_posix.cpp
+@@ -21,6 +21,7 @@
+ #include <sys/stat.h>
+ #include <unistd.h>
+ 
++#include <rex/logging.h>
+ #include <rex/math.h>
+ #include <rex/memory/utils.h>
+ #include <rex/platform.h>
+@@ -235,13 +236,30 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
+ #endif
+ 
+   void* result = mmap(base_address, length, prot_initial, flags, -1, 0);
++  bool already_mapped = false;
++#if defined(MAP_FIXED_NOREPLACE) && REX_PLATFORM_LINUX
++  if (result != MAP_FAILED && base_address && result != base_address) {
++    // Kernels before 4.17 (e.g. 4.14 phones) do not know MAP_FIXED_NOREPLACE and treat it as a
++    // hint: when the range is already mapped they return another address instead of EEXIST.
++    // Drop that stray mapping and take the same path as EEXIST.
++    static bool logged = false;
++    if (!logged) {
++      logged = true;
++      REXLOG_WARN("mmap ignored MAP_FIXED_NOREPLACE (kernel before 4.17): got {} instead of {}",
++                  result, base_address);
++    }
++    munmap(result, length);
++    result = MAP_FAILED;
++    already_mapped = true;
++  }
++#endif
+   if (result != MAP_FAILED) {
+     return result;
+   }
+ #if defined(MAP_FIXED_NOREPLACE) && REX_PLATFORM_LINUX
+   // Handle EEXIST: address already has a mapping (e.g., from prior Reserve)
+   // This is the "commit on existing reservation" path
+-  if (errno == EEXIST && base_address &&
++  if ((errno == EEXIST || already_mapped) && base_address &&
+       (allocation_type == AllocationType::kCommit ||
+        allocation_type == AllocationType::kReserveCommit)) {
+     // Verify the entire range is mapped before using mprotect
+diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
+index 03d0da4..ef6dfcf 100644
+--- a/src/core/threading_posix.cpp
++++ b/src/core/threading_posix.cpp
+@@ -251,12 +251,16 @@ class PosixConditionBase {
+     if (predicate()) {
+       executed = true;
+     } else {
++      // wwe2k14 patch (Session 89): count the threads blocked here, so an auto-reset event can hand a Signal to one of
++      // them (PosixCondition<Event>::Signal) instead of only setting a flag two Signals would share.
++      ++waiters_;
+       if (timeout == std::chrono::milliseconds::max()) {
+         cond_.wait(lock, predicate);
+         executed = true;  // Did not time out;
+       } else {
+         executed = cond_.wait_for(lock, timeout, predicate);
+       }
++      --waiters_;
+     }
+     if (executed) {
+       post_execution();
+@@ -360,8 +364,10 @@ class PosixConditionBase {
+       if (timeout == std::chrono::milliseconds::max()) {
+         std::this_thread::sleep_for(std::chrono::milliseconds(1));
+       } else {
+-        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - now);
+-        auto sleep_time = std::min(remaining, std::chrono::milliseconds(1));
++        // From the WWE '12 Android port: keep the clock's precision. Cast to whole milliseconds, any remaining
++        // time under 1 ms became a 0 ms sleep, and the alertable waits (1 ms slices) spun a core at 100 %.
++        auto remaining = end_time - now;
++        auto sleep_time = std::min<std::chrono::steady_clock::duration>(remaining, std::chrono::milliseconds(1));
+         std::this_thread::sleep_for(sleep_time);
+       }
+     }
+@@ -376,6 +382,7 @@ class PosixConditionBase {
+   inline virtual void post_execution() = 0;
+   std::condition_variable cond_;
+   std::mutex mutex_;
++  size_t waiters_ = 0;  // (Session 89) threads blocked in Wait() on this object, under mutex_
+ };
+ 
+ // There really is no native POSIX handle for a single wait/signal construct
+@@ -392,9 +399,23 @@ class PosixCondition<Event> : public PosixConditionBase {
+       : signal_(initial_state), manual_reset_(manual_reset) {}
+   virtual ~PosixCondition() = default;
+ 
++  // wwe2k14 patch (Session 89, the phone pinfall freeze): Win32 auto-reset semantics. Setting an auto-reset event
++  // that a thread waits on releases that thread and leaves the event NOT signalled, so a second Set before the woken
++  // thread runs signals it again. The old code only set signal_ = true and let the woken thread clear it when it ran:
++  // two Sets before it ran were one wake-up. WWE 2K14's highlights recorder is woken by two quick Sets at the bell
++  // (one per job); Windows kept both, Android lost the second, the recorder slept for good and the match end waited on
++  // it (frozen wrestlers after every pinfall). Now a Set with more blocked waiters than releases already handed out
++  // hands one release to a waiter (released_); otherwise it signals the event as before. Manual-reset events are
++  // unchanged. (A counted waiter cannot time out past its release: wait_for re-checks the predicate under the lock.
++  // Not covered (as before this patch, review of 0e69049): WaitMultiple's polling callers and alertable / det_frames
++  // waits in 1 ms Wait() slices are not counted in waiters_, so two quick Sets can still merge for them.)
+   bool Signal() override {
+     auto lock = std::unique_lock<std::mutex>(mutex_);
+-    signal_ = true;
++    if (!manual_reset_ && waiters_ > released_) {
++      ++released_;
++    } else {
++      signal_ = true;
++    }
+     cond_.notify_all();
+     return true;
+   }
+@@ -405,14 +426,17 @@ class PosixCondition<Event> : public PosixConditionBase {
+   }
+ 
+  private:
+-  inline bool signaled() const override { return signal_; }
++  inline bool signaled() const override { return signal_ || released_ > 0; }
+   inline void post_execution() override {
+-    if (!manual_reset_) {
++    if (released_ > 0) {
++      --released_;  // a release handed to a waiter: the event itself stays as it was
++    } else if (!manual_reset_) {
+       signal_ = false;
+     }
+   }
+   bool signal_;
+   const bool manual_reset_;
++  size_t released_ = 0;  // (Session 89) Sets handed to blocked waiters, not yet taken
+ };
+ 
+ template <>
+diff --git a/src/core/timer_queue.cpp b/src/core/timer_queue.cpp
+index ee004b4..cd25dbb 100644
+--- a/src/core/timer_queue.cpp
++++ b/src/core/timer_queue.cpp
+@@ -11,7 +11,17 @@
+ 
+ #include <algorithm>
+ #include <atomic>
++#include <atomic>
++#include <condition_variable>
+ #include <forward_list>
++#include <mutex>
++
++#if defined(_WIN32)
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#endif
+ 
+ #include <disruptorplus/multi_threaded_claim_strategy.hpp>
+ #include <disruptorplus/ring_buffer.hpp>
+@@ -40,6 +50,13 @@ class TimerQueue {
+         claim_strategy_(kWaitCount, wait_strategy_),
+         consumed_(wait_strategy_) {
+     claim_strategy_.add_claim_barrier(consumed_);
++#if defined(_WIN32)
++    wake_event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
++    wait_timer_ = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
++                                         TIMER_ALL_ACCESS);
++    if (!wait_timer_)  // before Windows 10 1803
++      wait_timer_ = CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);
++#endif
+     dispatch_thread_ = std::thread([this] { TimerThreadMain(); });
+   }
+ 
+@@ -53,6 +70,46 @@ class TimerQueue {
+     QueueTimer(std::move(wait_item));
+ 
+     if (dispatch_thread_.joinable()) dispatch_thread_.join();
++#if defined(_WIN32)
++    if (wait_timer_)
++      CloseHandle(wait_timer_);
++    if (wake_event_)
++      CloseHandle(wake_event_);
++#endif
++  }
++
++  // From the WWE '12 port (rexglue-sdk-timer-sleep). Sleeps until a timer is queued or `due` (the next timer) arrives. The disruptor's spin wait
++  // alone never sleeps for long (pause loops, yields, 1 ms naps), and the kernel's 1 ms timestamp
++  // timer (KeTimeStampBundle) always has a timer due within 1 ms: ~20 % of a core, all the time
++  // (profile on 4 threads, 2026-10-20). A high-resolution waitable timer keeps the precision.
++  void SleepUntil(clock::time_point due) {
++    if (queued_.load(std::memory_order_acquire) != taken_)
++      return;
++#if defined(_WIN32)
++    if (wake_event_ && wait_timer_) {
++      if (due == clock::time_point::max()) {
++        WaitForSingleObject(wake_event_, INFINITE);
++        return;
++      }
++      const auto left = due - clock::now();
++      if (left <= clock::duration::zero())
++        return;
++      LARGE_INTEGER when;
++      when.QuadPart =
++          -std::max<int64_t>(1, std::chrono::duration_cast<std::chrono::nanoseconds>(left).count() / 100);
++      if (SetWaitableTimer(wait_timer_, &when, 0, nullptr, nullptr, FALSE)) {
++        const HANDLE handles[2] = {wake_event_, wait_timer_};
++        WaitForMultipleObjects(2, handles, FALSE, INFINITE);
++        return;
++      }
++    }
++#endif
++    std::unique_lock lock(wake_mutex_);
++    const auto queued = [&] { return queued_.load(std::memory_order_acquire) != taken_; };
++    if (due == clock::time_point::max())
++      wake_cv_.wait(lock, queued);
++    else
++      wake_cv_.wait_until(lock, due, queued);
+   }
+ 
+   void TimerThreadMain() {
+@@ -65,14 +122,15 @@ class TimerQueue {
+     set_current_thread_name("rex::thread::TimerQueue");
+ 
+     while (!stop_requested_.load(std::memory_order_acquire)) {
+-      {
+-        // Consume new wait items and add them to sorted wait queue
+-        dp::sequence_t available = claim_strategy_.wait_until_published(
+-            next_sequence, next_sequence - 1,
+-            wait_queue_.empty() ? clock::time_point::max() : wait_queue_.front()->due_);
+-
+-        // Check for timeout
+-        if (available != next_sequence - 1) {
++      SleepUntil(wait_queue_.empty() ? clock::time_point::max() : wait_queue_.front()->due_);
++      if (queued_.load(std::memory_order_acquire) != taken_) {
++        // Consume new wait items and add them to sorted wait queue (QueueTimer counts an item
++        // after publishing it, so this does not spin)
++        dp::sequence_t available =
++            claim_strategy_.wait_until_published(next_sequence, next_sequence - 1);
++        taken_ += uint64_t(available - next_sequence + 1);
++
++        {
+           std::forward_list<std::shared_ptr<WaitItem>> wait_items;
+           do {
+             wait_items.push_front(std::move(buffer_[next_sequence]));
+@@ -132,6 +190,17 @@ class TimerQueue {
+     auto sequence = claim_strategy_.claim_one();
+     buffer_[sequence] = std::move(wait_item);
+     claim_strategy_.publish(sequence);
++    queued_.fetch_add(1, std::memory_order_release);
++#if defined(_WIN32)
++    if (wake_event_) {
++      SetEvent(wake_event_);
++      return wait_item_weak;
++    }
++#endif
++    {
++      std::lock_guard lock(wake_mutex_);
++    }
++    wake_cv_.notify_one();
+ 
+     return wait_item_weak;
+   }
+@@ -149,6 +218,14 @@ class TimerQueue {
+   // This is a _sorted_ (ascending due_) list of active timers managed by a
+   // dedicated thread
+   std::forward_list<std::shared_ptr<WaitItem>> wait_queue_;
++  std::atomic<uint64_t> queued_{0};  // items published by QueueTimer
++  uint64_t taken_ = 0;               // items the dispatch thread consumed
++  std::mutex wake_mutex_;
++  std::condition_variable wake_cv_;
++#if defined(_WIN32)
++  HANDLE wake_event_ = nullptr;
++  HANDLE wait_timer_ = nullptr;
++#endif
+   std::atomic_bool stop_requested_{false};
+   std::thread dispatch_thread_;
+ };
+diff --git a/src/filesystem/devices/stfs_container_file.cpp b/src/filesystem/devices/stfs_container_file.cpp
+index b758f68..3a391cc 100644
+--- a/src/filesystem/devices/stfs_container_file.cpp
++++ b/src/filesystem/devices/stfs_container_file.cpp
+@@ -14,11 +14,19 @@
+ 
+ #include <algorithm>
+ #include <cmath>
++#include <mutex>
+ 
+ #include <rex/math.h>
+ 
+ namespace rex::filesystem {
+ 
++namespace {
++// wwe2k14 patch (Session 32): every file of a package reads through the device's shared FILE* with a seek and then a
++// fread; two threads reading two files of one package at once (a titantron streaming while a .pac loads, as in a DLC
++// entrance) could interleave and get each other's bytes. One lock for the seek + read pair (reads are a few blocks).
++std::mutex g_stfs_read_mutex;
++}  // namespace
++
+ StfsContainerFile::StfsContainerFile(uint32_t file_access, StfsContainerEntry* entry)
+     : File(file_access, entry), entry_(entry) {}
+ 
+@@ -39,6 +47,7 @@ X_STATUS StfsContainerFile::ReadSync(std::span<uint8_t> buffer, size_t byte_offs
+   size_t remaining_length = std::min(buffer.size(), entry_->size() - byte_offset);
+ 
+   *out_bytes_read = 0;
++  std::lock_guard<std::mutex> lock(g_stfs_read_mutex);  // wwe2k14 patch (Session 32): see above
+   for (size_t i = 0; i < entry_->block_list().size(); i++) {
+     auto& record = entry_->block_list()[i];
+     if (src_offset + record.length <= byte_offset) {
+diff --git a/src/filesystem/virtual_file_system.cpp b/src/filesystem/virtual_file_system.cpp
+index 67abd1f..50866e8 100644
+--- a/src/filesystem/virtual_file_system.cpp
++++ b/src/filesystem/virtual_file_system.cpp
+@@ -102,6 +102,42 @@ bool VirtualFileSystem::ResolveSymbolicLink(const std::string_view path, std::st
+   return was_resolved;
+ }
+ 
++bool VirtualFileSystem::RegisterOverlay(const std::string_view device_mount_path,
++                                        std::unique_ptr<Device> overlay) {
++  auto global_lock = global_critical_region_.Acquire();
++  if (!overlay)
++    return false;
++  overlays_.emplace_back(std::string(device_mount_path), std::move(overlay));
++  return true;
++}
++
++Entry* VirtualFileSystem::FindOverlayFile(const std::string_view mount_path,
++                                          const std::string_view relative_path) {
++  for (const auto& [mount, overlay] : overlays_) {
++    if (!rex::string::utf8_equal_case(mount, mount_path))
++      continue;
++    // Files only: the overlay's folders (its root included) must not hide the device's.
++    auto* replaced = overlay->ResolvePath(relative_path);
++    if (replaced && !(replaced->attributes() & kFileAttributeDirectory)) {
++      REXFS_INFO("VFS: '{}{}' replaced by '{}'", mount_path, relative_path,
++                 replaced->absolute_path());
++      return replaced;
++    }
++  }
++  return nullptr;
++}
++
++Entry* VirtualFileSystem::OverlayFileFor(const std::string_view absolute_path) {
++  if (overlays_.empty())
++    return nullptr;
++  for (const auto& [mount, overlay] : overlays_) {
++    if (absolute_path.size() > mount.size() &&
++        rex::string::utf8_starts_with_case(absolute_path, mount))
++      return FindOverlayFile(mount, absolute_path.substr(mount.size()));
++  }
++  return nullptr;
++}
++
+ Entry* VirtualFileSystem::ResolvePath(const std::string_view path) {
+   auto global_lock = global_critical_region_.Acquire();
+ 
+@@ -131,6 +167,8 @@ Entry* VirtualFileSystem::ResolvePath(const std::string_view path) {
+ 
+   const auto& device = *it;
+   auto relative_path = normalized_path.substr(device->mount_path().size());
++  if (auto* replaced = FindOverlayFile(device->mount_path(), relative_path))
++    return replaced;
+   auto* entry = device->ResolvePath(relative_path);
+ 
+   if (entry) {
+@@ -221,6 +259,24 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
+     entry = !root_entry ? ResolvePath(path) : root_entry->GetChild(path);
+   }
+ 
++  // Overlay files replace the device's for plain opens (reads); writes keep the device's.
++  if (creation_disposition == FileDisposition::kOpen &&
++      !(desired_access & FileAccess::kFileWriteData)) {
++    const Entry* base = parent_entry ? parent_entry : root_entry;
++    if (base) {
++      const std::string name = parent_entry ? rex::string::utf8_find_name_from_guest_path(path)
++                                            : std::string(path);
++      std::string absolute(base->absolute_path());
++      if (!absolute.empty() && absolute.back() != '\\')
++        absolute += '\\';
++      absolute += name;
++      if (auto* replaced = OverlayFileFor(absolute)) {
++        entry = replaced;
++        parent_entry = replaced->parent();
++      }
++    }
++  }
++
+   if (entry) {
+     if (entry->attributes() & kFileAttributeDirectory && is_non_directory) {
+       return X_STATUS_FILE_IS_A_DIRECTORY;
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index b3ae074..5fab9e2 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -41,6 +41,11 @@
+ #include <rex/system/user_module.h>
+ 
+ REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
++// WWE '12 PC (2026-11-20, port/patches/rexglue-sdk-wait-probe.patch): the "NOW LOADING" freeze on 2 threads left
++// the command processor in one WAIT_REG_MEM for good. Read only: logs a WAIT_REG_MEM that lasts over 1 s (what it
++// polls, the reference, mask, comparison, the value read, the vblank counter), then every 5 s while it lasts.
++REXCVAR_DEFINE_BOOL(gpu_wait_probe, false, "GPU",
++                    "Debug: log every WAIT_REG_MEM of the guest command stream that waits more than 1 s");
+ 
+ REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
+                     "Refresh page-valid state from GPU-written memory at frame end. "
+@@ -1239,6 +1244,12 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+     }
+   };
+ 
++  // gpu_wait_probe (read only): time of the first poll, next report time, reports made.
++  const bool wait_probe = REXCVAR_GET(gpu_wait_probe);
++  const auto wait_probe_start = std::chrono::steady_clock::now();
++  auto wait_probe_next = wait_probe_start + std::chrono::seconds(1);
++  uint32_t wait_probe_reports = 0;
++
+   bool matched = false;
+   do {
+     uint32_t value = 0;
+@@ -1280,6 +1291,20 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+         matched = true;
+         break;
+     }
++    if (!matched && wait_probe) {
++      const auto now = std::chrono::steady_clock::now();
++      if (now >= wait_probe_next) {
++        ++wait_probe_reports;
++        REXGPU_WARN(
++            "[waitprobe] WAIT_REG_MEM waiting {} ms (report {}): {} {:08X} value {:08X} & mask {:08X} "
++            "vs ref {:08X} (compare {}: 0 never 1 < 2 <= 3 == 4 != 5 >= 6 > 7 always) | wait {:X} | vblank "
++            "counter {} | ring read {:08X}",
++            std::chrono::duration_cast<std::chrono::milliseconds>(now - wait_probe_start).count(),
++            wait_probe_reports, is_memory ? "memory" : "register", poll_reg_addr, value, mask, ref,
++            wait_info & 0x7, wait, counter_, read_ptr_index_);
++        wait_probe_next = now + std::chrono::seconds(5);
++      }
++    }
+     if (!matched) {
+       if (census_enabled) {
+         if (census_wait_iterations == 0) {
+diff --git a/src/system/mmio_handler.cpp b/src/system/mmio_handler.cpp
+index d660bd7..22dcc60 100644
+--- a/src/system/mmio_handler.cpp
++++ b/src/system/mmio_handler.cpp
+@@ -21,6 +21,10 @@
+ #include <mutex>
+ #include <unordered_set>
+ #include <utility>
++#if REX_PLATFORM_ANDROID
++#include <dlfcn.h>
++#include <atomic>
++#endif
+ 
+ #include <rex/assert.h>
+ #include <rex/exception_handler.h>
+@@ -574,6 +578,33 @@ void ReadWatchArm(uint8_t*, uint32_t, uint32_t) {
+ static bool ReadWatchOnFault(arch::Exception*) { return false; }
+ #endif
+ 
++#if REX_PLATFORM_ANDROID
++// WWE '12 Android: where a game crash happened. The log only said "Unhandled guest access
++// violation" (thousands of times for one crash, #46); the host PC and return address, as offsets
++// in their library, give the game function (sub_XXXXXXXX of the unstripped libwwe12.so).
++static void NoteUnhandledAccess(arch::Exception* ex) {
++  static std::atomic<int> notes{0};
++  if (notes.fetch_add(1, std::memory_order_relaxed) >= 3)
++    return;
++  auto where = [](uint64_t a) {
++    Dl_info info{};
++    if (a && dladdr(reinterpret_cast<void*>(a), &info) && info.dli_fname) {
++      const char* lib = std::strrchr(info.dli_fname, '/');
++      return fmt::format("{}+{:#x}", lib ? lib + 1 : info.dli_fname,
++                         a - reinterpret_cast<uintptr_t>(info.dli_fbase));
++    }
++    return fmt::format("{:#x}", a);
++  };
++#if REX_ARCH_ARM64
++  const uint64_t lr = ex->thread_context()->x[30];
++#else
++  const uint64_t lr = 0;
++#endif
++  REXSYS_ERROR("Game crash: fault at {:#x}, code {} (return address {})", ex->fault_address(),
++               where(ex->pc()), where(lr));
++}
++#endif
++
+ bool MMIOHandler::ExceptionCallbackThunk(arch::Exception* ex, void* data) {
+   return reinterpret_cast<MMIOHandler*>(data)->ExceptionCallback(ex);
+ }
+@@ -643,8 +674,16 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
+     // The address is not found within any range, so either a write watch or an
+     // actual access violation.
+     if (access_violation_callback_) {
++#if REX_PLATFORM_ANDROID
++      const bool handled = access_violation_callback_(
++          std::move(lock), access_violation_callback_context_, fault_host_address, is_write);
++      if (!handled)
++        NoteUnhandledAccess(ex);
++      return handled;
++#else
+       return access_violation_callback_(std::move(lock), access_violation_callback_context_,
+                                         fault_host_address, is_write);
++#endif
+     }
+     return false;
+   }
+diff --git a/src/system/xthread.cpp b/src/system/xthread.cpp
+index eacc33b..dd90dc2 100644
+--- a/src/system/xthread.cpp
++++ b/src/system/xthread.cpp
+@@ -425,8 +425,13 @@ X_STATUS XThread::Create() {
+     // Set thread ID override. This is used by logging.
+     rex::thread::set_current_thread_id(handle());
+ 
+-    // Set name immediately, if we have one.
+-    thread_->set_name(thread_name_);
++    // Set name immediately, if we have one. Under thread_lock_: the creating thread may be giving
++    // the default name at the same moment (set_name below), and two unguarded writes to the same
++    // strings freed memory twice (Scudo abort seen at start on Android).
++    {
++      std::lock_guard<std::mutex> lock(thread_lock_);
++      thread_->set_name(thread_name_);
++    }
+ 
+     rex::diagnostics::freeze_logger::RegisterThread(
+         thread_id_, thread_name_.empty() ? "XThread" : thread_name_.c_str());
+@@ -882,7 +887,11 @@ void XThread::SetActiveCpu(uint8_t cpu_index) {
+       thread_->set_affinity_mask(uint64_t(1) << cpu_index);
+     }
+   } else {
+-    REXSYS_WARN("Too few processor cores - scheduling will be wonky");
++    // Called on every thread switch of a guest CPU (vblank interrupts included): once is enough,
++    // tens of thousands of lines a minute cost the small PCs it warns about.
++    static std::atomic<bool> warned{false};
++    if (!warned.exchange(true))
++      REXSYS_WARN("Too few processor cores - scheduling will be wonky");
+   }
+ }
+ 
+diff --git a/src/ui/windowed_app_context_android.cpp b/src/ui/windowed_app_context_android.cpp
+index c2d2bc1..07d0814 100644
+--- a/src/ui/windowed_app_context_android.cpp
++++ b/src/ui/windowed_app_context_android.cpp
+@@ -15,9 +15,14 @@ bool AndroidWindowedAppContext::ShowSimpleMessageBox(const char* title, const ch
+   return SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, title, message, nullptr);
+ }
+ void AndroidWindowedAppContext::RunMainSDLLoop() {
++  // From the WWE '12 Android port (rexglue-sdk-android2-cpu / zz-android-uiwake): every event wakes SDL_WaitEvent and
++  // each pump adds a POLL_SENTINEL, so the UI thread never slept (a core at 100 %); the sentinel only serves
++  // SDL_PollEvent loops. And a wakeup pushed while the loop is about to sleep can be lost in SDL's Android pump (it then
++  // waits for a lifecycle event, forever) while the render thread waits on this thread: never sleep more than 50 ms.
++  SDL_SetEventEnabled(SDL_EVENT_POLL_SENTINEL, false);
+   while (!quit_requested_.load()) {
+     SDL_Event event{};
+-    if (!SDL_WaitEvent(&event)) {
++    if (!SDL_WaitEventTimeout(&event, 50)) {
+       ExecutePendingFunctionsFromUIThread();
+       continue;
+     }

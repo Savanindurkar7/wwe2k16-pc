@@ -4,13 +4,16 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.Intent;
 import android.content.SharedPreferences;
-import android.content.res.Configuration;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.graphics.drawable.GradientDrawable;
 import android.text.InputType;
+import android.text.SpannableString;
+import android.text.Spanned;
+import android.text.style.ForegroundColorSpan;
 import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.View;
@@ -19,7 +22,8 @@ import android.view.Window;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
 import android.widget.EditText;
-import android.widget.HorizontalScrollView;
+import android.widget.FrameLayout;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
@@ -55,104 +59,157 @@ public class OptionsActivity extends Activity {
         }
     }
 
-    @Override
-    public void onConfigurationChanged(Configuration newConfig) {
-        super.onConfigurationChanged(newConfig);
-        build();
-    }
-
-    private boolean landscape() {
-        return getResources().getConfiguration().orientation == Configuration.ORIENTATION_LANDSCAPE;
-    }
-
+    // Landscape only (manifest). Left: the title, the sections and the game files' status. Right: the section's
+    // options in an outlined panel over the dimmed background, with HOME at the top right.
     private void build() {
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setBackgroundColor(Ui.PANEL_SOLID);
+        FrameLayout root = new FrameLayout(this);
+        root.setBackgroundColor(0xFF000000);
+        ImageView art = new ImageView(this);
+        art.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        int bg = getResources().getIdentifier("home_bg", "drawable", getPackageName());
+        if (bg != 0) art.setImageResource(bg);
+        art.setAlpha(0.28f);
+        root.addView(art, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
-        // Header: back, title, reset.
-        LinearLayout header = new LinearLayout(this);
-        header.setOrientation(LinearLayout.HORIZONTAL);
-        header.setGravity(Gravity.CENTER_VERTICAL);
-        int pad = Ui.dp(this, 18);
-        header.setPadding(pad, Ui.dp(this, 12), pad, Ui.dp(this, 12));
-        header.setBackgroundColor(0xFF000000);
-        header.addView(Ui.smallButton(this, "‹ Back", false, v -> finish()));
-        TextView title = Ui.text(this, "OPTIONS", 28, Ui.WHITE, Ui.bold());
-        title.setLetterSpacing(0.06f);
-        title.setPadding(Ui.dp(this, 16), 0, 0, 0);
-        header.addView(title, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-        header.addView(Ui.smallButton(this, "Reset", false, v -> new AlertDialog.Builder(this)
-                .setTitle("Reset all options?")
-                .setMessage("Every option goes back to its default. Your game files and drivers stay.")
-                .setPositiveButton("Reset", (d, w) -> {
-                    Settings.resetAll(this);
-                    build();
-                })
-                .setNegativeButton("Cancel", null)
-                .show()));
-        root.addView(header);
-        View redLine = new View(this);
-        redLine.setBackgroundColor(Ui.RED);
-        root.addView(redLine, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, Ui.dp(this, 3)));
-
-        LinearLayout body = new LinearLayout(this);
-        body.setOrientation(landscape() ? LinearLayout.HORIZONTAL : LinearLayout.VERTICAL);
-        View tabs = tabs();
-        ScrollView content = new ScrollView(this);
-        content.setFillViewport(true);
-        content.addView(sectionContent());
-        if (landscape()) {
-            body.addView(tabs, new LinearLayout.LayoutParams(Ui.dp(this, 210), ViewGroup.LayoutParams.MATCH_PARENT));
-            body.addView(content, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f));
-        } else {
-            body.addView(tabs, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-            body.addView(content, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
-        }
-        root.addView(body, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        int sideWidth = Math.max(Ui.dp(this, 230), Math.round(getResources().getDisplayMetrics().widthPixels * 0.2f));
+        row.addView(sidebar(), new LinearLayout.LayoutParams(sideWidth, ViewGroup.LayoutParams.MATCH_PARENT));
+        row.addView(contentArea(), new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f));
+        root.addView(row);
         setContentView(root);
     }
 
-    private View tabs() {
-        LinearLayout list = new LinearLayout(this);
-        list.setOrientation(landscape() ? LinearLayout.VERTICAL : LinearLayout.HORIZONTAL);
-        int pad = Ui.dp(this, 10);
-        list.setPadding(pad, pad, pad, pad);
-        list.setBackgroundColor(0xFF08080A);
-        for (String s : Settings.SECTIONS) {
-            boolean active = s.equals(section);
-            TextView t = Ui.smallButton(this, s, active, v -> {
-                section = s;
+    private View sidebar() {
+        LinearLayout side = new LinearLayout(this);
+        side.setOrientation(LinearLayout.VERTICAL);
+        int pad = Ui.dp(this, 18);
+        side.setPadding(pad, Ui.dp(this, 18), Ui.dp(this, 10), Ui.dp(this, 12));
+        side.setBackground(new GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT, new int[] {0xF2000000, 0xB3000000}));
+
+        SpannableString title = new SpannableString("WWE 2K16");
+        title.setSpan(new ForegroundColorSpan(Ui.RED), 4, 8, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        TextView t = Ui.text(this, "", 32, Ui.WHITE, Ui.bold());
+        t.setText(title);
+        side.addView(t);
+        TextView sub = Ui.text(this, "XBOX 360 RECOMPILED", 10.5f, Ui.GREY, Ui.regular());
+        sub.setLetterSpacing(0.3f);
+        sub.setPadding(0, Ui.dp(this, 6), 0, Ui.dp(this, 14));
+        side.addView(sub);
+
+        LinearLayout nav = new LinearLayout(this);
+        nav.setOrientation(LinearLayout.VERTICAL);
+        for (String sec : Settings.SECTIONS) {
+            boolean active = sec.equals(section);
+            String label = sec.charAt(0) + sec.substring(1).toLowerCase(java.util.Locale.ROOT);
+            if (Settings.S_DRIVER.equals(sec)) label = "GPU driver";
+            TextView item = Ui.text(this, label, 17, active ? 0xFF111114 : Ui.WHITE, Ui.semi());
+            item.setGravity(Gravity.CENTER_VERTICAL);
+            item.setPadding(Ui.dp(this, 18), Ui.dp(this, 10), Ui.dp(this, 10), Ui.dp(this, 10));
+            item.setBackground(Ui.navBackground(this, active));
+            item.setFocusable(true);
+            item.setClickable(true);
+            item.setOnClickListener(v -> {
+                section = sec;
                 build();
             });
-            t.setGravity(landscape() ? Gravity.START | Gravity.CENTER_VERTICAL : Gravity.CENTER);
-            LinearLayout.LayoutParams lp = landscape()
-                    ? new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
-                    : new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-            if (landscape()) lp.bottomMargin = Ui.dp(this, 6);
-            else lp.rightMargin = Ui.dp(this, 6);
-            list.addView(t, lp);
-            if (active) t.post(t::requestFocus);
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT);
+            lp.bottomMargin = Ui.dp(this, 6);
+            nav.addView(item, lp);
+            if (active) item.post(item::requestFocus);
         }
-        if (landscape()) return list;
-        HorizontalScrollView h = new HorizontalScrollView(this);
-        h.setHorizontalScrollBarEnabled(false);
-        h.addView(list);
-        return h;
+        ScrollView navScroll = new ScrollView(this);
+        navScroll.setVerticalScrollBarEnabled(false);
+        navScroll.addView(nav);
+        side.addView(navScroll, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+
+        // Game files status card.
+        SharedPreferences prefs = Settings.prefs(this);
+        String path = prefs.getString(Settings.KEY_GAME_PATH, "");
+        String problem = GameFiles.checkSaved(path, prefs.getString(Settings.KEY_GAME_KIND, "folder"));
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setPadding(Ui.dp(this, 12), Ui.dp(this, 10), Ui.dp(this, 12), Ui.dp(this, 10));
+        card.setBackground(Ui.rect(0xCC16161B, Ui.dp(this, 8)));
+        TextView ok = Ui.text(this, problem == null ? "✓  Game files ready" : "✕  Game files needed", 14,
+                problem == null ? Ui.GREEN : Ui.RED, Ui.semi());
+        card.addView(ok);
+        TextView where = Ui.body(this, path.isEmpty() ? "None selected" : new java.io.File(path).getName(), 11, Ui.GREY);
+        where.setPadding(0, Ui.dp(this, 4), 0, 0);
+        where.setMaxLines(2);
+        card.addView(where);
+        LinearLayout.LayoutParams cardLp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT);
+        cardLp.topMargin = Ui.dp(this, 8);
+        side.addView(card, cardLp);
+        TextView ver = Ui.text(this, BuildInfo.versionName(this), 10.5f, Ui.DIM, Ui.regular());
+        ver.setPadding(0, Ui.dp(this, 8), 0, 0);
+        side.addView(ver);
+        return side;
+    }
+
+    private View contentArea() {
+        LinearLayout area = new LinearLayout(this);
+        area.setOrientation(LinearLayout.VERTICAL);
+        area.setPadding(Ui.dp(this, 20), Ui.dp(this, 14), Ui.dp(this, 20), Ui.dp(this, 10));
+        LinearLayout header = new LinearLayout(this);
+        header.setOrientation(LinearLayout.HORIZONTAL);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        String heading = Settings.S_DRIVER.equals(section) ? "GPU DRIVER" : section;
+        TextView h = Ui.text(this, heading, 26, Ui.WHITE, Ui.bold());
+        h.setLetterSpacing(0.03f);
+        header.addView(h, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        if (!Settings.S_CREDITS.equals(section)) {
+            TextView reset = Ui.smallButton(this, "Reset all", false, v -> new AlertDialog.Builder(this)
+                    .setTitle("Reset all options?")
+                    .setMessage("Every option goes back to its default. Your game files, drivers and touch layout stay.")
+                    .setPositiveButton("Reset", (d, w) -> {
+                        Settings.resetAll(this);
+                        build();
+                    })
+                    .setNegativeButton("Cancel", null)
+                    .show());
+            LinearLayout.LayoutParams rl = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT);
+            rl.rightMargin = Ui.dp(this, 8);
+            header.addView(reset, rl);
+        }
+        TextView home = Ui.smallButton(this, "Home", false, v -> finish());
+        home.setMinWidth(Ui.dp(this, 120));
+        header.addView(home);
+        area.addView(header);
+
+        ScrollView scroll = new ScrollView(this);
+        scroll.setFillViewport(false);
+        LinearLayout panel = (LinearLayout) sectionContent();
+        GradientDrawable panelBg = Ui.rect(0xB3060608, Ui.dp(this, 12));
+        panelBg.setStroke(Math.max(1, Ui.dp(this, 1)), 0x33FFFFFF);
+        panel.setBackground(panelBg);
+        scroll.addView(panel);
+        LinearLayout.LayoutParams sl = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f);
+        sl.topMargin = Ui.dp(this, 12);
+        area.addView(scroll, sl);
+        return area;
     }
 
     private View sectionContent() {
         LinearLayout p = new LinearLayout(this);
         p.setOrientation(LinearLayout.VERTICAL);
-        int pad = Ui.dp(this, landscape() ? 22 : 14);
-        p.setPadding(pad, pad, pad, Ui.dp(this, 30));
-        TextView h = Ui.label(this, section, 22);
-        h.setTextColor(Ui.RED);
-        p.addView(h);
+        int pad = Ui.dp(this, 18);
+        p.setPadding(pad, Ui.dp(this, 8), pad, Ui.dp(this, 18));
         int gap = Ui.dp(this, 8);
         SharedPreferences prefs = Settings.prefs(this);
+        if (Settings.S_CREDITS.equals(section)) {
+            addCredits(p);
+            return p;
+        }
         List<Settings.Choice> choices = Settings.inSection(section);
         for (Settings.Choice c : choices) p.addView(choiceRow(c, prefs), Ui.fill(gap));
+        if (Settings.S_CONTROLS.equals(section)) {
+            p.addView(Ui.menuButton(this, "Edit touch layout", "Move and resize the on-screen controls", true,
+                    v -> startActivity(new Intent(this, TouchEditActivity.class))), Ui.fill(Ui.dp(this, 14)));
+        }
         if (Settings.S_DRIVER.equals(section)) addDriverRows(p, prefs);
         if (Settings.S_ADVANCED.equals(section)) addExtraArgs(p, prefs);
         if (Settings.S_PERFORMANCE.equals(section)) {
@@ -162,6 +219,29 @@ public class OptionsActivity extends Activity {
             p.addView(tip);
         }
         return p;
+    }
+
+    private void addCredits(LinearLayout p) {
+        TextView name = Ui.text(this, Credits.PORT_BY, 30, Ui.WHITE, Ui.bold());
+        name.setPadding(0, Ui.dp(this, 10), 0, 0);
+        p.addView(name);
+        TextView role = Ui.body(this, "Port of WWE 2K16 to Android  ·  " + Credits.GITHUB, 14, Ui.GREY);
+        role.setPadding(0, Ui.dp(this, 4), 0, Ui.dp(this, 14));
+        p.addView(role);
+        for (String[] line : Credits.THANKS) {
+            LinearLayout r = new LinearLayout(this);
+            r.setOrientation(LinearLayout.VERTICAL);
+            r.setPadding(Ui.dp(this, 14), Ui.dp(this, 9), Ui.dp(this, 14), Ui.dp(this, 9));
+            r.setBackground(Ui.rect(0xCC141419, Ui.dp(this, 4)));
+            r.addView(Ui.label(this, line[0], 14));
+            TextView d = Ui.body(this, line[1], 12.5f, Ui.GREY);
+            d.setPadding(0, Ui.dp(this, 3), 0, 0);
+            r.addView(d);
+            p.addView(r, Ui.fill(Ui.dp(this, 6)));
+        }
+        TextView disc = Ui.body(this, Credits.DISCLAIMER, 11.5f, Ui.DIM);
+        disc.setPadding(0, Ui.dp(this, 14), 0, 0);
+        p.addView(disc);
     }
 
     /** A setting row: title and value with arrows; the note for the current value below. */

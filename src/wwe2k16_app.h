@@ -33,6 +33,7 @@
 #include "launcher_settings.h"
 #include "screenshot.h"
 #include "script_input.h"
+#include "touch_input.h"
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -245,6 +246,14 @@ class Wwe2k16App : public rex::ReXApp {
     rex::ui::RegisterBind("bind_screenshot", "F12",
                           "Save a full-resolution screenshot to Documents\\wwe2k16\\Screenshots",
                           [this] { wwe2k16::TakeScreenshot(runtime()); });
+#if defined(__ANDROID__)
+    // On-screen touch controller (touch_input.h): merged with any real gamepad by the input system.
+    if (runtime() && runtime()->input_system()) {
+      static_cast<rex::input::InputSystem*>(runtime()->input_system())
+          ->AddDriver(std::make_unique<wwe2k16::TouchInputDriver>(nullptr));
+      REXLOG_INFO("[wwe2k16] touch controller ready");
+    }
+#endif
     // Scripted controller for automated tests (script_input.h).
     if (wwe2k16::ScriptInputDriver::Enabled() && runtime() && runtime()->input_system()) {
       static_cast<rex::input::InputSystem*>(runtime()->input_system())
