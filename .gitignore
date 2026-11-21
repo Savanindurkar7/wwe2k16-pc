@@ -30,3 +30,5 @@ __pycache__/
 # Mods installed through the launcher
 /mods/
 /thirdparty/
+/generated_k14/
+/wwe2k16_k14_config.toml
