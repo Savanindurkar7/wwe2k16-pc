@@ -32,6 +32,8 @@ set(WWE2K16_SOURCES
     src/cp_profiler.cpp
     src/exit_menu.cpp
     src/display_refresh_rate.cpp
+    src/frame_monitor.cpp
+    src/android_driver.cpp
 )
 
 if(ANDROID)
@@ -44,6 +46,30 @@ else()
 endif()
 
 rexglue_setup_target(wwe2k16)
+# disc_image.cpp includes the SDK's disc reader from its source tree: the SDK checkout this build uses.
+if(REXSDK_DIR)
+    target_include_directories(wwe2k16 PRIVATE "${REXSDK_DIR}/src")
+else()
+    target_include_directories(wwe2k16 PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/sdk/rexglue/src")
+endif()
+
+if(ANDROID)
+    target_link_libraries(wwe2k16 PRIVATE android log)
+    # Custom Vulkan drivers (src/android_driver.cpp): libadrenotools (BSD-2-Clause), cloned by tools/android-build.sh.
+    # Its hook libraries (libhook_impl.so, libmain_hook.so) go into the APK next to libmain.so.
+    set(WWE2K16_ADRENOTOOLS "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/libadrenotools")
+    if(EXISTS "${WWE2K16_ADRENOTOOLS}/CMakeLists.txt")
+        if(NOT CMAKE_ANDROID_ARCH_ABI)
+            set(CMAKE_ANDROID_ARCH_ABI ${ANDROID_ABI})
+        endif()
+        add_subdirectory("${WWE2K16_ADRENOTOOLS}" adrenotools EXCLUDE_FROM_ALL)
+        target_link_libraries(wwe2k16 PRIVATE adrenotools)
+        target_compile_definitions(wwe2k16 PRIVATE WWE2K16_HAVE_ADRENOTOOLS=1)
+        add_dependencies(wwe2k16 hook_impl main_hook)
+    else()
+        message(WARNING "thirdparty/libadrenotools is missing: custom GPU drivers are off in this build")
+    endif()
+endif()
 
 # Title update 3 build: wwe2k16_tu.exe from generated_tu\ (tools/build-tu.ps1). Same app code; WWE2K16_TU selects the
 # title update's function addresses where the app hooks the game.

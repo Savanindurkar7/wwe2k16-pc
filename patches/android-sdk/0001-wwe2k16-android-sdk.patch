@@ -1,0 +1,482 @@
+diff --git a/include/rex/graphics/vulkan/pipeline_cache.h b/include/rex/graphics/vulkan/pipeline_cache.h
+index 1e1cbf1..47bad9a 100644
+--- a/include/rex/graphics/vulkan/pipeline_cache.h
++++ b/include/rex/graphics/vulkan/pipeline_cache.h
+@@ -422,6 +422,17 @@ class VulkanPipelineCache {
+   VkShaderModule depth_float24_truncate_fragment_shader_ = VK_NULL_HANDLE;
+   VkShaderModule depth_float24_round_fragment_shader_ = VK_NULL_HANDLE;
+ 
++  // WWE 2K16 Android: the driver's pipeline cache, kept on disk next to the shader storage, so pipelines the game used
++  // before are rebuilt from the driver's compiled binaries instead of compiling again (vulkan_pipeline_cache).
++  void LoadDriverPipelineCache(const std::filesystem::path& shader_storage_root);
++  void SaveDriverPipelineCache(const char* reason);
++  void DestroyDriverPipelineCache();
++  VkPipelineCache driver_pipeline_cache_ = VK_NULL_HANDLE;
++  std::filesystem::path driver_pipeline_cache_path_;
++  std::atomic<uint32_t> driver_pipeline_cache_unsaved_{0};
++  std::chrono::steady_clock::time_point driver_pipeline_cache_last_save_{};
++  std::mutex driver_pipeline_cache_save_lock_;
++
+   std::unordered_map<PipelineDescription, Pipeline, PipelineDescription::Hasher> pipelines_;
+ 
+   // Previously used pipeline, to avoid lookups if the state wasn't changed.
+diff --git a/include/rex/perf/stall_counters.h b/include/rex/perf/stall_counters.h
+new file mode 100644
+index 0000000..1392d6c
+--- /dev/null
++++ b/include/rex/perf/stall_counters.h
+@@ -0,0 +1,54 @@
++/**
++ * @file        perf/stall_counters.h
++ * @brief       WWE 2K16 Android: running totals the game reads per frame to tell what a long frame spent its time on
++ *              (pipeline creation, texture loads, guest file reads). Relaxed atomics: cheap, read as deltas.
++ */
++#pragma once
++
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++
++namespace rex::perf {
++
++struct StallCounters {
++  std::atomic<uint64_t> pipelines_created{0};
++  std::atomic<uint64_t> pipeline_create_ns{0};
++  std::atomic<uint64_t> pipeline_cache_hits{0};   // pipelines created from the driver's on-disk cache (fast)
++  std::atomic<uint64_t> texture_loads{0};
++  std::atomic<uint64_t> texture_load_ns{0};
++  std::atomic<uint64_t> file_reads{0};
++  std::atomic<uint64_t> file_read_bytes{0};
++  std::atomic<uint64_t> file_read_ns{0};
++};
++
++inline StallCounters& GetStallCounters() {
++  static StallCounters counters;
++  return counters;
++}
++
++inline uint64_t StallNowNs() {
++  return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                      std::chrono::steady_clock::now().time_since_epoch())
++                      .count());
++}
++
++// Adds the time from construction to destruction to `ns` (and 1 to `count`, if given).
++class StallScope {
++ public:
++  StallScope(std::atomic<uint64_t>& ns, std::atomic<uint64_t>* count = nullptr)
++      : ns_(ns), count_(count), start_(StallNowNs()) {}
++  ~StallScope() {
++    ns_.fetch_add(StallNowNs() - start_, std::memory_order_relaxed);
++    if (count_) count_->fetch_add(1, std::memory_order_relaxed);
++  }
++  StallScope(const StallScope&) = delete;
++  StallScope& operator=(const StallScope&) = delete;
++
++ private:
++  std::atomic<uint64_t>& ns_;
++  std::atomic<uint64_t>* count_;
++  uint64_t start_;
++};
++
++}  // namespace rex::perf
+diff --git a/include/rex/platform/dynlib.h b/include/rex/platform/dynlib.h
+index c30ae1c..c949fee 100644
+--- a/include/rex/platform/dynlib.h
++++ b/include/rex/platform/dynlib.h
+@@ -22,6 +22,11 @@ class DynamicLibrary {
+   DynamicLibrary& operator=(DynamicLibrary&& other) noexcept;
+ 
+   bool Load(const std::filesystem::path& path);
++  // WWE 2K16 Android: take ownership of an already opened library handle (a custom Vulkan driver).
++  void Adopt(void* handle) {
++    Close();
++    handle_ = handle;
++  }
+   void Close();
+   explicit operator bool() const { return handle_ != nullptr; }
+ 
+diff --git a/include/rex/ui/vulkan/device.h b/include/rex/ui/vulkan/device.h
+index e836469..4f4f22a 100644
+--- a/include/rex/ui/vulkan/device.h
++++ b/include/rex/ui/vulkan/device.h
+@@ -52,6 +52,7 @@ class VulkanDevice {
+     uint32_t driverVersion = 0;
+     uint32_t vendorID = 0;
+     uint32_t deviceID = 0;
++    uint8_t pipelineCacheUUID[VK_UUID_SIZE] = {};
+     char deviceName[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE] = {};
+ 
+     uint32_t maxImageDimension2D = 4096;
+diff --git a/include/rex/ui/vulkan/functions/device_1_0.inc b/include/rex/ui/vulkan/functions/device_1_0.inc
+index 9d3abe2..83152ff 100644
+--- a/include/rex/ui/vulkan/functions/device_1_0.inc
++++ b/include/rex/ui/vulkan/functions/device_1_0.inc
+@@ -43,6 +43,7 @@ XE_UI_VULKAN_FUNCTION(vkCreateFramebuffer)
+ XE_UI_VULKAN_FUNCTION(vkCreateGraphicsPipelines)
+ XE_UI_VULKAN_FUNCTION(vkCreateImage)
+ XE_UI_VULKAN_FUNCTION(vkCreateImageView)
++XE_UI_VULKAN_FUNCTION(vkCreatePipelineCache)
+ XE_UI_VULKAN_FUNCTION(vkCreatePipelineLayout)
+ XE_UI_VULKAN_FUNCTION(vkCreateQueryPool)
+ XE_UI_VULKAN_FUNCTION(vkCreateRenderPass)
+@@ -59,6 +60,7 @@ XE_UI_VULKAN_FUNCTION(vkDestroyFramebuffer)
+ XE_UI_VULKAN_FUNCTION(vkDestroyImage)
+ XE_UI_VULKAN_FUNCTION(vkDestroyImageView)
+ XE_UI_VULKAN_FUNCTION(vkDestroyPipeline)
++XE_UI_VULKAN_FUNCTION(vkDestroyPipelineCache)
+ XE_UI_VULKAN_FUNCTION(vkDestroyPipelineLayout)
+ XE_UI_VULKAN_FUNCTION(vkDestroyQueryPool)
+ XE_UI_VULKAN_FUNCTION(vkDestroyRenderPass)
+@@ -72,6 +74,7 @@ XE_UI_VULKAN_FUNCTION(vkGetBufferMemoryRequirements)
+ XE_UI_VULKAN_FUNCTION(vkGetDeviceQueue)
+ XE_UI_VULKAN_FUNCTION(vkGetFenceStatus)
+ XE_UI_VULKAN_FUNCTION(vkGetImageMemoryRequirements)
++XE_UI_VULKAN_FUNCTION(vkGetPipelineCacheData)
+ XE_UI_VULKAN_FUNCTION(vkInvalidateMappedMemoryRanges)
+ XE_UI_VULKAN_FUNCTION(vkMapMemory)
+ XE_UI_VULKAN_FUNCTION(vkResetCommandPool)
+diff --git a/include/rex/ui/vulkan/instance.h b/include/rex/ui/vulkan/instance.h
+index e672629..be70efe 100644
+--- a/include/rex/ui/vulkan/instance.h
++++ b/include/rex/ui/vulkan/instance.h
+@@ -22,6 +22,12 @@ namespace rex {
+ namespace ui {
+ namespace vulkan {
+ 
++// WWE 2K16 Android: the app can supply the Vulkan library (a custom driver opened through libadrenotools). Called once
++// per Create before the system loader; a non-null result (a dlopen-style handle exposing vkGetInstanceProcAddr) is used
++// instead of it.
++using VulkanLoaderOverride = void* (*)();
++void SetVulkanLoaderOverride(VulkanLoaderOverride override_fn);
++
+ class VulkanInstance {
+  public:
+   static std::unique_ptr<VulkanInstance> Create(bool with_surface, bool try_enable_validation);
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+index e2fdd64..984b495 100644
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -32,6 +32,7 @@
+ #include <rex/math.h>
+ #include <rex/thread.h>
+ #include <rex/memory.h>
++#include <rex/perf/stall_counters.h>
+ #include <rex/graphics/util/draw.h>
+ #include <rex/graphics/flags.h>
+ #include <rex/graphics/pipeline_util.h>
+@@ -56,6 +57,11 @@ REXCVAR_DEFINE_INT32(
+     .range(-1, 32)
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
++REXCVAR_DEFINE_BOOL(vulkan_pipeline_cache, true, "GPU/Vulkan",
++                    "Keep the Vulkan driver's pipeline cache on disk (shaders/vk_pipeline_cache.bin): pipelines used "
++                    "before load from it instead of compiling again")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++
+ REXCVAR_DEFINE_BOOL(vulkan_tessellation_wireframe, false, "GPU/Vulkan",
+                     "Render tessellation as wireframe")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+@@ -415,6 +421,8 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
+       return;
+     }
+   }
++  // Before the stored pipelines are created below: they then come from the driver's cache.
++  LoadDriverPipelineCache(shader_storage_root);
+ 
+   bool edram_fragment_shader_interlock =
+       render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
+@@ -741,7 +749,125 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
+       rex::path_to_utf8(pipeline_storage_file_path), rex::path_to_utf8(shader_storage_file_path));
+ }
+ 
++// --- WWE 2K16 Android: the driver's pipeline cache on disk -------------------------------------------------------
++
++void VulkanPipelineCache::LoadDriverPipelineCache(const std::filesystem::path& shader_storage_root) {
++  if (driver_pipeline_cache_ != VK_NULL_HANDLE || !REXCVAR_GET(vulkan_pipeline_cache)) {
++    return;
++  }
++  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
++  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
++  const VkDevice device = vulkan_device->device();
++  const auto& properties = vulkan_device->properties();
++  driver_pipeline_cache_path_ = shader_storage_root / "vk_pipeline_cache.bin";
++
++  // Only data this driver wrote is handed back: some phone drivers crash on another driver's cache (after a driver
++  // update, or with a custom driver chosen), so the header is checked here rather than trusting the driver to.
++  std::vector<uint8_t> data;
++  if (FILE* file = rex::filesystem::OpenFile(driver_pipeline_cache_path_, "rb")) {
++    std::fseek(file, 0, SEEK_END);
++    const long size = std::ftell(file);
++    std::fseek(file, 0, SEEK_SET);
++    if (size > 0 && size < (long(1) << 30)) {
++      data.resize(size_t(size));
++      if (std::fread(data.data(), 1, data.size(), file) != data.size()) data.clear();
++    }
++    std::fclose(file);
++  }
++  const char* origin = "new";
++  if (!data.empty()) {
++    VkPipelineCacheHeaderVersionOne header = {};
++    bool valid = data.size() >= sizeof(header);
++    if (valid) {
++      std::memcpy(&header, data.data(), sizeof(header));
++      valid = header.headerSize >= sizeof(header) && header.headerVersion == VK_PIPELINE_CACHE_HEADER_VERSION_ONE &&
++              header.vendorID == properties.vendorID && header.deviceID == properties.deviceID &&
++              std::memcmp(header.pipelineCacheUUID, properties.pipelineCacheUUID, VK_UUID_SIZE) == 0;
++    }
++    if (valid) {
++      origin = "loaded";
++    } else {
++      REXGPU_INFO("VulkanPipelineCache: the stored driver pipeline cache is from another driver or GPU, starting a new one");
++      data.clear();
++      origin = "replaced";
++    }
++  }
++  VkPipelineCacheCreateInfo create_info = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
++  create_info.initialDataSize = data.size();
++  create_info.pInitialData = data.empty() ? nullptr : data.data();
++  if (dfn.vkCreatePipelineCache(device, &create_info, nullptr, &driver_pipeline_cache_) != VK_SUCCESS) {
++    driver_pipeline_cache_ = VK_NULL_HANDLE;
++    if (!data.empty()) {
++      // A cache the driver refuses: start empty.
++      create_info.initialDataSize = 0;
++      create_info.pInitialData = nullptr;
++      if (dfn.vkCreatePipelineCache(device, &create_info, nullptr, &driver_pipeline_cache_) != VK_SUCCESS) {
++        driver_pipeline_cache_ = VK_NULL_HANDLE;
++      }
++    }
++  }
++  driver_pipeline_cache_unsaved_.store(0, std::memory_order_relaxed);
++  driver_pipeline_cache_last_save_ = std::chrono::steady_clock::now();
++  REXGPU_INFO("VulkanPipelineCache: driver pipeline cache {} ({} KB) at {}",
++              driver_pipeline_cache_ != VK_NULL_HANDLE ? origin : "unavailable", data.size() / 1024,
++              rex::path_to_utf8(driver_pipeline_cache_path_));
++}
++
++void VulkanPipelineCache::SaveDriverPipelineCache(const char* reason) {
++  if (driver_pipeline_cache_ == VK_NULL_HANDLE || driver_pipeline_cache_path_.empty()) {
++    return;
++  }
++  std::lock_guard<std::mutex> lock(driver_pipeline_cache_save_lock_);
++  const uint32_t unsaved = driver_pipeline_cache_unsaved_.exchange(0, std::memory_order_relaxed);
++  driver_pipeline_cache_last_save_ = std::chrono::steady_clock::now();
++  if (!unsaved) {
++    return;
++  }
++  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
++  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
++  const VkDevice device = vulkan_device->device();
++  size_t size = 0;
++  if (dfn.vkGetPipelineCacheData(device, driver_pipeline_cache_, &size, nullptr) != VK_SUCCESS || !size) {
++    return;
++  }
++  std::vector<uint8_t> data(size);
++  if (dfn.vkGetPipelineCacheData(device, driver_pipeline_cache_, &size, data.data()) != VK_SUCCESS) {
++    return;
++  }
++  data.resize(size);
++  // Written to a temporary file and renamed: a killed app never leaves half a cache behind.
++  std::filesystem::path temp_path = driver_pipeline_cache_path_;
++  temp_path += ".tmp";
++  FILE* file = rex::filesystem::OpenFile(temp_path, "wb");
++  if (!file) {
++    return;
++  }
++  const bool written = std::fwrite(data.data(), 1, data.size(), file) == data.size();
++  std::fclose(file);
++  std::error_code ec;
++  if (written) {
++    std::filesystem::rename(temp_path, driver_pipeline_cache_path_, ec);
++  }
++  if (!written || ec) {
++    std::filesystem::remove(temp_path, ec);
++    return;
++  }
++  REXGPU_INFO("VulkanPipelineCache: driver pipeline cache saved ({}, {} new pipelines, {} KB)", reason, unsaved,
++              data.size() / 1024);
++}
++
++void VulkanPipelineCache::DestroyDriverPipelineCache() {
++  if (driver_pipeline_cache_ == VK_NULL_HANDLE) {
++    return;
++  }
++  SaveDriverPipelineCache("exit");
++  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
++  vulkan_device->functions().vkDestroyPipelineCache(vulkan_device->device(), driver_pipeline_cache_, nullptr);
++  driver_pipeline_cache_ = VK_NULL_HANDLE;
++}
++
+ void VulkanPipelineCache::ShutdownShaderStorage() {
++  SaveDriverPipelineCache("shutdown");
+   if (storage_write_thread_) {
+     {
+       std::lock_guard<std::mutex> lock(storage_write_request_lock_);
+@@ -771,6 +897,12 @@ void VulkanPipelineCache::ShutdownShaderStorage() {
+ }
+ 
+ void VulkanPipelineCache::EndSubmission() {
++  // New pipelines reach the disk within a minute of being built, so a crash or a killed app loses little.
++  if (driver_pipeline_cache_ != VK_NULL_HANDLE &&
++      driver_pipeline_cache_unsaved_.load(std::memory_order_relaxed) != 0 &&
++      std::chrono::steady_clock::now() - driver_pipeline_cache_last_save_ > std::chrono::seconds(60)) {
++    SaveDriverPipelineCache("periodic");
++  }
+   if (shader_storage_file_flush_needed_ || pipeline_storage_file_flush_needed_) {
+     {
+       std::lock_guard<std::mutex> lock(storage_write_request_lock_);
+@@ -844,6 +976,7 @@ void VulkanPipelineCache::Shutdown() {
+   creation_completion_event_.reset();
+ 
+   ShutdownShaderStorage();
++  DestroyDriverPipelineCache();
+ 
+   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+@@ -3513,8 +3646,17 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
+   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+   const VkDevice device = vulkan_device->device();
+   VkPipeline pipeline;
+-  VkResult create_result = dfn.vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
++  const uint64_t create_start_ns = rex::perf::StallNowNs();
++  VkResult create_result = dfn.vkCreateGraphicsPipelines(device, driver_pipeline_cache_, 1,
+                                                          &pipeline_create_info, nullptr, &pipeline);
++  {
++    auto& counters = rex::perf::GetStallCounters();
++    counters.pipeline_create_ns.fetch_add(rex::perf::StallNowNs() - create_start_ns, std::memory_order_relaxed);
++    counters.pipelines_created.fetch_add(1, std::memory_order_relaxed);
++    if (driver_pipeline_cache_ != VK_NULL_HANDLE && create_result == VK_SUCCESS) {
++      driver_pipeline_cache_unsaved_.fetch_add(1, std::memory_order_relaxed);
++    }
++  }
+   if (create_result != VK_SUCCESS) {
+     uint64_t ps_hash = creation_arguments.pixel_shader
+                            ? creation_arguments.pixel_shader->shader().ucode_data_hash()
+diff --git a/src/graphics/vulkan/texture_cache.cpp b/src/graphics/vulkan/texture_cache.cpp
+index ea616c6..1a0c5ea 100644
+--- a/src/graphics/vulkan/texture_cache.cpp
++++ b/src/graphics/vulkan/texture_cache.cpp
+@@ -20,6 +20,7 @@
+ #include <rex/logging.h>
+ #include <rex/math.h>
+ #include <rex/cvar.h>
++#include <rex/perf/stall_counters.h>
+ #include <rex/dbg.h>
+ #include <rex/graphics/flags.h>
+ #include <rex/graphics/pipeline/texture/info.h>
+@@ -36,6 +37,9 @@
+ #include "gpu_timing.h"
+ 
+ REXCVAR_DEFINE_BOOL(non_seamless_cube_map, false, "GPU", "Use non-seamless cube map sampling");
++REXCVAR_DEFINE_INT32(texture_min_lod, 0, "GPU",
++                     "WWE 2K16 Android texture quality: mip levels skipped on mipmapped textures (0 = full quality)")
++    .range(0, 4);
+ 
+ namespace rex::graphics::vulkan {
+ 
+@@ -906,7 +910,11 @@ VkSampler VulkanTextureCache::UseSampler(SamplerParameters parameters, bool& has
+         float(UINT32_C(1) << (uint32_t(parameters.aniso_filter) -
+                               uint32_t(xenos::AnisoFilter::kMax_1_1)));
+   }
++  // WWE 2K16 Android (texture quality): skip the top mip levels of mipmapped textures.
+   sampler_create_info.minLod = float(parameters.mip_min_level);
++  if (!parameters.mip_base_map && REXCVAR_GET(texture_min_lod) > 0) {
++    sampler_create_info.minLod = std::max(sampler_create_info.minLod, float(REXCVAR_GET(texture_min_lod)));
++  }
+   if (parameters.mip_base_map) {
+     assert_false(parameters.mip_linear);
+     sampler_create_info.maxLod = sampler_create_info.minLod + 0.25f;
+@@ -1250,6 +1258,8 @@ bool VulkanTextureCache::EnsureScaledResolveMemoryCommitted(uint32_t start_unsca
+ 
+ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
+                                                                bool load_mips) {
++  rex::perf::StallScope stall_scope(rex::perf::GetStallCounters().texture_load_ns,
++                                    &rex::perf::GetStallCounters().texture_loads);
+   VulkanTexture& vulkan_texture = static_cast<VulkanTexture&>(texture);
+   TextureKey texture_key = vulkan_texture.key();
+ 
+diff --git a/src/system/xfile.cpp b/src/system/xfile.cpp
+index 89e1dc9..8d1334d 100644
+--- a/src/system/xfile.cpp
++++ b/src/system/xfile.cpp
+@@ -13,6 +13,7 @@
+ #include <rex/logging.h>
+ #include <rex/math.h>
+ #include <rex/memory.h>
++#include <rex/perf/stall_counters.h>
+ #include <rex/stream.h>
+ #include <rex/system/kernel_state.h>
+ #include <rex/system/xevent.h>
+@@ -113,6 +114,9 @@ X_STATUS XFile::Read(uint32_t buffer_guest_address, uint32_t buffer_length, uint
+ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address, uint32_t buffer_length,
+                              uint64_t byte_offset, uint32_t* out_bytes_read, uint32_t apc_context,
+                              bool notify_completion) {
++  rex::perf::StallScope stall_scope(rex::perf::GetStallCounters().file_read_ns,
++                                    &rex::perf::GetStallCounters().file_reads);
++  rex::perf::GetStallCounters().file_read_bytes.fetch_add(buffer_length, std::memory_order_relaxed);
+   if (byte_offset == uint64_t(-1)) {
+     // Read from current position.
+     byte_offset = position_;
+diff --git a/src/ui/vulkan/vulkan_device.cpp b/src/ui/vulkan/vulkan_device.cpp
+index bdae772..64c23ea 100644
+--- a/src/ui/vulkan/vulkan_device.cpp
++++ b/src/ui/vulkan/vulkan_device.cpp
+@@ -565,6 +565,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+   device->properties_.driverVersion = properties.driverVersion;
+   device->properties_.vendorID = properties.vendorID;
+   device->properties_.deviceID = properties.deviceID;
++  std::memcpy(device->properties_.pipelineCacheUUID, properties.pipelineCacheUUID, VK_UUID_SIZE);
+   std::strcpy(device->properties_.deviceName, properties.deviceName);
+ 
+   REXLOG_INFO(
+diff --git a/src/ui/vulkan/vulkan_instance.cpp b/src/ui/vulkan/vulkan_instance.cpp
+index 17e68eb..987b68c 100644
+--- a/src/ui/vulkan/vulkan_instance.cpp
++++ b/src/ui/vulkan/vulkan_instance.cpp
+@@ -29,6 +29,12 @@ namespace rex {
+ namespace ui {
+ namespace vulkan {
+ 
++namespace {
++VulkanLoaderOverride g_loader_override = nullptr;
++}  // namespace
++
++void SetVulkanLoaderOverride(VulkanLoaderOverride override_fn) { g_loader_override = override_fn; }
++
+ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
+                                                        const bool try_enable_validation) {
+   std::unique_ptr<VulkanInstance> vulkan_instance(new VulkanInstance());
+@@ -42,7 +48,15 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
+   Functions& ifn = vulkan_instance->functions_;
+ 
+   bool functions_loaded = true;
+-  if (!vulkan_instance->loader_.Load(platform::lib_names::kVulkanLoader)) {
++  bool loader_loaded = false;
++  if (g_loader_override) {
++    if (void* handle = g_loader_override()) {
++      vulkan_instance->loader_.Adopt(handle);
++      loader_loaded = true;
++      REXLOG_INFO("Vulkan: using the library the app supplied (custom driver)");
++    }
++  }
++  if (!loader_loaded && !vulkan_instance->loader_.Load(platform::lib_names::kVulkanLoader)) {
+     REXLOG_ERROR("Failed to load {}", platform::lib_names::kVulkanLoader);
+     return nullptr;
+   }
+diff --git a/src/ui/windowed_app_main_android.cpp b/src/ui/windowed_app_main_android.cpp
+index 32ea99f..712b6f0 100644
+--- a/src/ui/windowed_app_main_android.cpp
++++ b/src/ui/windowed_app_main_android.cpp
+@@ -45,7 +45,12 @@ extern "C" int main(int argc, char** argv) {
+     for (size_t i = 0; i < count; ++i) parsed[option_names[i]] = remaining[i];
+     app->SetParsedArguments(std::move(parsed));
+ 
++    // WWE 2K16 Android: the launcher passes a writable log path (the app's own folder; the process's "executable
++    // folder" is /system/bin on Android).
+     std::filesystem::path log_path = rex::filesystem::GetExecutableFolder() / (app->GetName() + ".log");
++    if (const char* launcher_log = std::getenv("WWE2K16_LOG_FILE"); launcher_log && *launcher_log) {
++      log_path = launcher_log;
++    }
+     try { rex::InitLogging(log_path.string().c_str()); }
+     catch (const spdlog::spdlog_ex& e) {
+       std::fprintf(stderr, "Logging init failed: %s\n", e.what());

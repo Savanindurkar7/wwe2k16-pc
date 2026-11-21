@@ -15,17 +15,36 @@
 // Environment switches (default first):
 //   WWE2K16_KEEP_60=0|1     console 30 FPS in entrances etc. | keep 60 FPS (default)
 //   WWE2K16_LATE_FLIP=1|0   a late frame flips at once | waits for the next vblank (console behaviour)
+//   WWE2K16_FRAME_CAP=0|30  no host cap (the game's own 60 / 30) | at most 30 presented frames per second
+//   WWE2K16_SPEED_FIX=1|0   (Android default 1, PC default 0) the game's time step follows the real frame time
+//
+// Game speed fix (Android port; same approach as the WWE 2K17 port by Xav): the engine advances everything by the
+// fixed step in the timing block once per frame (1/60 s, 1/30 s in entrances), so a phone rendering below 60 FPS runs
+// the game in slow motion. Once per presented frame the real frame time is measured, clamped to 1/60..1/12 s,
+// smoothed (ema += 0.3 * (dt - ema)) and written to the block's float fields: +28 step (s), +32 fps, +36 frame length
+// (ms), +60 step*60, +64 1/(step*60). The integer fields (+8 rate, +40 frame length in ms) stay as the game sets them.
+// The first frames are skipped, frames over 0.25 s (loading) are left out, and the fix switches itself off if the
+// block does not hold the expected values (wrong address or layout), logging what it found.
 
+#include <algorithm>
+#include <bit>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <string>
+#include <thread>
+
+#include <fmt/format.h>
 
 #include <rex/logging.h>
 #include <rex/ppc/context.h>
 #include <rex/ppc/memory.h>
 
 #include "fps_overlay.h"
+#include "android_driver.h"
+#include "frame_monitor.h"
 
 // WWE 2K16 retail addresses, matched to the WWE 2K16 functions by tools/port_functions.py; the timing block from the
 // same instructions in the 60 -> 30 switch.
@@ -75,6 +94,26 @@ bool LateFlipImmediate() {
   return EnvDefaultOn("WWE2K16_LATE_FLIP");
 }
 
+bool SpeedFixEnabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("WWE2K16_SPEED_FIX");
+#if defined(__ANDROID__)
+    return !(value && std::strcmp(value, "0") == 0);
+#else
+    return value && std::strcmp(value, "1") == 0;
+#endif
+  }();
+  return enabled;
+}
+
+uint32_t FrameCap() {
+  static const uint32_t cap = [] {
+    const char* value = std::getenv("WWE2K16_FRAME_CAP");
+    return value ? uint32_t(std::atoi(value)) : 0u;
+  }();
+  return cap;
+}
+
 uint64_t SteadyNs() {
   return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
                       std::chrono::steady_clock::now().time_since_epoch())
@@ -121,6 +160,97 @@ extern "C" PPC_FUNC(WWE2K16_FN_SetPresentInterval) {
   PPC_STORE_U32(ctx.r3.u32 + 14000, interval);
 }
 
+// --- Game speed fix and frame cap -----------------------------------------------------------------------------------
+
+namespace {
+
+float LoadF32(uint8_t* base, uint32_t address) { return std::bit_cast<float>(uint32_t(PPC_LOAD_U32(address))); }
+void StoreF32(uint8_t* base, uint32_t address, float value) { PPC_STORE_U32(address, std::bit_cast<uint32_t>(value)); }
+
+bool Near(float value, float expected) { return std::fabs(value - expected) <= std::fabs(expected) * 0.02f; }
+
+struct SpeedFix {
+  enum class State { kWaiting, kActive, kOff } state = State::kWaiting;
+  uint64_t frames = 0;
+  uint64_t last_ns = 0;
+  double ema = 1.0 / 60.0;
+  double log_sum = 0.0;
+  uint32_t log_count = 0;
+};
+
+// The block holds the game's own values for its current rate (60 or 30, PAL 50 or 25): checked before any write.
+bool BlockLooksRight(uint8_t* base) {
+  const uint32_t rate = PPC_LOAD_U32(kTimingBlock + 8);
+  if (rate != 60 && rate != 30 && rate != 50 && rate != 25) return false;
+  const float step = 1.0f / float(rate);
+  return Near(LoadF32(base, kTimingBlock + 28), step) && Near(LoadF32(base, kTimingBlock + 32), float(rate)) &&
+         Near(LoadF32(base, kTimingBlock + 36), step * 1000.0f) &&
+         Near(LoadF32(base, kTimingBlock + 60), step * 60.0f) &&
+         Near(LoadF32(base, kTimingBlock + 64), 1.0f / (step * 60.0f));
+}
+
+void LogBlock(uint8_t* base, const char* what) {
+  std::string words;
+  for (uint32_t offset = 0; offset <= 64; offset += 4) {
+    const uint32_t word = PPC_LOAD_U32(kTimingBlock + offset);
+    words += fmt::format(" +{}={:08X}({:g})", offset, word, std::bit_cast<float>(word));
+  }
+  REXLOG_INFO("[wwe2k16-speed] {} timing block 0x{:08X}:{}", what, kTimingBlock, words);
+}
+
+void SpeedFixOnFrame(uint8_t* base, uint64_t now_ns) {
+  static SpeedFix fix;
+  if (fix.state == SpeedFix::State::kOff) return;
+  const uint64_t prev_ns = fix.last_ns;
+  fix.last_ns = now_ns;
+  if (++fix.frames < 30 || !prev_ns) return;  // boot frames
+  if (fix.state == SpeedFix::State::kWaiting) {
+    if (!BlockLooksRight(base)) {
+      if (fix.frames < 600) return;  // the game may fill the block a little later
+      LogBlock(base, "not the expected values in the");
+      REXLOG_WARN("[wwe2k16-speed] game speed fix OFF: the timing block does not match");
+      fix.state = SpeedFix::State::kOff;
+      return;
+    }
+    LogBlock(base, "game speed fix ON,");
+    fix.state = SpeedFix::State::kActive;
+  }
+  const double dt = double(now_ns - prev_ns) * 1e-9;
+  if (dt > 0.25) return;  // a loading frame: not fed into the step
+  fix.ema += 0.3 * (std::clamp(dt, 1.0 / 60.0, 1.0 / 12.0) - fix.ema);
+  const float step = float(fix.ema);
+  StoreF32(base, kTimingBlock + 28, step);
+  StoreF32(base, kTimingBlock + 32, 1.0f / step);
+  StoreF32(base, kTimingBlock + 36, step * 1000.0f);
+  StoreF32(base, kTimingBlock + 60, step * 60.0f);
+  StoreF32(base, kTimingBlock + 64, 1.0f / (step * 60.0f));
+  fix.log_sum += dt;
+  if (++fix.log_count >= 900) {
+    REXLOG_INFO("[wwe2k16-speed] step {:.2f} ms ({:.1f} fps), real frame avg {:.2f} ms over {} frames, game rate {}",
+                fix.ema * 1000.0, 1.0 / fix.ema, fix.log_sum * 1000.0 / fix.log_count, fix.log_count,
+                PPC_LOAD_U32(kFrameRate));
+    fix.log_sum = 0.0;
+    fix.log_count = 0;
+  }
+}
+
+// WWE2K16_FRAME_CAP=30: the guest waits here until a 30 FPS frame's time is up (the speed fix then sees 33 ms frames
+// and steps the game by 1/30 s, so it runs at normal speed).
+void FrameCapOnFrame() {
+  const uint32_t cap = FrameCap();
+  if (cap < 10 || cap >= 60) return;
+  static uint64_t next_ns = 0;
+  const uint64_t period_ns = 1'000'000'000ull / cap;
+  uint64_t now = SteadyNs();
+  if (next_ns && now < next_ns) {
+    std::this_thread::sleep_for(std::chrono::nanoseconds(next_ns - now));
+    now = SteadyNs();
+  }
+  next_ns = (next_ns && now < next_ns + period_ns) ? next_ns + period_ns : now + period_ns;
+}
+
+}  // namespace
+
 // --- Late frames ----------------------------------------------------------------------------------------------------
 
 // After each Present the GPU waits until the frame's flip is processed. When a frame finishes after the vblank it was
@@ -141,6 +271,13 @@ struct FlipStats {
 extern "C" PPC_FUNC(WWE2K16_IMP_ChooseFlip);
 extern "C" PPC_FUNC(WWE2K16_FN_ChooseFlip) {
   wwe2k16::RecordGameFrame();
+  FrameCapOnFrame();
+  {
+    const uint64_t now_ns = SteadyNs();
+    if (SpeedFixEnabled()) SpeedFixOnFrame(base, now_ns);
+    wwe2k16::frame_monitor::OnGameFrame(now_ns);
+    wwe2k16::android_driver::OnFrame();
+  }
   static uint32_t last_threshold = UINT32_MAX;
   static FlipStats stats;
   const uint32_t orig_threshold = ctx.r3.u32 & 0xFF;

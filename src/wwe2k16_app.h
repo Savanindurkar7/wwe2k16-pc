@@ -25,9 +25,11 @@
 
 #include "achievement_sound.h"
 #include "achievement_toast.h"
+#include "android_driver.h"
 #include "disc_image.h"
 #include "display_refresh_rate.h"
 #include "fps_overlay.h"
+#include "frame_monitor.h"
 #include "launcher_settings.h"
 #include "screenshot.h"
 #include "script_input.h"
@@ -50,7 +52,15 @@ class Wwe2k16App : public rex::ReXApp {
   // Started without the launcher (no game folder argument, e.g. double-clicking the exe): use the settings last
   // saved in the launcher (launcher_settings.cpp).
   void OnConfigurePaths(rex::PathConfig& paths) override {
+#if defined(__ANDROID__)
+    // Android: the launcher app passes the game folder or .iso (positional argument), the user data folder
+    // (--user_data_root) and every setting (arguments and WWE2K16_* variables); the PC launcher's launcher.json and
+    // its exe switching do not apply.
+    REXLOG_INFO("[wwe2k16] Android: game {}, user data {}", rex::path_to_utf8(paths.game_data_root),
+                rex::path_to_utf8(paths.user_data_root));
+#else
     wwe2k16::ApplyLauncherSettings(paths, GetArgument("game_directory").has_value());
+#endif
     // The game can also be a disc image (.iso): mounted in place of the folder before default.xex loads.
     wwe2k16::UseDiscImage(paths.game_data_root, paths.user_data_root);
   }
@@ -179,6 +189,46 @@ class Wwe2k16App : public rex::ReXApp {
     }
     REXLOG_INFO("[wwe2k16] depth_float24_convert_in_pixel_shader={}",
                 rex::cvar::GetFlagByName("depth_float24_convert_in_pixel_shader"));
+
+#if defined(__ANDROID__)
+    ApplyAndroidDefaults();
+#endif
+    // Frame monitor, freeze diagnostics and CPU core pinning (frame_monitor.h).
+    wwe2k16::frame_monitor::Start();
+  }
+
+#if defined(__ANDROID__)
+  // Phone defaults. The launcher's choices arrive as command-line cvars and win over these (HasNonDefaultValue).
+  static void SetDefault(const char* name, const char* value) {
+    if (!rex::cvar::HasNonDefaultValue(name)) rex::cvar::SetFlagByName(name, value);
+  }
+  void ApplyAndroidDefaults() {
+    // The Adreno driver alone sends about a million debug messages per match; formatting them costs real time.
+    SetDefault("vulkan_log_debug_messages", "false");
+    // Phones share their memory with the CPU: the PC's 4 / 8 GB texture budget would push the game out of memory.
+    rex::cvar::SetFlagByName("texture_cache_memory_limit_soft", "768");
+    rex::cvar::SetFlagByName("texture_cache_memory_limit_hard", "1536");
+    rex::cvar::SetFlagByName("texture_cache_memory_limit_render_to_texture", "64");
+    // Keyboard and mouse emulation is meaningless on a phone.
+    rex::cvar::SetFlagByName("mnk_mode", "false");
+    // Custom Vulkan driver (launcher: Settings > GPU driver), before anything starts Vulkan.
+    wwe2k16::android_driver::Install();
+    REXLOG_INFO("[wwe2k16] Android: resolution scale {}x{}, texture min LOD {}, MSAA 2x {}, AA {}, aniso {}, "
+                "present {}, letterbox {}, pipeline cache {}, async shaders {}, frame cap {}, keep 60 {}, speed fix {}, "
+                "cores {}, driver {}",
+                rex::cvar::GetFlagByName("draw_resolution_scale_x"), rex::cvar::GetFlagByName("draw_resolution_scale_y"),
+                rex::cvar::GetFlagByName("texture_min_lod"), rex::cvar::GetFlagByName("native_2x_msaa"),
+                rex::cvar::GetFlagByName("swap_post_effect"), rex::cvar::GetFlagByName("anisotropic_override"),
+                rex::cvar::GetFlagByName("present_effect"), rex::cvar::GetFlagByName("present_letterbox"),
+                rex::cvar::GetFlagByName("vulkan_pipeline_cache"), rex::cvar::GetFlagByName("async_shader_compilation"),
+                EnvOr("WWE2K16_FRAME_CAP", "game"), EnvOr("WWE2K16_KEEP_60", "1"), EnvOr("WWE2K16_SPEED_FIX", "1"),
+                EnvOr("WWE2K16_CPU_CORES", "all"), EnvOr("WWE2K16_DRIVER", "system"));
+  }
+#endif
+
+  static const char* EnvOr(const char* name, const char* fallback) {
+    const char* v = std::getenv(name);
+    return (v && *v) ? v : fallback;
   }
 
   void OnPostSetup() override {
@@ -257,6 +307,7 @@ class Wwe2k16App : public rex::ReXApp {
   }
 
   void OnShutdown() override {
+    wwe2k16::frame_monitor::Stop();
     rex::ui::UnregisterBind("bind_toggle_fullscreen");
     rex::ui::UnregisterBind("bind_screenshot");
     fps_overlay_.Detach();

@@ -21,7 +21,7 @@
 #include <rex/logging.h>
 #include <rex/runtime.h>
 
-#include "../sdk/rexglue/src/filesystem/devices/disc_image_device.h"
+#include "filesystem/devices/disc_image_device.h"
 
 #if defined(_WIN32)
 #include <windows.h>

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# WWE 2K16 Android: native ARM64 build -> verify -> stage -> APK. Run after host codegen (generated/sources.cmake).
-# Safe to re-run: every step is incremental or skips work that is already done. Log: out/android-build.log
+# WWE 2K16 Android: SDK patches -> native ARM64 build -> verify -> Android project (launcher + game) -> APK.
+# Run after host codegen (generated/sources.cmake). Safe to re-run: every step is incremental or skips finished work.
+# Log: out/android-build.log
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -15,9 +16,10 @@ BUILD_DIR="$ROOT/sdk/rexglue/out/build/android-arm64"
 step() { echo; echo "==== [$(date +%H:%M:%S)] $*"; }
 die()  { echo "!!! $*"; exit 1; }
 
-step "1/8 Checks"
+step "1/9 Checks and SDK"
 [ -f generated/sources.cmake ] || die "generated/sources.cmake missing - host codegen has not run."
-
+# The Android sources live on the rexglue-android branch. Use sdk/rexglue if it has them; otherwise keep it untouched
+# (it holds the host build) and use a separate checkout of that branch.
 SDK="$ROOT/sdk/rexglue"
 if [ ! -f "$SDK/src/core/fiber_android.cpp" ]; then
     SDK="$ROOT/sdk/rexglue-android"
@@ -28,8 +30,25 @@ if [ ! -f "$SDK/src/core/fiber_android.cpp" ]; then
     git -C "$SDK" submodule update --init --recursive --depth 1 --jobs 4
 fi
 echo "SDK: $SDK ($(git -C "$SDK" rev-parse --short HEAD))"
+# This project's SDK changes (patches/android-sdk): applied once; a patch already in place is left alone.
+for p in "$ROOT"/patches/android-sdk/*.patch; do
+    [ -f "$p" ] || continue
+    if git -C "$SDK" apply --check "$p" 2>/dev/null; then
+        git -C "$SDK" apply "$p" && echo "applied $(basename "$p")"
+    elif git -C "$SDK" apply --check -R "$p" 2>/dev/null; then
+        echo "already applied: $(basename "$p")"
+    else
+        die "$(basename "$p") neither applies nor is already applied: the SDK checkout has other changes in those files"
+    fi
+done
+# libadrenotools (custom GPU drivers, BSD-2-Clause).
+if [ ! -f thirdparty/libadrenotools/CMakeLists.txt ]; then
+    mkdir -p thirdparty
+    git clone --recursive --depth 1 https://github.com/bylaws/libadrenotools.git thirdparty/libadrenotools
+fi
+echo "libadrenotools: $(git -C thirdparty/libadrenotools rev-parse --short HEAD)"
 
-step "2/8 Java and Android SDK"
+step "2/9 Java and Android SDK"
 if ! java -version 2>&1 | grep -qE 'version "(1[7-9]|2[0-9])'; then
     echo "Installing JDK 17"
     sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openjdk-17-jdk-headless
@@ -51,36 +70,39 @@ if [ -z "$SDKMANAGER" ]; then
     SDKMANAGER="$ASDK/cmdline-tools/latest/bin/sdkmanager"
 fi
 export ANDROID_HOME="$ASDK" ANDROID_SDK_ROOT="$ASDK"
-yes | "$SDKMANAGER" --sdk_root="$ASDK" --licenses >/dev/null || true
 need=()
 [ -d "$ASDK/ndk/$NDK_VER" ]           || need+=("ndk;$NDK_VER")
 [ -d "$ASDK/platforms/android-35" ]    || need+=("platforms;android-35")
 [ -d "$ASDK/build-tools/35.0.0" ]      || need+=("build-tools;35.0.0")
 [ -d "$ASDK/platform-tools" ]          || need+=("platform-tools")
-if [ ${#need[@]} -gt 0 ]; then echo "Installing: ${need[*]}"; yes | "$SDKMANAGER" --sdk_root="$ASDK" "${need[@]}" >/dev/null; fi
+if [ ${#need[@]} -gt 0 ]; then
+    echo "Installing: ${need[*]}"
+    yes | "$SDKMANAGER" --sdk_root="$ASDK" --licenses >/dev/null 2>&1 || true
+    yes | "$SDKMANAGER" --sdk_root="$ASDK" "${need[@]}" > out/sdkmanager.log 2>&1 || { tail -20 out/sdkmanager.log; die "sdkmanager failed (out/sdkmanager.log)"; }
+fi
 NDK="$ASDK/ndk/$NDK_VER"
 [ -f "$NDK/build/cmake/android.toolchain.cmake" ] || die "NDK toolchain not found in $NDK"
 LLVM="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
 echo "Android SDK: $ASDK   NDK: $NDK_VER"
 
-step "3/8 Configure Android arm64-v8a (API $API)"
+step "3/9 Configure Android arm64-v8a (API $API)"
 GEN=(); command -v ninja >/dev/null && GEN=(-G Ninja)
 if [ -f "$BUILD_DIR/CMakeCache.txt" ] && ! grep -q "REXSDK_DIR:PATH=$SDK\$" "$BUILD_DIR/CMakeCache.txt"; then
     echo "Build dir was configured for a different SDK path - starting it fresh"; rm -rf "$BUILD_DIR"
 fi
-[ -f "$BUILD_DIR/CMakeCache.txt" ] && GEN=()
+[ -f "$BUILD_DIR/CMakeCache.txt" ] && GEN=()   # keep the generator an existing build dir already uses
 cmake -S . -B "$BUILD_DIR" "${GEN[@]}" \
     -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
     -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-$API \
     -DCMAKE_BUILD_TYPE=Release -DREXSDK_DIR="$SDK" -DBUILD_TESTING=OFF
 
-step "4/8 Build libmain.so (long: ~80k recompiled functions)"
+step "4/9 Build libmain.so (first build is long: ~80k recompiled functions)"
 MEM_GB=$(( $(awk '/MemAvailable/{print $2}' /proc/meminfo) / 1048576 ))
 JOBS=$(nproc); [ $(( MEM_GB / 3 )) -lt "$JOBS" ] && JOBS=$(( MEM_GB / 3 )); [ "$JOBS" -lt 1 ] && JOBS=1
-echo "Using $JOBS parallel jobs (${MEM_GB} GB RAM free, $(nproc) cores)"
+echo "Using $JOBS parallel jobs (${MEM_GB} GB RAM free, $(nproc) cores, $(df -h --output=avail "$ROOT" | tail -1 | tr -d ' ') disk free)"
 cmake --build "$BUILD_DIR" --target wwe2k16 --parallel "$JOBS"
 
-step "5/8 Verify native libraries"
+step "5/9 Verify native libraries"
 MAIN="$(find "$BUILD_DIR" "$SDK/out/android-arm64" -name libmain.so -type f -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2- || true)"
 [ -n "$MAIN" ] || die "libmain.so was not produced"
 echo "libmain.so: $MAIN ($(du -h "$MAIN" | cut -f1))"
@@ -89,7 +111,7 @@ EXPORTS="$("$LLVM/llvm-nm" -D --defined-only "$MAIN" | awk '{print $NF}')"
 for sym in SDL_main JNI_OnLoad; do
     grep -qx "$sym" <<<"$EXPORTS" && echo "  exports $sym" || echo "  WARNING: $sym is not exported - SDL's Java side needs it at launch"
 done
-SYSTEM_LIBS="libc.so libm.so libdl.so liblog.so libandroid.so libvulkan.so libEGL.so libGLESv1_CM.so libGLESv2.so libGLESv3.so libOpenSLES.so libaaudio.so libmediandk.so libjnigraphics.so libz.so"
+SYSTEM_LIBS="libc.so libm.so libdl.so liblog.so libandroid.so libvulkan.so libEGL.so libGLESv1_CM.so libGLESv2.so libGLESv3.so libOpenSLES.so libaaudio.so libmediandk.so libjnigraphics.so libz.so libnativewindow.so libsync.so"
 LIBS=("$MAIN"); queue=("$MAIN"); SEEN=" libmain.so "
 while [ ${#queue[@]} -gt 0 ]; do
     lib="${queue[0]}"; queue=("${queue[@]:1}")
@@ -103,23 +125,58 @@ while [ ${#queue[@]} -gt 0 ]; do
         found="$(readlink -f "$found")"; LIBS+=("$found"); queue+=("$found")
     done
 done
+# libadrenotools' hook libraries: loaded by path at run time, not linked.
+for hook in libhook_impl.so libmain_hook.so; do
+    h="$(find "$BUILD_DIR" -name "$hook" -type f 2>/dev/null | head -1 || true)"
+    if [ -n "$h" ]; then LIBS+=("$h"); else echo "  WARNING: $hook not built - custom GPU drivers will fall back to the phone's"; fi
+done
 for l in "${LIBS[@]}"; do echo "  ok  $(basename "$l")  NEEDED: $("$LLVM/llvm-readelf" -d "$l" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p' | tr '\n' ' ')"; done
 
-step "6/8 SDL Android project (WWE2K16Activity)"
-AP="$SDK/thirdparty/sdl3/android-project"
-ACT="$AP/app/src/main/java/org/libsdl/app/WWE2K16Activity.java"
-if [ -f "$ACT" ] && grep -q "WWE2K16Activity" "$AP/app/src/main/AndroidManifest.xml"; then
-    echo "Custom activity and manifest already in place - leaving them unchanged"
-elif git -C "$SDK/thirdparty/sdl3" apply --check ../../android-sdl3-android.patch 2>/dev/null; then
-    git -C "$SDK/thirdparty/sdl3" apply ../../android-sdl3-android.patch && echo "Applied android-sdl3-android.patch"
+step "6/9 Android project (launcher + game)"
+AP="$ROOT/out/android-project"
+SDL_AP="$SDK/thirdparty/sdl3/android-project"
+rm -rf "$AP" && mkdir -p "$AP"
+# SDL's Gradle project and Java sources (they must match the SDL inside libmain.so: same checkout), nothing built.
+(cd "$SDL_AP" && tar cf - --exclude=build --exclude=.gradle --exclude=.cxx --exclude='app/libs' --exclude='app/jni' \
+    --exclude='local.properties' .) | (cd "$AP" && tar xf -)
+# GameActivity replaces the earlier WWE2K16Activity test class.
+rm -f "$AP/app/src/main/java/org/libsdl/app/WWE2K16Activity.java"
+cp "$ROOT/android/AndroidManifest.xml" "$AP/app/src/main/AndroidManifest.xml"
+cp "$ROOT/android/build.gradle" "$AP/app/build.gradle"
+mkdir -p "$AP/app/src/main/java" && cp -r "$ROOT/android/java/." "$AP/app/src/main/java/"
+cp -r "$ROOT/android/res/." "$AP/app/src/main/res/"
+mkdir -p "$AP/app/src/main/assets" && cp "$ROOT/android/licenses/"* "$AP/app/src/main/assets/"
+cp thirdparty/libadrenotools/LICENSE "$AP/app/src/main/assets/LICENSE-libadrenotools.txt" 2>/dev/null || true
+# Home screen background and app icon: the repository's own BG.jpg and APP_ICON.jpg, if present.
+if [ -f "$ROOT/BG.jpg" ]; then
+    mkdir -p "$AP/app/src/main/res/drawable-nodpi" && cp "$ROOT/BG.jpg" "$AP/app/src/main/res/drawable-nodpi/home_bg.jpg"
+    echo "home background: BG.jpg"
 else
-    die "SDL Android project is partly modified and the patch does not apply - check $AP by hand"
+    echo "  (no BG.jpg: the home screen uses a plain dark background)"
 fi
-grep -q 'return new String\[\] { "main" }' "$ACT" || die "WWE2K16Activity.getLibraries() does not load \"main\""
-
-step "7/8 Stage libraries and build APK"
+if [ -f "$ROOT/APP_ICON.jpg" ]; then
+    python3 -c "import PIL" 2>/dev/null || python3 -m pip install --user -q pillow 2>/dev/null || python3 -m pip install --user -q --break-system-packages pillow
+    python3 - "$ROOT/APP_ICON.jpg" "$AP/app/src/main/res" <<'PY'
+import sys, os
+from PIL import Image
+src, res = sys.argv[1], sys.argv[2]
+im = Image.open(src).convert("RGB")
+w, h = im.size
+side = min(w, h)
+# Square crop, centred across and taken from the top.
+im = im.crop(((w - side) // 2, 0, (w - side) // 2 + side, side))
+for folder, size in (("mdpi", 48), ("hdpi", 72), ("xhdpi", 96), ("xxhdpi", 144), ("xxxhdpi", 192)):
+    d = os.path.join(res, "mipmap-" + folder)
+    os.makedirs(d, exist_ok=True)
+    im.resize((size, size), Image.LANCZOS).save(os.path.join(d, "ic_launcher.png"))
+print("app icon: APP_ICON.jpg -> 48..192 px")
+PY
+else
+    echo "  (no APP_ICON.jpg: SDL's default icon)"
+fi
+# Every native library next to the app.
 JNI="$AP/app/libs/arm64-v8a"
-rm -rf "$JNI" && mkdir -p "$JNI"
+mkdir -p "$JNI"
 for l in "${LIBS[@]}"; do
     name="$(basename "$l")"; [ "$l" = "$MAIN" ] && name=libmain.so
     soname="$("$LLVM/llvm-readelf" -d "$l" | sed -n 's/.*(SONAME).*\[\(.*\)\]/\1/p')"
@@ -127,16 +184,24 @@ for l in "${LIBS[@]}"; do
     cp "$l" "$JNI/$name"; echo "  staged $name"
 done
 echo "sdk.dir=$ASDK" > "$AP/local.properties"
-(cd "$AP" && chmod +x gradlew && ./gradlew --no-daemon assembleDebug -PEXCLUDE_NATIVE_LIBS)
 
-step "8/8 Verify APK"
+step "7/9 Build APK"
+VCODE="$(git rev-list --count HEAD 2>/dev/null || echo 1)"
+VNAME="android-$(git rev-parse --short HEAD 2>/dev/null || echo dev)"
+git diff --quiet 2>/dev/null || VNAME="$VNAME+"
+(cd "$AP" && chmod +x gradlew && ./gradlew --no-daemon -q assembleDebug -PWWE2K16_VERSION_CODE="$VCODE" -PWWE2K16_VERSION_NAME="$VNAME")
+
+step "8/9 Verify APK"
 APK_SRC="$AP/app/build/outputs/apk/debug/app-debug.apk"
 [ -f "$APK_SRC" ] || die "Gradle finished but $APK_SRC is missing"
 APK="$ROOT/out/wwe2k16-android-debug.apk"
 cp "$APK_SRC" "$APK"
 unzip -l "$APK" | awk '/lib\//{print "  " $4 "  (" $1 " bytes)"}'
 for l in "$JNI"/*.so; do unzip -l "$APK" | grep -q "lib/arm64-v8a/$(basename "$l")" || die "$(basename "$l") is missing from the APK"; done
-"$ASDK/build-tools/35.0.0/apksigner" verify --print-certs "$APK" | head -3
-echo
-echo "==== DONE. APK: $APK ($(du -h "$APK" | cut -f1))"
-echo "Built and verified as a package only. Installing and launching on a device is the next, separate test."
+"$ASDK/build-tools/35.0.0/aapt2" dump badging "$APK" 2>/dev/null | grep -E "^package:|^application-label:|launchable-activity" | sed 's/^/  /' || true
+"$ASDK/build-tools/35.0.0/apksigner" verify "$APK" && echo "  signature ok"
+
+step "9/9 Done"
+echo "APK: $APK ($(du -h "$APK" | cut -f1)), version $VNAME ($VCODE)"
+echo "Package com.savanindurkar7.wwe2k16: it installs next to the earlier test APK (org.libsdl.app), which you can uninstall."
+echo "Built and verified as a package only. Installing and playing on the phone is the real test."

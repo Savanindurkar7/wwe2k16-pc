@@ -11,16 +11,16 @@
 #include <rex/ui/imgui_dialog.h>
 #include <rex/ui/imgui_drawer.h>
 
+#include "frame_monitor.h"
+
 namespace wwe2k16 {
 
 namespace {
 
 std::atomic<uint64_t> g_game_frame_count{0};
 
-bool Enabled() {
-  const char* v = std::getenv("WWE2K16_FPS_COUNTER");
-  return v && v[0] != '0';
-}
+// WWE2K16_FRAME_MONITOR (Android launcher: Frame monitor) or the PC launcher's WWE2K16_FPS_COUNTER.
+bool Enabled() { return frame_monitor::OverlayMode() > 0; }
 
 class FpsOverlayDialog final : public rex::ui::ImGuiDialog {
  public:
@@ -43,8 +43,16 @@ class FpsOverlayDialog final : public rex::ui::ImGuiDialog {
       last_frame_count_ = frames;
       last_sample_ = now;
     }
-    char text[40];
-    std::snprintf(text, sizeof(text), "%.0f FPS", game_fps_);
+    char text[160];
+    if (frame_monitor::OverlayMode() >= 2) {
+      // Full monitor: frame time, the worst frame of the last second and what was loading (pipelines built, textures
+      // loaded, KB read from the game files per second).
+      const frame_monitor::Snapshot s = frame_monitor::GetSnapshot();
+      std::snprintf(text, sizeof(text), "%.0f FPS  %.1f ms  worst %.0f ms\nshaders %u/s  textures %u/s  disk %u KB/s",
+                    game_fps_, s.frame_ms, s.worst_ms, s.pipelines_per_s, s.texture_loads_per_s, s.file_kb_per_s);
+    } else {
+      std::snprintf(text, sizeof(text), "%.0f FPS", game_fps_);
+    }
 
     ImFont* font = ImGui::GetFont();
     const float font_size = 18.0f;

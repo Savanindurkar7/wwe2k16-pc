@@ -1,0 +1,48 @@
+// WWE 2K16 Android: the app module. tools/android-build.sh copies this over the SDL Android project's
+// app/build.gradle. The native libraries are built by CMake beforehand and staged in app/libs/arm64-v8a.
+plugins {
+    id 'com.android.application'
+}
+
+def wwe2k16VersionCode = project.hasProperty('WWE2K16_VERSION_CODE') ? project.property('WWE2K16_VERSION_CODE').toInteger() : 1
+def wwe2k16VersionName = project.hasProperty('WWE2K16_VERSION_NAME') ? project.property('WWE2K16_VERSION_NAME') : 'dev'
+
+android {
+    namespace = "com.savanindurkar7.wwe2k16"
+    compileSdkVersion 35
+    ndkVersion = "28.2.13676358"
+    defaultConfig {
+        applicationId "com.savanindurkar7.wwe2k16"
+        minSdkVersion 29
+        targetSdkVersion 35
+        versionCode wwe2k16VersionCode
+        versionName wwe2k16VersionName
+        ndk {
+            abiFilters 'arm64-v8a'
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
+    }
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+    }
+    sourceSets.main {
+        jniLibs.srcDir 'libs'
+    }
+    packagingOptions {
+        jniLibs {
+            // libadrenotools loads its hook libraries and the custom driver by path: they must be real files.
+            useLegacyPackaging = true
+        }
+    }
+    lint {
+        abortOnError = false
+    }
+}
+
+dependencies {
+}
