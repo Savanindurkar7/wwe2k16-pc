@@ -84,18 +84,37 @@ MEM_GB=$(( $(awk '/MemAvailable/{print $2}' /proc/meminfo) / 1048576 ))
 JOBS=$(nproc); [ $(( MEM_GB / 3 )) -lt "$JOBS" ] && JOBS=$(( MEM_GB / 3 )); [ "$JOBS" -lt 1 ] && JOBS=1
 echo "Using $JOBS parallel jobs (${MEM_GB} GB RAM free, $(nproc) cores, $(df -h --output=avail "$ROOT" | tail -1 | tr -d ' ') disk free)"
 
+# Small disks (a 32 GB Codespace holds the NDK, two SDKs and the game): no debug info (-g0, about a third of the object
+# size), and the SDK's build folder is deleted once the SDK is installed (KEEP_SDK_BUILD=1 keeps it). The libraries in
+# the APK are the same; only crash stacks lose line numbers.
+FLAGS="-march=armv8.2-a -g0"
+SDK_STAMP="$SDK_INSTALL/.built-from"
+SDK_ID="$(git -C "$SDK" rev-parse HEAD) $(cat "$SDK/.wwe2k14-patched") ndk $NDK_VER"
+free_gb() { df -Pk "$ROOT" | awk 'NR==2{print int($4/1048576)}'; }
+
 step "3/8 The WWE 2K14 SDK for Android arm64 (-> out/k14-android-sdk)"
 # As the 2K14 port builds it (tools/android/build_sdk_android.ps1): shared libc++, ARMv8.2, no Tracy / FidelityFX / tests.
+echo "disk free: $(free_gb) GB"
+if [ -f "$SDK_STAMP" ] && [ "$(cat "$SDK_STAMP")" = "$SDK_ID" ] && [ -f "$SDK_INSTALL/lib/librexruntime.so" ] \
+    && [ -f "$SDK_INSTALL/lib/librexgpu-xenos.so" ] && [ ! -d "$SDK_BUILD" ]; then
+    echo "already built and installed ($SDK_INSTALL): skipped"
+else
+[ "$(free_gb)" -ge 4 ] || die "only $(free_gb) GB free: the SDK build needs about 4 GB (see the clean-up command in the chat / docs/ANDROID_NATIVE.md)"
 if [ ! -f "$SDK_BUILD/CMakeCache.txt" ]; then
     cmake -S "$SDK" -B "$SDK_BUILD" -G Ninja \
         -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-$API \
         -DANDROID_STL=c++_shared -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$SDK_INSTALL" \
-        -DCMAKE_C_FLAGS=-march=armv8.2-a -DCMAKE_CXX_FLAGS=-march=armv8.2-a \
+        -DCMAKE_C_FLAGS="$FLAGS" -DCMAKE_CXX_FLAGS="$FLAGS" \
         -DREXGLUE_ENABLE_TRACY=OFF -DREXGLUE_ENABLE_FIDELITYFX=OFF -DREXGLUE_BUILD_TESTS=OFF \
         -DCMAKE_EXPORT_NO_PACKAGE_REGISTRY=ON -DCMAKE_FIND_USE_PACKAGE_REGISTRY=OFF > out/k14-android-sdk-configure.log 2>&1 \
         || { tail -40 out/k14-android-sdk-configure.log; rm -rf "$SDK_BUILD"; die "SDK configure failed (out/k14-android-sdk-configure.log)"; }
 fi
 cmake --build "$SDK_BUILD" --target install --parallel "$JOBS"
+echo "$SDK_ID" > "$SDK_STAMP"
+if [ "${KEEP_SDK_BUILD:-0}" != 1 ]; then
+    rm -rf "$SDK_BUILD"; echo "SDK installed; its build folder deleted to save space (now $(free_gb) GB free)"
+fi
+fi
 for so in librexruntime.so librexgpu-xenos.so; do
     [ -f "$SDK_INSTALL/lib/$so" ] || die "$so is not in $SDK_INSTALL/lib"
     echo "  $so ($(du -h "$SDK_INSTALL/lib/$so" | cut -f1))"
@@ -106,11 +125,12 @@ if [ ! -f "$GAME_BUILD/CMakeCache.txt" ]; then
     cmake -S native -B "$GAME_BUILD" -G Ninja \
         -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-$API \
         -DANDROID_STL=c++_shared -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_C_FLAGS=-march=armv8.2-a -DCMAKE_CXX_FLAGS=-march=armv8.2-a \
+        -DCMAKE_C_FLAGS="$FLAGS" -DCMAKE_CXX_FLAGS="$FLAGS" \
         -DCMAKE_PREFIX_PATH="$SDK_INSTALL" -DCMAKE_FIND_ROOT_PATH="$SDK_INSTALL" -DCMAKE_FIND_USE_PACKAGE_REGISTRY=OFF \
         > out/k14-android-game-configure.log 2>&1 \
         || { tail -40 out/k14-android-game-configure.log; rm -rf "$GAME_BUILD"; die "game configure failed (out/k14-android-game-configure.log)"; }
 fi
+echo "disk free: $(free_gb) GB (the game's objects take about 4-6 GB)"
 cmake --build "$GAME_BUILD" --target wwe2k16 --parallel "$JOBS"
 
 step "5/8 Verify native libraries"

@@ -34,9 +34,16 @@ endif()
 include("${WWE2K16_GENERATED}/sources.cmake")  # GENERATED_SOURCES (absolute paths)
 
 # --- The recompiled game (generated_k14/) ----------------------------------------------------------------------------
+# No debug info for the ~80k recompiled functions unless asked (-DWWE2K16_RECOMP_DEBUG=ON): it is most of the build's
+# disk use.
+option(WWE2K16_RECOMP_DEBUG "Line tables for the recompiled code" OFF)
 set(WWE2K16_RECOMP_OPTIONS "")
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-    list(APPEND WWE2K16_RECOMP_OPTIONS -gline-tables-only)
+    if(WWE2K16_RECOMP_DEBUG)
+        list(APPEND WWE2K16_RECOMP_OPTIONS -gline-tables-only)
+    else()
+        list(APPEND WWE2K16_RECOMP_OPTIONS -g0)
+    endif()
 endif()
 add_library(wwe2k16_recomp OBJECT ${GENERATED_SOURCES})
 target_include_directories(wwe2k16_recomp PRIVATE "${WWE2K16_GENERATED}" "${WWE2K16_ROOT}/src")
