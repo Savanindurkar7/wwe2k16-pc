@@ -1,0 +1,44 @@
+--- a/include/rex/ui/vulkan/presenter.h
++++ b/include/rex/ui/vulkan/presenter.h
+@@ -569,6 +569,9 @@
+     uint32_t gap_next = 0, gap_count = 0;
+     uint64_t pending_dropped = 0;  // new frames that came before the pending real frame was shown
+     uint64_t generated = 0, skipped = 0, log_window_start_ns = 0;
++    // wwe2k16 patch (frame generation v2): the guard. When the real frame keeps coming after the next new one (the
++    // paints are too slow: only the in-between frames would be shown, at half the game's rate), generation pauses.
++    uint64_t guard_start_ns = 0, guard_new = 0, guard_overtaken = 0, pause_until_ns = 0, pauses = 0;
+   };
+   FrameGen frame_gen_;
+   bool FrameGenInitialize();
+--- a/src/ui/vulkan/vulkan_presenter_framegen.cpp
++++ b/src/ui/vulkan/vulkan_presenter_framegen.cpp
+@@ -460,8 +460,27 @@
+   // Generate with a previous frame of this size and a normal gap, while the game is slower than about 50 frames a
+   // second (at 60 there is no room for a frame in between on a 120 Hz screen). A real frame still pending (this new one
+   // came first) is simply not shown: the in-between frame of the new pair follows the last one shown.
+-  if (fg.pending_real) ++fg.pending_dropped;
+-  const bool generate = fg.history_slot >= 0 && gap && gap < max_gap && fg.interval_ns > 20.0e6;
++  if (fg.pending_real) {
++    ++fg.pending_dropped;
++    ++fg.guard_overtaken;
++  }
++  // The guard (v2): over 2 s windows, more than a quarter of the real frames overtaken -> no in-between frames for 10 s.
++  ++fg.guard_new;
++  if (!fg.guard_start_ns) fg.guard_start_ns = now;
++  if (now - fg.guard_start_ns >= 2000000000ull) {
++    if (fg.guard_new >= 20 && fg.guard_overtaken * 4 > fg.guard_new && now >= fg.pause_until_ns) {
++      fg.pause_until_ns = now + 10000000000ull;
++      ++fg.pauses;
++      REXLOG_INFO("[framegen] paused 10 s: {} of {} real frames came after the next new one (paints too slow; only "
++                  "in-between frames would be shown). Pauses so far: {}",
++                  fg.guard_overtaken, fg.guard_new, fg.pauses);
++    }
++    fg.guard_start_ns = now;
++    fg.guard_new = 0;
++    fg.guard_overtaken = 0;
++  }
++  const bool generate = fg.history_slot >= 0 && gap && gap < max_gap && fg.interval_ns > 20.0e6 &&
++                        now >= fg.pause_until_ns;
+   if (!generate && fg.history_slot >= 0) ++fg.skipped;
+   const int prev_slot = fg.history_slot;            // read: the previous real frame
+   const int next_slot = prev_slot >= 0 ? 1 - prev_slot : 0;  // written: the current frame, for next time

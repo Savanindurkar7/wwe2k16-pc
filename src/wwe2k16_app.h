@@ -49,6 +49,7 @@
 #include "touch_input.h"
 #if WWE2K16_SDK_K14
 #include "k14_tiling_hooks.h"  // the game's scene without MSAA (once, here: main.cpp only)
+#include <rex/ui/overlay/achievement_notification.h>
 #endif
 
 #if defined(_WIN32)
@@ -331,6 +332,21 @@ class Wwe2k16App : public rex::ReXApp {
 
   // Achievements: the SDK keeps unlocks in userdata\achievements\315A07D2.txt (achievements.cpp);
   // each new one shows an "Achievement unlocked" pop-up here.
+#if WWE2K16_SDK_K14
+  // Frame generation: the SDK's achievement pop-up layer is an ImGui dialog that stays registered for the whole run, and
+  // while the UI layer has any dialog every frame is painted on Android's UI thread (about 30 paints a second under
+  // load: the real frames came after the next new one and only in-between frames were shown, 17 a second; phone test
+  // 2026-11-21). With frame generation on there is no pop-up layer (achievements still unlock), so the game presents
+  // from its own thread. The FPS counter is GameActivity's label then (src/fps_overlay.cpp).
+  std::unique_ptr<rex::ui::AchievementNotificationDialog> CreateAchievementNotificationDialog() override {
+    if (const char* fg = std::getenv("WWE2K16_FRAMEGEN"); fg && fg[0] == '1') {
+      REXLOG_INFO("[wwe2k16] frame generation: no achievement pop-ups (the game thread presents)");
+      return nullptr;
+    }
+    return rex::ReXApp::CreateAchievementNotificationDialog();
+  }
+#endif
+
   void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override {
 #if defined(_WIN32)
     SetupWindowMode();

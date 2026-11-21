@@ -74,6 +74,11 @@ to draw, and the game's FPS counter was such a thing. With frame generation on, 
 game activity (`GameActivity.setupFpsLabel`, the game's frame count via JNI from `src/fps_overlay.cpp`). The game
 then presents from its own thread, and the frame-generation timer presents the real frame directly. The log line
 `[present] paint mode: game thread (immediately)` confirms it (`patches/k14-sdk/0003-present-paint-mode-log.patch`).
+The first v2 test still showed `Android UI thread (UI drawers 1)`. The SDK's achievement pop-up layer stays
+registered for the whole run, and only in-between frames were shown, 17 a second. With frame generation on, the app
+now leaves that layer out (`Wwe2k16App::CreateAchievementNotificationDialog`). A guard
+(`0004-frame-generation-guard.patch`) pauses generation for 10 s when more than a quarter of the real frames arrive
+late, so frame generation can no longer halve the frame rate.
 
 **Limits:**
 
