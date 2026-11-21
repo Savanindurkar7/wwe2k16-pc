@@ -109,7 +109,7 @@ step "5/9 Verify native libraries"
 MAIN="$(find "$BUILD_DIR" "$SDK/out/android-arm64" -name libmain.so -type f -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2- || true)"
 [ -n "$MAIN" ] || die "libmain.so was not produced"
 echo "libmain.so: $MAIN ($(du -h "$MAIN" | cut -f1))"
-"$LLVM/llvm-readelf" -h "$MAIN" | grep -q "AArch64" || die "libmain.so is not AArch64"
+grep -q AArch64 <<<"$("$LLVM/llvm-readelf" -h "$MAIN")" || die "libmain.so is not AArch64"
 EXPORTS="$("$LLVM/llvm-nm" -D --defined-only "$MAIN" | awk '{print $NF}')"
 for sym in SDL_main JNI_OnLoad; do
     grep -qx "$sym" <<<"$EXPORTS" && echo "  exports $sym" || echo "  WARNING: $sym is not exported - SDL's Java side needs it at launch"
@@ -200,7 +200,7 @@ APK_SRC="$AP/app/build/outputs/apk/debug/app-debug.apk"
 APK="$ROOT/out/wwe2k16-android-debug.apk"
 cp "$APK_SRC" "$APK"
 unzip -l "$APK" | awk '/lib\//{print "  " $4 "  (" $1 " bytes)"}'
-for l in "$JNI"/*.so; do unzip -l "$APK" | grep -q "lib/arm64-v8a/$(basename "$l")" || die "$(basename "$l") is missing from the APK"; done
+for l in "$JNI"/*.so; do grep -q "lib/arm64-v8a/$(basename "$l")" <<<"$(unzip -l "$APK")" || die "$(basename "$l") is missing from the APK"; done
 "$ASDK/build-tools/35.0.0/aapt2" dump badging "$APK" 2>/dev/null | grep -E "^package:|^application-label:|launchable-activity" | sed 's/^/  /' || true
 "$ASDK/build-tools/35.0.0/apksigner" verify "$APK" && echo "  signature ok"
 
