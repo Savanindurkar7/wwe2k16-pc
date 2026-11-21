@@ -208,3 +208,9 @@ step "9/9 Done"
 echo "APK: $APK ($(du -h "$APK" | cut -f1)), version $VNAME ($VCODE)"
 echo "Package com.savanindurkar7.wwe2k16: it installs next to the earlier test APK (org.libsdl.app), which you can uninstall."
 echo "Built and verified as a package only. Installing and playing on the phone is the real test."
+
+# Termux: the command that brings this APK to the phone (the Codespace's own name, from GitHub's environment).
+CS="${CODESPACE_NAME:-YOUR-CODESPACE-NAME}"
+echo
+echo "==== Termux (on the phone): download the APK into Download/, then stop the Codespace:"
+echo "gh codespace cp -e -c $CS remote:$APK ~/storage/downloads/wwe2k16-${VNAME//+/}-${VCODE}.apk && gh codespace stop -c $CS"

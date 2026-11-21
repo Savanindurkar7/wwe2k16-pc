@@ -232,3 +232,9 @@ grep -q "assets/sdk.txt" <<<"$LISTING" || die "assets/sdk.txt is missing from th
 echo
 echo "==== DONE. APK: $APK ($(du -h "$APK" | cut -f1)), version $VNAME ($VCODE)"
 echo "In the game: Options > Renderer: Classic / Native / Native+ (Native+ is the fastest, the least tested)."
+
+# Termux: the command that brings this APK to the phone (the Codespace's own name, from GitHub's environment).
+CS="${CODESPACE_NAME:-YOUR-CODESPACE-NAME}"
+echo
+echo "==== Termux (on the phone): download the APK into Download/, then stop the Codespace:"
+echo "gh codespace cp -e -c $CS remote:$APK ~/storage/downloads/wwe2k16-${VNAME//+/}-${VCODE}.apk && gh codespace stop -c $CS"
