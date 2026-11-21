@@ -22,7 +22,7 @@ mkdir -p out
 exec > >(tee -a out/android-build-k14.log) 2>&1
 trap 'echo; echo "!!! FAILED at line $LINENO: $BASH_COMMAND"; echo "!!! Full log: $ROOT/out/android-build-k14.log"' ERR
 
-NDK_VER="28.2.13676358"
+NDK_VER="29.0.14206865"  # NDK 29: libc++ with float from_chars (the 0.10 SDK needs it)
 API=29
 SDK="$ROOT/sdk/rexglue-k14"
 SDK_BUILD="$ROOT/out/build-k14-android-sdk"
