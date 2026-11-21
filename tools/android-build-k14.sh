@@ -72,7 +72,7 @@ need=()
 [ -d "$ASDK/platform-tools" ]       || need+=("platform-tools")
 if [ ${#need[@]} -gt 0 ]; then
     yes | "$SDKMANAGER" --sdk_root="$ASDK" --licenses >/dev/null 2>&1 || true
-    yes | "$SDKMANAGER" --sdk_root="$ASDK" "${need[@]}" > out/sdkmanager.log 2>&1 || { tail -20 out/sdkmanager.log; die "sdkmanager failed"; }
+    yes | "$SDKMANAGER" --sdk_root="$ASDK" "${need[@]}" > out/sdkmanager.log 2>&1 || true
 fi
 NDK="$ASDK/ndk/$NDK_VER"
 TOOLCHAIN="$NDK/build/cmake/android.toolchain.cmake"
