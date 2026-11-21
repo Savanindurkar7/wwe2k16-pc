@@ -84,6 +84,26 @@ show.
 
 - `gpu_native_half2_skip_gpr_draws` on (NATIVE, NATIVE+): those 24 point draws are the only MSAA draws of a match.
   Drawn, every frame falls back (21 FPS instead of 40).
-- `vulkan_vertex_residency_cache_off` (all renderers in the native APK): it greatly reduced the skin spikes.
-- **Still open:** occasional skin stretching in close-ups. The diagnostic run ruled out stale-vertex tracking and
-  vertex kill. The next step is the skin draw's own inputs and shader.
+- `vulkan_vertex_residency_cache_off` (all renderers in the native APK): this fixed the skin spikes. The 2K14 port's
+  residency cache skips re-uploading vertex ranges it thinks are unchanged; WWE 2K16 streams character meshes into
+  reused memory, so close-ups drew stale vertices. The diagnostic run with it off (census + shader dump, 2026-11-21)
+  showed clean wrestlers. The skinning shaders themselves were checked: each bone row is read through `a0` as the
+  console does, and all 256 float constants are uploaded for them.
+- Diagnostics such as `--gpu_native_vertex_census` / `--dump_shaders` cost about 10 FPS (25-30 instead of 38-40).
+  Leave Extra arguments empty for normal play.
+
+## The game's scene without MSAA (native APK)
+
+Native truth frames are 1x only, so the game's own 2x MSAA sends entrance frames to the emulated path (5-9 FPS; log
+`[native][truth] ... fallbacks (clearing resolve / msaa)`). It also makes single match frames fall back, which shows
+as black flicker. The fix is the one the WWE 2K14 port ships (`wwe2k14_force_no_msaa`, its `src/tiling_hooks.h`): the
+game builds its scene targets 1x, as one tile.
+
+- `tools/k14-tiling-hooks.py` finds WWE 2K16's scene-target builder in `generated_k14/` by the 2K14 function's
+  shape: object fields +296/+300, the layout at +12 with its type at +20, targets at +272/+276, and +4/+8 stored.
+  On exactly one match it writes `config/k14_tiling_hooks.toml` and adds the two hook calls into that one generated
+  file. `android-build-k14.sh` runs it in step 1. With `python3 tools/k14-tiling-hooks.py` alone it only reports.
+- `src/k14_tiling_hooks.h` holds the hooks, the cvar `wwe2k16_force_no_msaa` and the guards. Options > Graphics >
+  Anti-aliasing (MSAA) > OFF (now the default) sets the cvar.
+- The log line `[wwe2k16][tiling] scene build N: ... force_no_msaa: applied: 1 tile, 1x` confirms it worked. If no
+  match is found, the build log shows `not hooked` and the functions it saw.

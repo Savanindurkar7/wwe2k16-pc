@@ -50,6 +50,9 @@ for p in "$ROOT"/patches/k14-sdk/*.patch; do
 done
 K14_PATCHES_ID="$(cat "$ROOT"/patches/k14-sdk/*.patch 2>/dev/null | sha1sum | cut -c1-12)"
 echo "generated_k14: $(ls generated_k14 | wc -l) files, $(du -sh generated_k14 | cut -f1)"
+# The game's scene without MSAA (src/k14_tiling_hooks.h): find the scene-target builder in generated_k14/ and hook it
+# (once; only the one generated file it is in rebuilds). Not found = the build goes on, MSAA OFF just does nothing.
+python3 tools/k14-tiling-hooks.py --apply || echo "(tiling hook finder failed: the build goes on without it)"
 if [ ! -f thirdparty/libadrenotools/CMakeLists.txt ]; then
     mkdir -p thirdparty
     git clone --recursive --depth 1 https://github.com/bylaws/libadrenotools.git thirdparty/libadrenotools

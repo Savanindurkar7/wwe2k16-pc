@@ -114,12 +114,14 @@ public final class Settings {
               "Capped at 30 FPS: steadier and cooler on phones that cannot hold 60.",
               "Like the console: 60 in matches, 30 in entrances and cutscenes."));
 
-    public static final Choice MSAA = new Choice(S_GRAPHICS, "msaa", "ANTI-ALIASING (MSAA)", 0,
-            a("game", "off"),
-            a("2X (GAME)", "OFF"),
-            a("The game's own 2x MSAA.",
-              "Turning the game's MSAA off needs a hook in the game's render setup, found in the next research build. "
-              + "This build keeps 2x."));
+    // (Key "msaa_v2": the old "msaa" setting could only be 2X; the new default is OFF for everyone.)
+    public static final Choice MSAA = new Choice(S_GRAPHICS, "msaa_v2", "ANTI-ALIASING (MSAA)", 0,
+            a("off", "game"),
+            a("OFF (FAST)", "2X (GAME)"),
+            a("Native APK: the game builds its 3D scene without MSAA, so the NATIVE renderer draws entrances and matches "
+              + "itself: fixes the 5-9 FPS entrances and the black flicker frames in matches. Edges a little sharper "
+              + "(SGSR or FXAA smooth them). The classic APK keeps 2x.",
+              "The game's own 2x MSAA. With the NATIVE renderer entrances fall back to the slow path (5-9 FPS)."));
 
     public static final Choice FAST_AA = new Choice(S_GRAPHICS, "fast_aa", "FAST ANTI-ALIASING", 0,
             a("none", "fxaa", "fxaa_extreme"),
@@ -363,7 +365,8 @@ public final class Settings {
         cvar(l, "swap_post_effect", FAST_AA.value(p));
         cvar(l, "texture_min_lod", TEXTURES.value(p));
         cvar(l, "anisotropic_override", FILTER.value(p));
-        // MSAA "off" and the SGSR / FSR upscalers are not available in this build (see their notes): nothing to pass.
+        // MSAA OFF: the game's scene targets built 1x (src/k14_tiling_hooks.h, native APK only).
+        if (nat && "off".equals(MSAA.value(p))) cvar(l, "wwe2k16_force_no_msaa", "true");
 
         String shape = SCREEN_SHAPE.value(p);
         cvar(l, "present_letterbox", "stretch".equals(shape) ? "false" : "true");

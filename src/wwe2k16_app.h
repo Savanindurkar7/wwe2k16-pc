@@ -47,6 +47,9 @@
 #include "native_renderer.h"
 #include "script_input.h"
 #include "touch_input.h"
+#if WWE2K16_SDK_K14
+#include "k14_tiling_hooks.h"  // the game's scene without MSAA (once, here: main.cpp only)
+#endif
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN

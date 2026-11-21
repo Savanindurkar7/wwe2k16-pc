@@ -10,4 +10,4 @@ file_path = "game/default.xex"
 out_directory_path = "generated_k14"
 setjmp_address = 0x831EFB10
 longjmp_address = 0x831EF7F0
-includes = ["config/functions.toml", "config/functions_fptrs.toml", "config/functions_thunks.toml", "config/hooks.toml"]
+includes = ["config/functions.toml", "config/functions_fptrs.toml", "config/functions_thunks.toml", "config/hooks.toml", "config/k14_tiling_hooks.toml"]
