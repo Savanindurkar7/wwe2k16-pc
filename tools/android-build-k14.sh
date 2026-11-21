@@ -36,6 +36,19 @@ step "1/8 Checks"
 [ -f generated_k14/sources.cmake ] && [ -f generated_k14/wwe2k16_init.h ] \
     || die "generated_k14/ is missing or incomplete: run tools/native-stage1.sh first"
 echo "SDK: $(git -C "$SDK" log -1 --format='%h %s') + $(cat "$SDK/.wwe2k14-patched")"
+# This project's own SDK changes on top (patches/k14-sdk: frame generation, ...): applied once; a patch already in
+# place is left alone.
+for p in "$ROOT"/patches/k14-sdk/*.patch; do
+    [ -f "$p" ] || continue
+    if git -C "$SDK" apply --check "$p" 2>/dev/null; then
+        git -C "$SDK" apply "$p" && echo "applied $(basename "$p")"
+    elif git -C "$SDK" apply --check -R "$p" 2>/dev/null; then
+        echo "already applied: $(basename "$p")"
+    else
+        die "$(basename "$p") neither applies nor is already applied to $SDK"
+    fi
+done
+K14_PATCHES_ID="$(cat "$ROOT"/patches/k14-sdk/*.patch 2>/dev/null | sha1sum | cut -c1-12)"
 echo "generated_k14: $(ls generated_k14 | wc -l) files, $(du -sh generated_k14 | cut -f1)"
 if [ ! -f thirdparty/libadrenotools/CMakeLists.txt ]; then
     mkdir -p thirdparty
@@ -89,7 +102,7 @@ echo "Using $JOBS parallel jobs (${MEM_GB} GB RAM free, $(nproc) cores, $(df -h 
 # the APK are the same; only crash stacks lose line numbers.
 FLAGS="-march=armv8.2-a -g0"
 SDK_STAMP="$SDK_INSTALL/.built-from"
-SDK_ID="$(git -C "$SDK" rev-parse HEAD) $(cat "$SDK/.wwe2k14-patched") ndk $NDK_VER"
+SDK_ID="$(git -C "$SDK" rev-parse HEAD) $(cat "$SDK/.wwe2k14-patched") ndk $NDK_VER k14-sdk $K14_PATCHES_ID"
 free_gb() { df -Pk "$ROOT" | awk 'NR==2{print int($4/1048576)}'; }
 
 step "3/8 The WWE 2K14 SDK for Android arm64 (-> out/k14-android-sdk)"

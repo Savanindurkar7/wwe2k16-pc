@@ -104,9 +104,10 @@ public class OptionsActivity extends Activity {
             boolean active = sec.equals(section);
             String label = sec.charAt(0) + sec.substring(1).toLowerCase(java.util.Locale.ROOT);
             if (Settings.S_DRIVER.equals(sec)) label = "GPU driver";
-            TextView item = Ui.text(this, label, 17, active ? 0xFF111114 : Ui.WHITE, Ui.semi());
+            // Compact, so all seven sections fit a phone held sideways without scrolling the menu.
+            TextView item = Ui.text(this, label, 14, active ? 0xFF111114 : Ui.WHITE, Ui.semi());
             item.setGravity(Gravity.CENTER_VERTICAL);
-            item.setPadding(Ui.dp(this, 18), Ui.dp(this, 10), Ui.dp(this, 10), Ui.dp(this, 10));
+            item.setPadding(Ui.dp(this, 14), Ui.dp(this, 5), Ui.dp(this, 8), Ui.dp(this, 5));
             item.setBackground(Ui.navBackground(this, active));
             item.setFocusable(true);
             item.setClickable(true);
@@ -116,7 +117,7 @@ public class OptionsActivity extends Activity {
             });
             LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.WRAP_CONTENT);
-            lp.bottomMargin = Ui.dp(this, 6);
+            lp.bottomMargin = Ui.dp(this, 3);
             nav.addView(item, lp);
             if (active) item.post(item::requestFocus);
         }

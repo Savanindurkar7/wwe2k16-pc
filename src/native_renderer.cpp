@@ -48,12 +48,19 @@ const std::vector<Flag> kPhone = {
     // The game sets the "invalid" type on many texture fetch constants (as 2K14 does): unset, the SDK skips those
     // textures and logs 500-1100 warnings a second on the GPU command thread.
     {"gpu_allow_invalid_fetch_constants", "true"},
+    // The 2K14 port's vertex residency cache skips re-uploading vertex ranges it believes unchanged. On 2K16 that
+    // left wrestlers' skin stretched into spikes in close-ups (phone test G, 2026-11-21: much better with it off).
+    {"vulkan_vertex_residency_cache_off", "true"},
 };
 
 // The native renderer: the scene drawn by the SDK's own renderer with the game's shaders (no EDRAM emulation), on the
 // host render-target path (phones have no fragment shader interlock).
 const std::vector<Flag> kNative = {
     {"gpu_native", "2"},
+    // The D3D library's GPR-flush point draws (24 one-vertex draws) are the only MSAA draws of a 2K16 match: drawn,
+    // every frame falls back to the emulated path (21 fps); skipped, the match is truth frames (38-40 fps). Tests r3
+    // and test D, 2026-11-21. (Not the cause of the skin spikes.)
+    {"gpu_native_half2_skip_gpr_draws", "true"},
     {"gpu_native_truth", "true"},
     {"gpu_native_truth_host_rt", "true"},
     {"gpu_fast_clear", "true"},
@@ -78,11 +85,10 @@ const std::vector<Flag> kNative = {
 // Model-data shortcuts, off by default since the 2026-11-21 phone tests: with them on, near-camera models (the ring
 // post, a wrestler's arm) came out as stretched spikes in NATIVE and NATIVE+ alike, at 480p and 720p. Each is a 2K14
 // measurement that never met 2K16's data: trusting geometry pages (2K16 may rewrite vertex data the trust then misses),
-// skipping the D3D library's GPR-flush draws, baking vertex endianness. Options > Advanced > Native shortcuts > ALL
+// baking vertex endianness (the GPR-flush draw skip is in kNative: it is what makes match frames truth frames). Options > Advanced > Native shortcuts > ALL
 // (WWE2K16_NATIVE_SHORTCUTS=1) turns them back on for testing.
 const std::vector<Flag> kShortcuts = {
     {"gpu_native_trust_geometry_pages", "true"},
-    {"gpu_native_half2_skip_gpr_draws", "true"},
     {"gpu_native_vertex_endian_spec", "true"},
 };
 
@@ -125,7 +131,11 @@ int Apply(const std::vector<Flag>& flags) {
   int set = 0;
   for (const auto& [name, value] : flags) {
     // Anything given on the command line / Extra arguments wins, even when it equals the default (false is a default).
+#if WWE2K16_SDK_K14
     if (rex::cvar::GetFlagSource(name) != rex::cvar::Source::kDefault || rex::cvar::HasNonDefaultValue(name)) continue;
+#else
+    if (rex::cvar::HasNonDefaultValue(name)) continue;  // (0.7 has no GetFlagSource; the profiles are 0.10-only anyway)
+#endif
     if (rex::cvar::SetFlagByName(name, value)) {
       ++set;
     } else {

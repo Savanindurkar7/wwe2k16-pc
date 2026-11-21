@@ -51,3 +51,39 @@ Codespace. Later runs are incremental. `FORCE_CODEGEN=1 bash tools/native-stage1
 * the disc reader header and the achievement API.
 
 `native/CMakeLists.txt` builds `src/` with `generated_k14/` against an installed SDK package.
+
+## Frame generation (native APK)
+
+Options > Graphics > **Frame generation**. Code: `patches/k14-sdk/0001-frame-generation.patch`, applied to the
+0.10 SDK by `tools/android-build-k14.sh` (`--present_frame_generation=true`).
+
+The presenter shows an in-between frame before every new guest frame, and the real frame half a frame interval
+later. Everything runs on the GPU, in the paint's own command buffer:
+
+1. both frames' luma at a quarter of the size;
+2. one motion vector per 16x16 pixels, searched symmetrically from the in-between time;
+3. per pixel, the best of five block vectors, blended with a plain mix where none fits;
+4. a copy of the current frame for next time.
+
+The launcher also asks Android for the screen's fastest mode (90 / 120 Hz), because that's where the extra frames
+show.
+
+**Limits:**
+
+- Input still acts at the game's rate.
+- The HUD and fast motion can smear a little.
+- Below about 30 game FPS (entrances, until the MSAA hook) it gains little.
+- No in-between frame for frames more than `present_frame_generation_max_gap_ms` (80 ms) apart.
+
+**Tuning:**
+
+- `--present_frame_generation_search=N` (2..16, default 8): the motion search range.
+- `--present_frame_generation_log_s=N`: a `[framegen]` line with the counts every N seconds.
+
+## Defaults learned on the phone (2026-11-21)
+
+- `gpu_native_half2_skip_gpr_draws` on (NATIVE, NATIVE+): those 24 point draws are the only MSAA draws of a match.
+  Drawn, every frame falls back (21 FPS instead of 40).
+- `vulkan_vertex_residency_cache_off` (all renderers in the native APK): it greatly reduced the skin spikes.
+- **Still open:** occasional skin stretching in close-ups. The diagnostic run ruled out stale-vertex tracking and
+  vertex kill. The next step is the skin draw's own inputs and shader.

@@ -118,7 +118,12 @@ class Wwe2k16App : public rex::ReXApp {
 
     // Memexport readback (copying every shader memory write back for the CPU) stalls the GPU thread: entrances ran at
     // 9-16 presented FPS with it, a steady 30 without (2026-10-17). WWE2K16_MEMEXPORT_READBACK=1 turns it back on.
+#if WWE2K16_SDK_K14
+    // (0.10: a value given on the command line wins even when it equals the default, true.)
+    if (rex::cvar::GetFlagSource("readback_memexport") == rex::cvar::Source::kDefault) {
+#else
     if (!rex::cvar::HasNonDefaultValue("readback_memexport")) {
+#endif
       rex::cvar::SetFlagByName("readback_memexport", EnvIs("WWE2K16_MEMEXPORT_READBACK", "1") ? "true" : "false");
     }
 

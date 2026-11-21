@@ -101,6 +101,7 @@ public class GameActivity extends SDLActivity {
             getWindow().setAttributes(lp);
         }
         applyDisplayMode();
+        applyRefreshRate();
         setupTouchControls();
     }
 
@@ -189,6 +190,33 @@ public class GameActivity extends SDLActivity {
             decor.setSystemUiVisibility(View.SYSTEM_UI_FLAG_FULLSCREEN | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
                     | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
                     | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
+        }
+    }
+
+    /**
+     * Frame generation (WWE2K16_FRAMEGEN=1) shows up to twice the game's frames: it needs the screen's fastest mode
+     * (90 / 120 Hz), which Android does not pick for a game by itself. The same resolution, the highest refresh rate.
+     */
+    private void applyRefreshRate() {
+        if (!"1".equals(System.getenv("WWE2K16_FRAMEGEN")) || Build.VERSION.SDK_INT < 23) return;
+        try {
+            android.view.Display display = getWindowManager().getDefaultDisplay();
+            android.view.Display.Mode current = display.getMode();
+            android.view.Display.Mode best = current;
+            for (android.view.Display.Mode m : display.getSupportedModes()) {
+                if (m.getPhysicalWidth() == current.getPhysicalWidth()
+                        && m.getPhysicalHeight() == current.getPhysicalHeight()
+                        && m.getRefreshRate() > best.getRefreshRate()) {
+                    best = m;
+                }
+            }
+            WindowManager.LayoutParams lp = getWindow().getAttributes();
+            lp.preferredDisplayModeId = best.getModeId();
+            lp.preferredRefreshRate = best.getRefreshRate();
+            getWindow().setAttributes(lp);
+            Log.i(TAG, "frame generation: display mode " + best.getModeId() + " (" + best.getRefreshRate() + " Hz)");
+        } catch (RuntimeException e) {
+            Log.e(TAG, "frame generation: could not set the refresh rate", e);
         }
     }
 

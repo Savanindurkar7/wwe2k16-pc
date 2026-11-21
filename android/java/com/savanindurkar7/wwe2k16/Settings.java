@@ -66,6 +66,14 @@ public final class Settings {
               "Native APK: Native plus the faster resolve and texture paths. Fastest (about 40 FPS in matches at 480p "
               + "on an Adreno 810). Recommended."));
 
+    public static final Choice FRAME_GEN = new Choice(S_GRAPHICS, "frame_gen", "FRAME GENERATION", 0,
+            a("off", "on"),
+            a("OFF", "ON"),
+            a("Every frame the game draws is shown once.",
+              "Native APK: an in-between frame (from the motion between the last two frames) before every new frame: "
+              + "up to twice the frames on a 90 / 120 Hz screen (about 40 -> 80 in matches). Controls still respond at "
+              + "the game's rate; fast moves can show small smears. Below 30 FPS (intros) it helps little."));
+
     public static final Choice CROWD = new Choice(S_GRAPHICS, "crowd", "CROWD", 0,
             a("100", "70", "50", "30", "0"),
             a("FULL", "70%", "50%", "30%", "OFF"),
@@ -86,7 +94,8 @@ public final class Settings {
             a("on", "off"),
             a("ON", "OFF"),
             a("The game's blur of out-of-focus areas (entrance close-ups, replays).",
-              "Native APK: no depth-of-field blur: sharper and a little faster."));
+              "Native APK: no depth-of-field blur. Warning: on 2K16 this made the native renderer fall back in "
+              + "matches (about 21 FPS instead of 40) in a test; keep ON unless you are testing."));
 
     public static final Choice RESOLUTION = new Choice(S_GRAPHICS, "resolution", "RESOLUTION", 1,
             a("360", "480", "540", "720", "1080", "1440"),
@@ -239,7 +248,7 @@ public final class Settings {
               "Off: the Adreno driver alone sends about a million messages per match."));
 
     public static final Choice[] CHOICES = {
-            RENDERER, RESOLUTION, CROWD, SHADOWS, DOF, FRAME_RATE, MSAA, FAST_AA, UPSCALER, TEXTURES, FILTER,
+            RENDERER, RESOLUTION, FRAME_GEN, CROWD, SHADOWS, DOF, FRAME_RATE, MSAA, FAST_AA, UPSCALER, TEXTURES, FILTER,
             DISPLAY, SCREEN_SHAPE, VSYNC, SHARPNESS,
             CPU_CORES, SPEED_FIX, SHADER_CACHE, FRAME_MONITOR, PERF_HINT, SUSTAINED,
             TOUCH, TOUCH_VIBRATE, RUMBLE,
@@ -327,6 +336,9 @@ public final class Settings {
             if ("off".equals(shadows)) cvar(l, "gpu_dynamic_shadows", "false");
             if ("half".equals(shadows)) cvar(l, "gpu_shadow_half_rate", "true");
             if ("off".equals(DOF.value(p))) cvar(l, "gpu_depth_of_field", "false");
+            boolean frameGen = "on".equals(FRAME_GEN.value(p));
+            if (frameGen) cvar(l, "present_frame_generation", "true");
+            l.env.put("WWE2K16_FRAMEGEN", frameGen ? "1" : "0");
         }
         String res = RESOLUTION.value(p);
         int scale = ("1080".equals(res) || "1440".equals(res)) ? 2 : 1;
