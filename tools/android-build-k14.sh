@@ -38,12 +38,21 @@ step "1/8 Checks"
 echo "SDK: $(git -C "$SDK" log -1 --format='%h %s') + $(cat "$SDK/.wwe2k14-patched")"
 # This project's own SDK changes on top (patches/k14-sdk: frame generation, ...): applied once; a patch already in
 # place is left alone.
-for p in "$ROOT"/patches/k14-sdk/*.patch; do
+# Patches build on each other (0002 changes lines of 0001), so "already applied" is decided from the newest one back:
+# the newest patch that reverses cleanly is in place, and so is every patch before it.
+PATCHES=("$ROOT"/patches/k14-sdk/*.patch)
+applied_upto=-1
+for ((i=${#PATCHES[@]}-1; i>=0; i--)); do
+    [ -f "${PATCHES[$i]}" ] || continue
+    if git -C "$SDK" apply --check -R "${PATCHES[$i]}" 2>/dev/null; then applied_upto=$i; break; fi
+done
+for ((i=0; i<${#PATCHES[@]}; i++)); do
+    p="${PATCHES[$i]}"
     [ -f "$p" ] || continue
-    if git -C "$SDK" apply --check "$p" 2>/dev/null; then
-        git -C "$SDK" apply "$p" && echo "applied $(basename "$p")"
-    elif git -C "$SDK" apply --check -R "$p" 2>/dev/null; then
+    if [ "$i" -le "$applied_upto" ]; then
         echo "already applied: $(basename "$p")"
+    elif git -C "$SDK" apply --check "$p" 2>/dev/null; then
+        git -C "$SDK" apply "$p" && echo "applied $(basename "$p")"
     else
         die "$(basename "$p") neither applies nor is already applied to $SDK"
     fi
