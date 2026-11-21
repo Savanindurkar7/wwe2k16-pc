@@ -66,7 +66,7 @@ if [ -z "$SDKMANAGER" ]; then
 fi
 export ANDROID_HOME="$ASDK" ANDROID_SDK_ROOT="$ASDK"
 need=()
-[ -d "$ASDK/ndk/$NDK_VER" ]        || need+=("ndk;$NDK_VER")
+[ -f "$ASDK/ndk/$NDK_VER/build/cmake/android.toolchain.cmake" ] || { rm -rf "$ASDK/ndk/$NDK_VER"; need+=("ndk;$NDK_VER"); }
 [ -d "$ASDK/platforms/android-35" ] || need+=("platforms;android-35")
 [ -d "$ASDK/build-tools/35.0.0" ]   || need+=("build-tools;35.0.0")
 [ -d "$ASDK/platform-tools" ]       || need+=("platform-tools")
