@@ -45,6 +45,9 @@ const std::vector<Flag> kPhone = {
     {"readback_resolve_batch_min_bytes", "16385"},
     // Adreno keeps no shader cache of its own: the SDK's VkPipelineCache on disk.
     {"vulkan_disk_pipeline_cache", "true"},
+    // The game sets the "invalid" type on many texture fetch constants (as 2K14 does): unset, the SDK skips those
+    // textures and logs 500-1100 warnings a second on the GPU command thread.
+    {"gpu_allow_invalid_fetch_constants", "true"},
 };
 
 // The native renderer: the scene drawn by the SDK's own renderer with the game's shaders (no EDRAM emulation), on the
