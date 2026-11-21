@@ -1,0 +1,49 @@
+diff --git a/src/ui/window_android.cpp b/src/ui/window_android.cpp
+index dead886..41c02fb 100644
+--- a/src/ui/window_android.cpp
++++ b/src/ui/window_android.cpp
+@@ -2,6 +2,9 @@
+ #include <rex/ui/surface_android.h>
+ #include <SDL3/SDL.h>
+ 
++#include <atomic>
++#include <memory>
++
+ namespace rex {
+ namespace ui {
+ 
+@@ -12,6 +15,8 @@ class AndroidWindow final : public Window {
+       : Window(context, title, width, height) {}
+ 
+   ~AndroidWindow() override {
++    // Paints queued on the UI thread see the window is gone (they run on the UI thread, as does this destructor).
++    paint_queued_.reset();
+     EnterDestructor();
+     if (window_) SDL_DestroyWindow(window_);
+   }
+@@ -63,10 +68,24 @@ class AndroidWindow final : public Window {
+     return std::make_unique<AndroidNativeWindowSurface>(native_window);
+   }
+ 
+-  void RequestPaintImpl() override {}
++  // WWE 2K16 Android: the presenter paints on the UI thread when the window asks for it (always while ImGui overlays
++  // such as the FPS counter or achievement pop-ups exist), and its connection to the surface is also set up from a UI
++  // thread paint. This was empty, so nothing ever reached the screen (black picture, game running with sound). Queue
++  // one paint on the UI thread; further requests while it is pending are merged into it.
++  void RequestPaintImpl() override {
++    if (!paint_queued_ || paint_queued_->exchange(true)) return;
++    std::weak_ptr<std::atomic<bool>> weak = paint_queued_;
++    app_context().CallInUIThreadDeferred([this, weak]() {
++      auto queued = weak.lock();
++      if (!queued) return;  // the window was destroyed meanwhile
++      queued->store(false);
++      OnPaint();
++    });
++  }
+ 
+  private:
+   SDL_Window* window_ = nullptr;
++  std::shared_ptr<std::atomic<bool>> paint_queued_ = std::make_shared<std::atomic<bool>>(false);
+ };
+ 
+ std::unique_ptr<Window> Window::Create(
