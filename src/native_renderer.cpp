@@ -124,7 +124,8 @@ const std::vector<Flag> kNativePlus = {
 int Apply(const std::vector<Flag>& flags) {
   int set = 0;
   for (const auto& [name, value] : flags) {
-    if (rex::cvar::HasNonDefaultValue(name)) continue;
+    // Anything given on the command line / Extra arguments wins, even when it equals the default (false is a default).
+    if (rex::cvar::GetFlagSource(name) != rex::cvar::Source::kDefault || rex::cvar::HasNonDefaultValue(name)) continue;
     if (rex::cvar::SetFlagByName(name, value)) {
       ++set;
     } else {
