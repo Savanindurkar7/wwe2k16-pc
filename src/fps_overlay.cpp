@@ -13,6 +13,10 @@
 
 #include "frame_monitor.h"
 
+#if defined(__ANDROID__)
+#include <jni.h>
+#endif
+
 namespace wwe2k16 {
 
 namespace {
@@ -103,6 +107,12 @@ void FpsOverlay::Attach(rex::ui::ImGuiDrawer* drawer) {
   if (!Enabled()) {
     return;
   }
+  // Frame generation (Android launcher): the counter is a label of the game activity instead (GameActivity.setupFpsLabel).
+  // With nothing for the SDK's UI layer to draw the game presents from its own thread, not the Android UI thread, and
+  // the in-between frames are presented on time.
+  if (const char* fg = std::getenv("WWE2K16_FRAMEGEN"); fg && fg[0] == '1') {
+    return;
+  }
   if (drawer_ && !active_) {
     active_ = true;
     new FpsOverlayDialog(drawer_);
@@ -115,3 +125,10 @@ void FpsOverlay::Detach() {
 }
 
 }  // namespace wwe2k16
+
+#if defined(__ANDROID__)
+// GameActivity's FPS label (frame generation on): the game's frame count, sampled twice a second.
+extern "C" JNIEXPORT jlong JNICALL Java_com_savanindurkar7_wwe2k16_GameActivity_nativeGameFrames(JNIEnv*, jclass) {
+  return jlong(wwe2k16::GameFrameCount());
+}
+#endif

@@ -243,6 +243,14 @@ public final class Settings {
               "Native APK: those shortcuts on again (geometry page trust, GPR-flush draw skip, vertex endian baking): "
               + "a little faster, but expect the spike glitch. Only for testing."));
 
+    public static final Choice TURNIP_FIX = new Choice(S_ADVANCED, "turnip_skin_fix", "TURNIP SKIN FIX", 0,
+            a("on", "off"),
+            a("ON", "OFF"),
+            a("With a Turnip driver: its shader compiler keeps the game's constants in memory instead of copying them into "
+              + "fast registers (IR3_SHADER_DEBUG=nouboopt). Fixes the wrestlers' skin stretching into spikes in close-ups "
+              + "(phone test A, 2026-11-21). No effect with the phone's own driver.",
+              "Turnip's normal compiler: a little faster, but the skin spike glitch comes back. Only for testing."));
+
     public static final Choice VK_DEBUG = new Choice(S_ADVANCED, "vk_debug", "VULKAN DEBUG MESSAGES", 1,
             a("1", "0"),
             a("ON", "OFF"),
@@ -254,7 +262,7 @@ public final class Settings {
             DISPLAY, SCREEN_SHAPE, VSYNC, SHARPNESS,
             CPU_CORES, SPEED_FIX, SHADER_CACHE, FRAME_MONITOR, PERF_HINT, SUSTAINED,
             TOUCH, TOUCH_VIBRATE, RUMBLE,
-            READBACK, SHORTCUTS, VK_DEBUG,
+            READBACK, SHORTCUTS, TURNIP_FIX, VK_DEBUG,
     };
 
     public static final String KEY_EXTRA_ARGS = "extra_args";
@@ -303,6 +311,21 @@ public final class Settings {
         File d = new File(c.getFilesDir(), "logs");
         d.mkdirs();
         return d;
+    }
+
+    /** The SDK's VkPipelineCache files (TITLE.vkpc) and Mesa's own shader cache (under HOME = files/.cache). */
+    static void clearShaderCaches(Context c) {
+        File shareable = new File(userDataDir(c), "cache/shaders/shareable");
+        File[] files = shareable.listFiles();
+        if (files != null) for (File f : files) if (f.getName().endsWith(".vkpc")) f.delete();
+        File[] caches = new File(c.getFilesDir(), ".cache").listFiles();
+        if (caches != null) for (File f : caches) if (f.getName().startsWith("mesa_shader_cache")) deleteTree(f);
+    }
+
+    private static void deleteTree(File f) {
+        File[] children = f.listFiles();
+        if (children != null) for (File ch : children) deleteTree(ch);
+        f.delete();
     }
 
     public static File userDataDir(Context c) {
@@ -399,6 +422,7 @@ public final class Settings {
         }
 
         // Custom driver.
+        String compiler = "";
         String driver = p.getString(KEY_DRIVER, "");
         if (!driver.isEmpty()) {
             Drivers.Driver d = Drivers.find(ctx, driver);
@@ -408,7 +432,20 @@ public final class Settings {
                 l.env.put("WWE2K16_DRIVER_TRIAL", Drivers.trialFile(ctx).getAbsolutePath());
                 // Turnip on newer Adrenos is steadier without its tile-based fast path.
                 l.env.put("TU_DEBUG", "sysmem");
+                // Turnip skin fix: the bone matrices are read with an index known only while the shader runs; Turnip's
+                // copy of uniform buffers into the constant registers ("UBO optimisation") gets those wrong on the
+                // A8xx (spikes in close-ups). Without it: clean (test A, 2026-11-21).
+                if (d.library.contains("freedreno") && "on".equals(TURNIP_FIX.value(p))) {
+                    l.env.put("IR3_SHADER_DEBUG", "nouboopt");
+                    compiler = "nouboopt";
+                }
             }
+        }
+        // Shaders compiled with other compiler switches must not come back from the caches: when the switches change,
+        // the pipeline cache and Mesa's shader cache start over once.
+        if (!compiler.equals(p.getString("compiler_switches_applied", ""))) {
+            clearShaderCaches(ctx);
+            p.edit().putString("compiler_switches_applied", compiler).apply();
         }
 
         // Extra arguments: "--cvar=value" go to the SDK, "NAME=value" become environment variables. They come last, so

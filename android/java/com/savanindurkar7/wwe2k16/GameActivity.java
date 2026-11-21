@@ -9,6 +9,10 @@ import android.os.VibrationEffect;
 import android.os.Vibrator;
 import android.view.InputDevice;
 import android.view.ViewGroup;
+import android.view.Gravity;
+import android.widget.FrameLayout;
+import android.widget.TextView;
+import android.graphics.Color;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.PowerManager;
@@ -103,6 +107,53 @@ public class GameActivity extends SDLActivity {
         applyDisplayMode();
         applyRefreshRate();
         setupTouchControls();
+        setupFpsLabel();
+    }
+
+    // --- FPS label with frame generation ----------------------------------------------------------------------------
+    // The game's own FPS counter is drawn by the SDK's UI layer, and while that layer has anything to draw every frame is
+    // painted on Android's UI thread, which frame generation cannot keep up with (about 30 paints a second in total).
+    // With frame generation on, the counter is this label instead (src/fps_overlay.cpp leaves the SDK's out), so the
+    // game presents from its own thread and the in-between frames go out on time.
+
+    static native long nativeGameFrames();
+
+    private TextView fpsLabel;
+    private long fpsLastFrames = -1, fpsLastMs;
+    private final Runnable fpsTick = new Runnable() {
+        @Override
+        public void run() {
+            if (fpsLabel == null) return;
+            long now = android.os.SystemClock.uptimeMillis();
+            long frames;
+            try { frames = nativeGameFrames(); } catch (UnsatisfiedLinkError e) { return; }
+            if (fpsLastFrames >= 0 && now > fpsLastMs) {
+                float fps = (frames - fpsLastFrames) * 1000f / (now - fpsLastMs);
+                fpsLabel.setText(String.format(java.util.Locale.US, "%.0f FPS  FG", fps));
+            }
+            fpsLastFrames = frames;
+            fpsLastMs = now;
+            handler.postDelayed(this, 500);
+        }
+    };
+
+    private void setupFpsLabel() {
+        if (!"1".equals(System.getenv("WWE2K16_FRAMEGEN"))) return;
+        String monitor = System.getenv("WWE2K16_FRAME_MONITOR");
+        if (monitor == null || "0".equals(monitor)) return;
+        fpsLabel = new TextView(this);
+        fpsLabel.setTextColor(Color.rgb(242, 245, 250));
+        fpsLabel.setTextSize(13);
+        fpsLabel.setBackgroundColor(Color.argb(210, 20, 23, 28));
+        int pad = (int) (6 * getResources().getDisplayMetrics().density);
+        fpsLabel.setPadding(pad * 2, pad, pad * 2, pad);
+        fpsLabel.setText("-- FPS  FG");
+        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP | Gravity.END);
+        lp.topMargin = pad * 2;
+        lp.rightMargin = pad * 3;
+        addContentView(fpsLabel, lp);
+        handler.postDelayed(fpsTick, 1000);
     }
 
     // --- Touch controls -------------------------------------------------------------------------------------------

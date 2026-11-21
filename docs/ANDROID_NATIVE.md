@@ -68,11 +68,18 @@ later. Everything runs on the GPU, in the paint's own command buffer:
 The launcher also asks Android for the screen's fastest mode (90 / 120 Hz), because that's where the extra frames
 show.
 
+**v2 (who presents):** the first version requested every paint from Android's UI thread, which managed only about 30
+paints a second under GPU load, so it cost FPS. The SDK paints from the UI thread whenever its UI layer has something
+to draw, and the game's FPS counter was such a thing. With frame generation on, the counter is now a label of the
+game activity (`GameActivity.setupFpsLabel`, the game's frame count via JNI from `src/fps_overlay.cpp`). The game
+then presents from its own thread, and the frame-generation timer presents the real frame directly. The log line
+`[present] paint mode: game thread (immediately)` confirms it (`patches/k14-sdk/0003-present-paint-mode-log.patch`).
+
 **Limits:**
 
 - Input still acts at the game's rate.
 - The HUD and fast motion can smear a little.
-- Below about 30 game FPS (entrances, until the MSAA hook) it gains little.
+- Below about 30 game FPS it gains little.
 - No in-between frame for frames more than `present_frame_generation_max_gap_ms` (80 ms) apart.
 
 **Tuning:**
@@ -107,3 +114,12 @@ game builds its scene targets 1x, as one tile.
   Anti-aliasing (MSAA) > OFF (now the default) sets the cvar.
 - The log line `[wwe2k16][tiling] scene build N: ... force_no_msaa: applied: 1 tile, 1x` confirms it worked. If no
   match is found, the build log shows `not hooked` and the functions it saw.
+
+## Turnip skin fix
+
+With the Turnip driver (Mesa 27 A8xx), wrestlers' skin stretched into spikes in close-ups. The phone's own driver
+showed none, and the shaders are correct. Test A (2026-11-21), `IR3_SHADER_DEBUG=nouboopt`, removed them: Turnip's
+compiler copies uniform buffers into its constant registers ("UBO optimisation"), and it gets that wrong for the
+skinning shaders, which read bone matrices with an index known only at run time (`c[76 + a0]`). Options > Advanced >
+**Turnip skin fix** (on by default) sets it for Turnip drivers. When the compiler switches change, the launcher
+deletes the pipeline cache (`*.vkpc`) and Mesa's shader cache once (`Settings.clearShaderCaches`).
