@@ -140,3 +140,13 @@ deletes the pipeline cache (`*.vkpc`) and Mesa's shader cache once (`Settings.cl
   because the GPU had no room at about 40.
 - **Home screen**: sidebar plus pages (`LauncherActivity`, `Home.java`), with the repository's BG1.png, BG2.jpg,
   BG3.jpg and BG34-.jpg packed as `home_bg1..4`. The credits card (`Credits.card`) shows Catonix's links.
+
+### r10 test results and r11
+
+Phone tests on 2026-11-22, crowd 20%:
+- **Render pass trim:** about 53 FPS with it OFF, about 42 with it ON. It is now OFF by default (key `pass_trim_v2`).
+- **Frame generation at 30:** the game fell to about 22 real frames. Painting on the GPU command thread blocked
+  that thread.
+
+r11 (`0005-frame-generation-paint-thread.patch`) moves every paint to the frame generation thread when frame
+generation is on, so the command thread never waits on the swapchain.

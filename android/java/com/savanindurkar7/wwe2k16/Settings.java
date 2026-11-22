@@ -100,13 +100,14 @@ public final class Settings {
               "Native APK: no depth-of-field blur. Warning: on 2K16 this made the native renderer fall back in "
               + "matches (about 21 FPS instead of 40) in a test; keep ON unless you are testing."));
 
-    public static final Choice PASS_TRIM = new Choice(S_GRAPHICS, "pass_trim", "RENDER PASS TRIM", 0,
+    // (Key "pass_trim_v2", OFF by default: phone test 2026-11-22 with crowd 20%: OFF about 53 FPS in a match, ON about
+    // 42. The 2K14 port's frame-structure savings cost more than they save on 2K16 / the Adreno 810.)
+    public static final Choice PASS_TRIM = new Choice(S_GRAPHICS, "pass_trim_v2", "RENDER PASS TRIM", 1,
             a("on", "off"),
-            a("ON (FAST)", "OFF"),
-            a("Native APK: the WWE 2K14 port's frame-structure savings: passes and copies nothing reads are skipped, "
-              + "depth-only passes keep their colour on the GPU's tiles, copies are batched, off-screen crowd skipped. "
-              + "Picture-identical in 2K14. If anything looks wrong, try OFF and send the logs.",
-              "Native APK: the renderer without those savings (as in build r9)."));
+            a("ON (TEST)", "OFF"),
+            a("Native APK: the WWE 2K14 port's frame-structure savings. Slower on 2K16 in the phone test (about 42 FPS "
+              + "instead of 53); only for testing.",
+              "Native APK: the renderer without those savings. Faster on 2K16. Recommended."));
 
     public static final Choice RESOLUTION = new Choice(S_GRAPHICS, "resolution", "RESOLUTION", 1,
             a("360", "480", "540", "720", "1080", "1440"),

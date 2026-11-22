@@ -1,0 +1,26 @@
+--- a/src/ui/presenter.cpp
++++ b/src/ui/presenter.cpp
+@@ -26,6 +26,8 @@
+ #include <rex/ui/presenter.h>
+ #include <rex/ui/window.h>
+ 
++REXCVAR_DECLARE(bool, present_frame_generation);  // wwe2k16 patch (vulkan_presenter_framegen.cpp)
++
+ #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+ #include <ffx_api/ffx_api.h>
+ #include <ffx_api/ffx_upscale.h>
+@@ -1222,6 +1224,14 @@
+         RequestPaintOrConnectionRecoveryViaWindow(true);
+         break;
+       case PaintMode::kGuestOutputThreadImmediately:
++        // wwe2k16 patch (frame generation v4): with frame generation every paint, the new frame's (its in-between
++        // frame) and the real frame's half a frame later, runs on the frame generation thread. Painting here blocked
++        // the GPU command thread on the swapchain and the paint's own submissions: the game's frames fell from 30 to
++        // about 22 (phone test 2026-11-22), the overlap of emulation and GPU work lost.
++        if (REXCVAR_GET(present_frame_generation)) {
++          ScheduleFrameGenRepaint(0);
++          break;
++        }
+         // Both painting and window paint requesting are accessible.
+         if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable) {
+           paint_result = PaintAndPresent(false);
