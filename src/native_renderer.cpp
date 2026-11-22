@@ -92,6 +92,7 @@ const std::vector<Flag> kShortcuts = {
     {"gpu_native_vertex_endian_spec", "true"},
 };
 
+// (kShortcuts: on by default in the launcher since phone test T3, 2026-11-22.)
 // More speed, less margin: resolves only a texture reads skip their write-back, textures load straight into their
 // storage, shader specialisations. Try it after "native" is right.
 const std::vector<Flag> kNativePlus = {

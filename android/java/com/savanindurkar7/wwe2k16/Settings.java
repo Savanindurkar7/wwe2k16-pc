@@ -236,12 +236,14 @@ public final class Settings {
               "Native APK: exact readback all the time. Use it if a wrestler or attire shows noise or black / magenta "
               + "patches; it costs speed."));
 
-    public static final Choice SHORTCUTS = new Choice(S_ADVANCED, "native_shortcuts", "NATIVE SHORTCUTS", 0,
-            a("safe", "all"),
-            a("SAFE", "ALL (TEST)"),
-            a("Native APK: the model-data shortcuts that stretched near-camera models into spikes stay off.",
-              "Native APK: those shortcuts on again (geometry page trust, GPR-flush draw skip, vertex endian baking): "
-              + "a little faster, but expect the spike glitch. Only for testing."));
+    // (Key "native_shortcuts_v2": ON is the new default for everyone. The spikes blamed on these shortcuts were
+    // Turnip's (fixed by the Turnip skin fix); phone test T3, 2026-11-22: ALL ran 38-47 FPS with no glitches.)
+    public static final Choice SHORTCUTS = new Choice(S_ADVANCED, "native_shortcuts_v2", "NATIVE SHORTCUTS", 0,
+            a("all", "safe"),
+            a("ON (FAST)", "OFF"),
+            a("Native APK: geometry page trust and vertex endian baking on. Faster and smoother; no glitches with the "
+              + "Turnip skin fix ON.",
+              "Native APK: those shortcuts off (slower). Only for testing."));
 
     public static final Choice TURNIP_FIX = new Choice(S_ADVANCED, "turnip_skin_fix", "TURNIP SKIN FIX", 0,
             a("on", "off"),
