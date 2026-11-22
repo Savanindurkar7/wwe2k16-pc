@@ -40,8 +40,11 @@ public class TouchEditActivity extends Activity {
         root.setBackgroundColor(0xFF000000);
         ImageView art = new ImageView(this);
         art.setScaleType(ImageView.ScaleType.CENTER_CROP);
-        int bg = getResources().getIdentifier("home_bg", "drawable", getPackageName());
-        if (bg != 0) art.setImageResource(bg);
+        java.util.List<Integer> arts = Home.artIds(this);
+        if (!arts.isEmpty()) {
+            android.graphics.Bitmap b = Home.art(this, arts.get(0), 960);
+            if (b != null) art.setImageBitmap(b);
+        }
         art.setAlpha(0.35f);
         root.addView(art, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 

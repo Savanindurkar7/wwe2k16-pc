@@ -68,20 +68,23 @@ public final class Settings {
 
     public static final Choice FRAME_GEN = new Choice(S_GRAPHICS, "frame_gen", "FRAME GENERATION", 0,
             a("off", "on"),
-            a("OFF", "ON"),
+            a("OFF", "ON (30 -> 60)"),
             a("Every frame the game draws is shown once.",
-              "Native APK: an in-between frame (from the motion between the last two frames) before every new frame: "
-              + "up to twice the frames on a 90 / 120 Hz screen (about 40 -> 80 in matches). Controls still respond at "
-              + "the game's rate; fast moves can show small smears. Below 30 FPS (intros) it helps little."));
+              "Native APK: the game runs at a steady 30 FPS and an in-between frame is made between every two, so the "
+              + "screen shows 60 (the screen is set to 60 Hz). The GPU has room for the extra frames at 30, which it "
+              + "did not at 40 (tests 2026-11-21: uncapped frame generation halved the game's own frames). Controls "
+              + "respond at 30; fast moves can show small smears. Overrides FRAME RATE."));
 
-    public static final Choice CROWD = new Choice(S_GRAPHICS, "crowd", "CROWD", 0,
-            a("100", "70", "50", "30", "0"),
-            a("FULL", "70%", "50%", "30%", "OFF"),
+    // (Key "crowd_v2": 20% is the new default for everyone; phone test 2026-11-22: crowd OFF about 44 FPS, 50% about 40.)
+    public static final Choice CROWD = new Choice(S_GRAPHICS, "crowd_v2", "CROWD", 3,
+            a("100", "70", "50", "20", "0"),
+            a("FULL", "70%", "50%", "20%", "OFF"),
             a("The whole crowd. Native APK only (the classic APK always draws it).",
               "Native APK: 70% of the crowd, spread evenly; the same people stay from frame to frame.",
-              "Native APK: half the crowd. A big help in entrances, where the crowd is hundreds of draws a frame.",
-              "Native APK: 30% of the crowd. Entrances run noticeably faster.",
-              "Native APK: no crowd at all. Fastest entrances."));
+              "Native APK: half the crowd (about 40 FPS in a match on an Adreno 810).",
+              "Native APK: a fifth of the crowd, spread evenly over the arena, so the seats do not look empty. Close to "
+              + "crowd OFF for speed. Recommended.",
+              "Native APK: no crowd at all (about 44 FPS, up to 60 in close shots)."));
 
     public static final Choice SHADOWS = new Choice(S_GRAPHICS, "shadows", "DYNAMIC SHADOWS", 0,
             a("on", "half", "off"),
@@ -97,6 +100,14 @@ public final class Settings {
               "Native APK: no depth-of-field blur. Warning: on 2K16 this made the native renderer fall back in "
               + "matches (about 21 FPS instead of 40) in a test; keep ON unless you are testing."));
 
+    public static final Choice PASS_TRIM = new Choice(S_GRAPHICS, "pass_trim", "RENDER PASS TRIM", 0,
+            a("on", "off"),
+            a("ON (FAST)", "OFF"),
+            a("Native APK: the WWE 2K14 port's frame-structure savings: passes and copies nothing reads are skipped, "
+              + "depth-only passes keep their colour on the GPU's tiles, copies are batched, off-screen crowd skipped. "
+              + "Picture-identical in 2K14. If anything looks wrong, try OFF and send the logs.",
+              "Native APK: the renderer without those savings (as in build r9)."));
+
     public static final Choice RESOLUTION = new Choice(S_GRAPHICS, "resolution", "RESOLUTION", 1,
             a("360", "480", "540", "720", "1080", "1440"),
             a("360p", "480p", "540p", "720p", "1080p", "1440p"),
@@ -108,10 +119,12 @@ public final class Settings {
               "Drawn at 1440p (2x). Only for the strongest phones."));
 
     public static final Choice FRAME_RATE = new Choice(S_GRAPHICS, "frame_rate", "FRAME RATE", 0,
-            a("60", "30", "classic"),
-            a("60 FPS", "30 FPS", "CLASSIC"),
-            a("60 FPS everywhere, entrances included. With the game speed fix the game keeps normal speed below 60.",
-              "Capped at 30 FPS: steadier and cooler on phones that cannot hold 60.",
+            a("60", "45", "30", "classic"),
+            a("60 FPS", "45 FPS (STEADY)", "30 FPS", "CLASSIC"),
+            a("Up to 60 FPS everywhere, entrances included. With the game speed fix the game keeps normal speed below 60.",
+              "Capped at 45 FPS: much steadier than jumping between 35 and 60 (the screen is set to 90 Hz when it has "
+              + "it, so every frame shows for the same time). The game keeps normal speed.",
+              "Capped at 30 FPS: steadiest and coolest.",
               "Like the console: 60 in matches, 30 in entrances and cutscenes."));
 
     // (Key "msaa_v2": the old "msaa" setting could only be 2X; the new default is OFF for everyone.)
@@ -260,7 +273,7 @@ public final class Settings {
               "Off: the Adreno driver alone sends about a million messages per match."));
 
     public static final Choice[] CHOICES = {
-            RENDERER, RESOLUTION, FRAME_GEN, CROWD, SHADOWS, DOF, FRAME_RATE, MSAA, FAST_AA, UPSCALER, TEXTURES, FILTER,
+            RENDERER, RESOLUTION, FRAME_GEN, CROWD, SHADOWS, DOF, PASS_TRIM, FRAME_RATE, MSAA, FAST_AA, UPSCALER, TEXTURES, FILTER,
             DISPLAY, SCREEN_SHAPE, VSYNC, SHARPNESS,
             CPU_CORES, SPEED_FIX, SHADER_CACHE, FRAME_MONITOR, PERF_HINT, SUSTAINED,
             TOUCH, TOUCH_VIBRATE, RUMBLE,
@@ -355,6 +368,7 @@ public final class Settings {
         if (nat) {
             l.env.put("WWE2K16_RENDERER", renderer);
             l.env.put("WWE2K16_NATIVE_SHORTCUTS", "all".equals(SHORTCUTS.value(p)) ? "1" : "0");
+            l.env.put("WWE2K16_PASS_TRIM", "on".equals(PASS_TRIM.value(p)) ? "1" : "0");
             // SDK scene levers from the WWE 2K14 port (keyed on shader hashes that 2K16 shares: its crowd draws are the
             // same three crowd shaders, the census shows).
             String crowd = CROWD.value(p);
@@ -384,8 +398,12 @@ public final class Settings {
         }
 
         String fr = FRAME_RATE.value(p);
+        boolean fg = nat && "on".equals(FRAME_GEN.value(p));
+        if (fg) fr = "30";  // frame generation v3: a steady 30 from the game, 60 on the screen
         l.env.put("WWE2K16_KEEP_60", "classic".equals(fr) ? "0" : "1");
-        l.env.put("WWE2K16_FRAME_CAP", "30".equals(fr) ? "30" : "0");
+        l.env.put("WWE2K16_FRAME_CAP", "30".equals(fr) ? "30" : "45".equals(fr) ? "45" : "0");
+        // The screen's refresh rate (GameActivity): 60 Hz for frame generation (30 + 30 evenly), 90 Hz for 45 FPS.
+        l.env.put("WWE2K16_DISPLAY_HZ", fg ? "60" : "45".equals(fr) ? "90" : "0");
 
         cvar(l, "swap_post_effect", FAST_AA.value(p));
         cvar(l, "texture_min_lod", TEXTURES.value(p));

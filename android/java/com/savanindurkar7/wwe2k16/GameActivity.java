@@ -129,7 +129,7 @@ public class GameActivity extends SDLActivity {
             try { frames = nativeGameFrames(); } catch (UnsatisfiedLinkError e) { return; }
             if (fpsLastFrames >= 0 && now > fpsLastMs) {
                 float fps = (frames - fpsLastFrames) * 1000f / (now - fpsLastMs);
-                fpsLabel.setText(String.format(java.util.Locale.US, "%.0f FPS  FG", fps));
+                fpsLabel.setText(String.format(java.util.Locale.US, "%.0f FPS  \u00B7  FG x2", fps));
             }
             fpsLastFrames = frames;
             fpsLastMs = now;
@@ -248,26 +248,39 @@ public class GameActivity extends SDLActivity {
      * Frame generation (WWE2K16_FRAMEGEN=1) shows up to twice the game's frames: it needs the screen's fastest mode
      * (90 / 120 Hz), which Android does not pick for a game by itself. The same resolution, the highest refresh rate.
      */
+    /**
+     * The screen's refresh rate for the frame pacing (WWE2K16_DISPLAY_HZ from the launcher): 60 Hz for frame generation
+     * (a real and an in-between frame, each one vblank), 90 Hz for the 45 FPS cap (every frame two vblanks). The mode
+     * with that rate at the current size, else the nearest above it; 0 = leave the screen as it is.
+     */
     private void applyRefreshRate() {
-        if (!"1".equals(System.getenv("WWE2K16_FRAMEGEN")) || Build.VERSION.SDK_INT < 23) return;
+        if (Build.VERSION.SDK_INT < 23) return;
+        float want;
+        try {
+            want = Float.parseFloat(String.valueOf(System.getenv("WWE2K16_DISPLAY_HZ")));
+        } catch (NumberFormatException e) {
+            return;
+        }
+        if (want <= 0) return;
         try {
             android.view.Display display = getWindowManager().getDefaultDisplay();
             android.view.Display.Mode current = display.getMode();
-            android.view.Display.Mode best = current;
+            android.view.Display.Mode best = null;
             for (android.view.Display.Mode m : display.getSupportedModes()) {
-                if (m.getPhysicalWidth() == current.getPhysicalWidth()
-                        && m.getPhysicalHeight() == current.getPhysicalHeight()
-                        && m.getRefreshRate() > best.getRefreshRate()) {
-                    best = m;
-                }
+                if (m.getPhysicalWidth() != current.getPhysicalWidth() || m.getPhysicalHeight() != current.getPhysicalHeight())
+                    continue;
+                float hz = m.getRefreshRate();
+                if (hz + 0.5f < want) continue;
+                if (best == null || hz < best.getRefreshRate()) best = m;
             }
+            if (best == null) return;
             WindowManager.LayoutParams lp = getWindow().getAttributes();
             lp.preferredDisplayModeId = best.getModeId();
             lp.preferredRefreshRate = best.getRefreshRate();
             getWindow().setAttributes(lp);
-            Log.i(TAG, "frame generation: display mode " + best.getModeId() + " (" + best.getRefreshRate() + " Hz)");
+            Log.i(TAG, "display mode " + best.getModeId() + " (" + best.getRefreshRate() + " Hz) for " + want + " Hz");
         } catch (RuntimeException e) {
-            Log.e(TAG, "frame generation: could not set the refresh rate", e);
+            Log.e(TAG, "could not set the refresh rate", e);
         }
     }
 

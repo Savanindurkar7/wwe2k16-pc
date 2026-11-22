@@ -35,6 +35,8 @@ import java.util.List;
 /** OPTIONS: every setting, grouped in sections. Rows cycle with a tap or the D-pad's left / right. */
 public class OptionsActivity extends Activity {
     private static final int REQ_DRIVER_ZIP = 21;
+    /** The section to open (Settings.S_*), from the home screen's sidebar and cards. */
+    static final String EXTRA_SECTION = "section";
 
     private String section = Settings.S_GRAPHICS;
     private final Handler handler = new Handler(Looper.getMainLooper());
@@ -45,6 +47,8 @@ public class OptionsActivity extends Activity {
         requestWindowFeature(Window.FEATURE_NO_TITLE);
         setRequestedOrientation(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
         Ui.init(this);
+        String wanted = getIntent().getStringExtra(EXTRA_SECTION);
+        if (wanted != null) for (String sec : Settings.SECTIONS) if (sec.equals(wanted)) section = sec;
         build();
     }
 
@@ -67,8 +71,11 @@ public class OptionsActivity extends Activity {
         root.setBackgroundColor(0xFF000000);
         ImageView art = new ImageView(this);
         art.setScaleType(ImageView.ScaleType.CENTER_CROP);
-        int bg = getResources().getIdentifier("home_bg", "drawable", getPackageName());
-        if (bg != 0) art.setImageResource(bg);
+        java.util.List<Integer> arts = Home.artIds(this);
+        if (!arts.isEmpty()) {
+            android.graphics.Bitmap b = Home.art(this, arts.get(arts.size() > 1 ? 1 : 0), 960);
+            if (b != null) art.setImageBitmap(b);
+        }
         art.setAlpha(0.28f);
         root.addView(art, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
@@ -224,26 +231,8 @@ public class OptionsActivity extends Activity {
     }
 
     private void addCredits(LinearLayout p) {
-        TextView name = Ui.text(this, Credits.PORT_BY, 30, Ui.WHITE, Ui.bold());
-        name.setPadding(0, Ui.dp(this, 10), 0, 0);
-        p.addView(name);
-        TextView role = Ui.body(this, "Port of WWE 2K16 to Android  ·  " + Credits.GITHUB, 14, Ui.GREY);
-        role.setPadding(0, Ui.dp(this, 4), 0, Ui.dp(this, 14));
-        p.addView(role);
-        for (String[] line : Credits.THANKS) {
-            LinearLayout r = new LinearLayout(this);
-            r.setOrientation(LinearLayout.VERTICAL);
-            r.setPadding(Ui.dp(this, 14), Ui.dp(this, 9), Ui.dp(this, 14), Ui.dp(this, 9));
-            r.setBackground(Ui.rect(0xCC141419, Ui.dp(this, 4)));
-            r.addView(Ui.label(this, line[0], 14));
-            TextView d = Ui.body(this, line[1], 12.5f, Ui.GREY);
-            d.setPadding(0, Ui.dp(this, 3), 0, 0);
-            r.addView(d);
-            p.addView(r, Ui.fill(Ui.dp(this, 6)));
-        }
-        TextView disc = Ui.body(this, Credits.DISCLAIMER, 11.5f, Ui.DIM);
-        disc.setPadding(0, Ui.dp(this, 14), 0, 0);
-        p.addView(disc);
+        p.addView(Credits.card(this), Ui.fill(Ui.dp(this, 10)));
+        Credits.addThanks(this, p);
     }
 
     /** A setting row: title and value with arrows; the note for the current value below. */

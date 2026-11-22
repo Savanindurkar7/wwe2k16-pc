@@ -127,6 +127,44 @@ const std::vector<Flag> kNativePlus = {
     {"gpu_native_fma", "3"},
 };
 
+// Render pass trim (Options > Graphics > Render pass trim, WWE2K16_PASS_TRIM=1): the WWE 2K14 port's "frame structure"
+// work (its native_frame.h, Sessions 52-80), the parts that need nothing of 2K14's own: no shader hashes, no game-side
+// owned frame. Each was byte-identical in 2K14's picture tests and cuts passes, copies or barriers:
+//   colour_none        depth-only passes keep their colour with LOAD/STORE_OP_NONE (tile GPUs: no load + store)
+//   clear_attachments  real depth clears (the GPU's hierarchical depth works)
+//   dedupe_state       fewer state commands a draw
+//   cover_outdated     fills that write every texel no longer refused
+//   cube faces         reflection cube faces filled by their copies, one barrier pair for 6 faces
+//   alias_direct*      alias loads straight from the owner images (store dispatches 208 -> 0 a 2K14 match frame)
+//   defer_*_resolves   copies batched instead of flushing alone with their own barriers
+//   skip_writeback_depth / drop_dead_copies / drop_dead_passes: copies and passes nothing reads turned into no-ops
+//   exact_rows / carry_copies / serve_copies / serve_ahead: the scene copies served from the scene image, the
+//                      scene pass no longer split for the arena screen (one 1280x720 colour + depth store / load less)
+//   crowd_cull 2       crowd members entirely outside the draw's view skipped (exact)
+// 2K16 is the same engine; whether every one holds here is what the phone test shows (OFF = the r9 renderer).
+const std::vector<Flag> kPassTrim = {
+    {"gpu_native_truth_color_none", "true"},
+    {"gpu_native_truth_clear_attachments", "true"},
+    {"gpu_native_truth_dedupe_state", "true"},
+    {"gpu_native_truth_cover_outdated", "true"},
+    {"gpu_native_truth_fill_cube_faces", "true"},
+    {"gpu_native_truth_texture_only_cube_faces", "true"},
+    {"gpu_native_truth_alias_direct", "true"},
+    {"gpu_native_truth_alias_direct_rgba16", "true"},
+    {"gpu_native_truth_alias_direct_lazy_flush", "true"},
+    {"gpu_native_truth_defer_memory_resolves", "true"},
+    {"gpu_native_truth_defer_depth_resolves", "true"},
+    {"gpu_native_truth_defer_full_resolves", "true"},
+    {"gpu_native_truth_skip_writeback_depth", "true"},
+    {"gpu_native_truth_drop_dead_copies", "true"},
+    {"gpu_native_truth_drop_dead_passes", "true"},
+    {"gpu_native_truth_exact_rows", "true"},
+    {"gpu_native_truth_carry_copies", "true"},
+    {"gpu_native_truth_serve_copies", "true"},
+    {"gpu_native_truth_serve_ahead", "true"},
+    {"gpu_scene_crowd_cull", "2"},
+};
+
 // A value from the launcher's extra arguments (or the command line) wins: only settings still at default are set.
 int Apply(const std::vector<Flag>& flags) {
   int set = 0;
@@ -167,6 +205,13 @@ void Apply() {
   const char* shortcuts = std::getenv("WWE2K16_NATIVE_SHORTCUTS");
   const bool with_shortcuts = shortcuts && shortcuts[0] == '1' && profile != "classic";
   if (with_shortcuts) set += Apply(kShortcuts);
+  const char* trim = std::getenv("WWE2K16_PASS_TRIM");
+  const bool with_trim = trim && trim[0] == '1' && profile != "classic";
+  if (with_trim) {
+    set += Apply(kPassTrim);
+    REXLOG_INFO("[wwe2k16-renderer] render pass trim on ({} settings from the 2K14 port's frame structure)",
+                kPassTrim.size());
+  }
   REXLOG_INFO("[wwe2k16-renderer] profile {}{}: {} settings applied; gpu_native={} truth={} host_rt={}", profile,
               with_shortcuts ? " + model shortcuts" : "", set,
               rex::cvar::GetFlagByName("gpu_native"), rex::cvar::GetFlagByName("gpu_native_truth"),

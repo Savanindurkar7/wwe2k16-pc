@@ -128,3 +128,15 @@ compiler copies uniform buffers into its constant registers ("UBO optimisation")
 skinning shaders, which read bone matrices with an index known only at run time (`c[76 + a0]`). Options > Advanced >
 **Turnip skin fix** (on by default) sets it for Turnip drivers. When the compiler switches change, the launcher
 deletes the pipeline cache (`*.vkpc`) and Mesa's shader cache once (`Settings.clearShaderCaches`).
+
+## Build r10 (2026-11-22)
+
+- **Crowd 20%** (new default, key `crowd_v2`). Phone test: crowd OFF about 44 FPS, 50% about 40.
+- **Frame rate 45 FPS (steady)**: `WWE2K16_FRAME_CAP=45` and the screen at 90 Hz (`WWE2K16_DISPLAY_HZ`).
+- **Render pass trim** (Options > Graphics, on by default): `kPassTrim` in `src/native_renderer.cpp` holds the WWE
+  2K14 port's frame-structure settings that need nothing 2K14-specific. OFF gives the r9 renderer.
+- **Frame generation v3**: frame generation ON runs the game at a steady 30 (`WWE2K16_FRAME_CAP=30`), with the screen
+  at 60 Hz. One in-between frame per real frame makes 60 on screen. The uncapped version halved the game's own frames,
+  because the GPU had no room at about 40.
+- **Home screen**: sidebar plus pages (`LauncherActivity`, `Home.java`), with the repository's BG1.png, BG2.jpg,
+  BG3.jpg and BG34-.jpg packed as `home_bg1..4`. The credits card (`Credits.card`) shows Catonix's links.

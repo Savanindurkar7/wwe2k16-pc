@@ -19,6 +19,7 @@ import android.view.Window;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
 import android.widget.FrameLayout;
+import android.widget.HorizontalScrollView;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
@@ -32,8 +33,8 @@ import java.util.ArrayList;
 import java.util.Map;
 
 /**
- * The home screen: PLAY, SELECT EXTRACTED GAME FOLDER, SELECT ISO, OPTIONS and LOGS over the background art, with the
- * game files' status. Landscape puts the menu in a panel on the left; portrait puts it under the picture.
+ * The home screen: a sidebar (Home, Graphics, Controls, Game files, Logs, Credits, Settings) and the page: the hero card
+ * with PLAY and QUICK SETUP, game files, logs or credits, over the wrestler art.
  */
 public class LauncherActivity extends Activity {
     private static final int REQ_FOLDER = 11;
@@ -91,172 +92,620 @@ public class LauncherActivity extends Activity {
     }
 
     // --- Layout ----------------------------------------------------------------------------------------------------
-    // Landscape only (manifest): the background fills the screen; the menu sits top-left, the tip and the game files'
-    // status bottom-left, the credits bottom-right.
+    // Landscape only (manifest). Left: the sidebar (title, pages, the game files' status, Settings). Right: the page
+    // over the dimmed wrestler art (BG1.png, BG2.jpg, BG3.jpg, BG34-.jpg from the repository, packed by the build):
+    //   home     the hero card (art slideshow, WWE 2K16, chips, PLAY) and QUICK SETUP (Graphics, Controls)
+    //   files    game files status, install location (folder / ISO / verify), shader cache
+    //   logs     save / share / clear, the last lines of the log
+    //   credits  the porter's card with the links, then everyone else's work
+    // Graphics, Controls and Settings open OPTIONS at that section.
+
+    private java.util.List<Integer> art;
+    private int artIndex;
+    private ImageView heroArt, backArt;
+    private final Runnable slideshow = new Runnable() {
+        @Override
+        public void run() {
+            if (art == null || art.size() < 2 || heroArt == null) return;
+            artIndex = (artIndex + 1) % art.size();
+            final int id = art.get(artIndex);
+            heroArt.animate().alpha(0f).setDuration(350).withEndAction(() -> {
+                setArt(heroArt, id, 1400);
+                setArt(backArt, id, 960);
+                heroArt.animate().alpha(1f).setDuration(450).start();
+            }).start();
+            handler.postDelayed(this, 7000);
+        }
+    };
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        handler.removeCallbacks(slideshow);
+    }
+
+    private void setArt(ImageView v, int id, int maxWidth) {
+        if (v == null) return;
+        android.graphics.Bitmap b = Home.art(this, id, maxWidth);
+        if (b != null) v.setImageBitmap(b);
+    }
+
+    private int screenW() { return getResources().getDisplayMetrics().widthPixels; }
+    private int screenH() { return getResources().getDisplayMetrics().heightPixels; }
 
     private void build() {
+        handler.removeCallbacks(slideshow);
+        art = Home.artIds(this);
         FrameLayout root = new FrameLayout(this);
-        root.setBackgroundColor(0xFF000000);
+        root.setBackgroundColor(0xFF0A0204);
 
-        // Background art (BG.jpg from the repository, packed by the build); a dark red gradient if it is missing.
-        ImageView art = new ImageView(this);
-        art.setScaleType(ImageView.ScaleType.CENTER_CROP);
-        int bg = getResources().getIdentifier("home_bg", "drawable", getPackageName());
-        if (bg != 0) art.setImageResource(bg);
-        else art.setBackground(new GradientDrawable(GradientDrawable.Orientation.TL_BR, new int[] {0xFF3A0006, 0xFF000000}));
-        root.addView(art, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        backArt = new ImageView(this);
+        backArt.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        backArt.setAlpha(0.30f);
+        if (!art.isEmpty()) setArt(backArt, art.get(artIndex % art.size()), 960);
+        root.addView(backArt, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        View tint = new View(this);
+        tint.setBackground(new GradientDrawable(GradientDrawable.Orientation.TL_BR,
+                new int[] {0xE6160306, 0xB3420810, 0xD90A0203}));
+        root.addView(tint, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
-        // Shades so the menu (left) and the text lines (bottom) read over any picture.
-        View left = new View(this);
-        left.setBackground(new GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT, new int[] {0xCC000000, 0x55000000, 0x00000000}));
-        root.addView(left, new FrameLayout.LayoutParams(Math.round(getResources().getDisplayMetrics().widthPixels * 0.5f),
-                ViewGroup.LayoutParams.MATCH_PARENT, Gravity.START));
-        View bottom = new View(this);
-        bottom.setBackground(new GradientDrawable(GradientDrawable.Orientation.BOTTOM_TOP, new int[] {0xE6000000, 0x00000000}));
-        root.addView(bottom, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, Ui.dp(this, 120), Gravity.BOTTOM));
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        int sideW = Math.max(Ui.dp(this, 200), Math.round(screenW() * 0.2f));
+        row.addView(sidebar(), new LinearLayout.LayoutParams(sideW, ViewGroup.LayoutParams.MATCH_PARENT));
 
-        int margin = Ui.dp(this, 22);
-        LinearLayout menu = "logs".equals(page) ? logsMenu() : homeMenu();
         ScrollView scroll = new ScrollView(this);
         scroll.setVerticalScrollBarEnabled(false);
-        scroll.addView(menu);
-        FrameLayout.LayoutParams menuLp = new FrameLayout.LayoutParams(
-                Math.max(Ui.dp(this, 260), Math.round(getResources().getDisplayMetrics().widthPixels * 0.25f)),
-                ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.START | Gravity.TOP);
-        menuLp.leftMargin = margin;
-        menuLp.topMargin = Ui.dp(this, 16);
-        menuLp.bottomMargin = Ui.dp(this, 70);
-        root.addView(scroll, menuLp);
-
-        root.addView(statusLines(), bottomLeft(margin));
-        if ("home".equals(page)) root.addView(creditsBlock(), bottomRight(margin));
-        else root.addView(logsInfo(), bottomRight(margin));
+        scroll.setFillViewport(true);
+        LinearLayout content = new LinearLayout(this);
+        content.setOrientation(LinearLayout.VERTICAL);
+        int pad = Ui.dp(this, 22);
+        content.setPadding(pad, Ui.dp(this, 14), pad, Ui.dp(this, 16));
+        content.addView(topBar());
+        if ("files".equals(page)) filesPage(content);
+        else if ("logs".equals(page)) logsPage(content);
+        else if ("credits".equals(page)) creditsPage(content);
+        else homePage(content);
+        scroll.addView(content);
+        row.addView(scroll, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f));
+        root.addView(row);
 
         setContentView(root);
-        View first = menu.findViewWithTag("first");
+        View first = root.findViewWithTag("first");
         if (first != null) first.requestFocus();
+        if ("home".equals(page) && art.size() > 1) handler.postDelayed(slideshow, 7000);
     }
 
-    private FrameLayout.LayoutParams bottomLeft(int margin) {
-        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(Math.round(getResources().getDisplayMetrics().widthPixels * 0.55f),
-                ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.START | Gravity.BOTTOM);
-        lp.leftMargin = margin;
-        lp.bottomMargin = Ui.dp(this, 14);
+    // --- Sidebar ---
+
+    private View sidebar() {
+        LinearLayout side = new LinearLayout(this);
+        side.setOrientation(LinearLayout.VERTICAL);
+        side.setPadding(Ui.dp(this, 22), Ui.dp(this, 20), Ui.dp(this, 14), Ui.dp(this, 12));
+        side.setBackground(new GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT,
+                new int[] {0xFA0C0204, 0xF2160407}));
+
+        LinearLayout title = new LinearLayout(this);
+        title.setOrientation(LinearLayout.HORIZONTAL);
+        title.setGravity(Gravity.BOTTOM);
+        title.addView(Ui.text(this, "2K16", 38, Ui.WHITE, Ui.bold()));
+        TextView recomp = Ui.text(this, "RECOMP", 11, Ui.RED, Ui.semi());
+        recomp.setLetterSpacing(0.35f);
+        recomp.setPadding(Ui.dp(this, 10), 0, 0, Ui.dp(this, 5));
+        title.addView(recomp);
+        side.addView(title);
+        side.addView(rule(), ruleLp(14, 10));
+
+        LinearLayout nav = new LinearLayout(this);
+        nav.setOrientation(LinearLayout.VERTICAL);
+        nav.addView(navItem("⌂", "Home", "home".equals(page), v -> show("home")));
+        nav.addView(navItem("▣", "Graphics", false, v -> openOptions(Settings.S_GRAPHICS)));
+        nav.addView(navItem("✚", "Controls", false, v -> openOptions(Settings.S_CONTROLS)));
+        nav.addView(navItem("▤", "Game files", "files".equals(page), v -> show("files")));
+        nav.addView(rule(), ruleLp(8, 8));
+        nav.addView(navItem("≡", "Logs", "logs".equals(page), v -> show("logs")));
+        nav.addView(navItem("★", "Credits", "credits".equals(page), v -> show("credits")));
+        ScrollView navScroll = new ScrollView(this);
+        navScroll.setVerticalScrollBarEnabled(false);
+        navScroll.addView(nav);
+        side.addView(navScroll, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+
+        side.addView(statusCard());
+        side.addView(navItem("⚙", "Settings", false, v -> openOptions(Settings.S_PERFORMANCE)));
+        return side;
+    }
+
+    private View rule() {
+        View r = new View(this);
+        r.setBackgroundColor(0x40FFFFFF);
+        return r;
+    }
+
+    private LinearLayout.LayoutParams ruleLp(int topDp, int bottomDp) {
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, Math.max(1, Ui.dp(this, 1.5f)));
+        lp.topMargin = Ui.dp(this, topDp);
+        lp.bottomMargin = Ui.dp(this, bottomDp);
         return lp;
     }
 
-    private FrameLayout.LayoutParams bottomRight(int margin) {
-        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.END | Gravity.BOTTOM);
-        lp.rightMargin = margin;
-        lp.bottomMargin = Ui.dp(this, 14);
-        return lp;
+    private View navItem(String icon, String label, boolean selected, View.OnClickListener click) {
+        LinearLayout item = new LinearLayout(this);
+        item.setOrientation(LinearLayout.HORIZONTAL);
+        item.setGravity(Gravity.CENTER_VERTICAL);
+        item.setPadding(0, Ui.dp(this, 7), Ui.dp(this, 6), Ui.dp(this, 7));
+        item.setBackground(Home.pill(this, 0x00000000, 0x26FFFFFF, Ui.dp(this, 8)));
+        item.setFocusable(true);
+        item.setClickable(true);
+        item.setOnClickListener(click);
+        if (selected) item.setTag("first");
+
+        View bar = new View(this);
+        bar.setBackground(Ui.rect(selected ? Ui.WHITE : 0x00000000, Ui.dp(this, 2)));
+        LinearLayout.LayoutParams bl = new LinearLayout.LayoutParams(Ui.dp(this, 4), Ui.dp(this, 26));
+        bl.rightMargin = Ui.dp(this, 12);
+        item.addView(bar, bl);
+        TextView ic = Ui.text(this, icon, 19, selected ? Ui.WHITE : 0xFFCFCFD4, android.graphics.Typeface.DEFAULT_BOLD);
+        ic.setGravity(Gravity.CENTER);
+        item.addView(ic, new LinearLayout.LayoutParams(Ui.dp(this, 26), ViewGroup.LayoutParams.WRAP_CONTENT));
+        TextView t = Ui.text(this, label, 18, selected ? Ui.WHITE : 0xFFD4D4D8, selected ? Ui.bold() : Ui.regular());
+        t.setPadding(Ui.dp(this, 12), 0, 0, 0);
+        item.addView(t);
+        return item;
     }
 
-    /** A home-screen entry in the game's style: dark, outlined, a red edge; PLAY is red. */
-    private TextView entry(String title, boolean primary, View.OnClickListener click) {
-        TextView t = Ui.text(this, title.toUpperCase(java.util.Locale.ROOT), 25, Ui.WHITE, Ui.bold());
-        t.setLetterSpacing(0.03f);
-        t.setGravity(Gravity.CENTER_VERTICAL);
-        t.setPadding(Ui.dp(this, 24), Ui.dp(this, 9), Ui.dp(this, 16), Ui.dp(this, 9));
-        t.setBackground(Ui.entryBackground(this, primary));
-        t.setFocusable(true);
-        t.setClickable(true);
-        t.setOnClickListener(click);
-        return t;
+    private View statusCard() {
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setPadding(Ui.dp(this, 12), Ui.dp(this, 10), Ui.dp(this, 10), Ui.dp(this, 10));
+        card.setBackground(Ui.rect(0x99202024, Ui.dp(this, 10)));
+        String problem = filesProblem();
+        boolean ready = problem == null;
+        TextView s = Ui.text(this, (ready ? "✔  Game files ready" : "✖  Game files needed"), 14,
+                ready ? Ui.GREEN : Ui.RED, Ui.semi());
+        card.addView(s);
+        TextView v = Ui.text(this, BuildInfo.versionName(this), 11, Ui.GREY, Ui.regular());
+        v.setPadding(0, Ui.dp(this, 5), 0, 0);
+        card.addView(v);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.bottomMargin = Ui.dp(this, 6);
+        card.setLayoutParams(lp);
+        return card;
     }
 
-    private LinearLayout homeMenu() {
-        LinearLayout p = new LinearLayout(this);
-        p.setOrientation(LinearLayout.VERTICAL);
-        int gap = Ui.dp(this, 9);
-        View play = entry("Play", true, v -> play());
-        play.setTag("first");
-        p.addView(play, Ui.fill(0));
-        p.addView(entry("Select folder", false, v -> withStorageAccess(this::pickFolder)), Ui.fill(gap));
-        p.addView(entry("Select ISO", false, v -> withStorageAccess(this::pickIso)), Ui.fill(gap));
-        p.addView(entry("Options", false, v -> startActivity(new Intent(this, OptionsActivity.class))), Ui.fill(gap));
-        p.addView(entry("Logs", false, v -> {
-            page = "logs";
-            build();
-        }), Ui.fill(gap));
-        return p;
+    private void show(String p) {
+        page = p;
+        build();
     }
 
-    private LinearLayout logsMenu() {
-        LinearLayout p = new LinearLayout(this);
-        p.setOrientation(LinearLayout.VERTICAL);
-        int gap = Ui.dp(this, 9);
-        View save = entry("Save logs", true, v -> saveLogs(false));
-        save.setTag("first");
-        p.addView(save, Ui.fill(0));
-        p.addView(entry("Share logs", false, v -> saveLogs(true)), Ui.fill(gap));
-        p.addView(entry("Clear logs", false, v -> {
-            Logs.clear(this);
-            Toast.makeText(this, "Logs cleared", Toast.LENGTH_SHORT).show();
-            build();
-        }), Ui.fill(gap));
-        p.addView(entry("Back", false, v -> {
-            page = "home";
-            build();
-        }), Ui.fill(gap));
-        return p;
+    private void openOptions(String section) {
+        Intent i = new Intent(this, OptionsActivity.class);
+        i.putExtra(OptionsActivity.EXTRA_SECTION, section);
+        startActivity(i);
     }
 
-    /** Bottom-left: a tip, then the game files' status and the version. */
-    private View statusLines() {
-        LinearLayout p = new LinearLayout(this);
-        p.setOrientation(LinearLayout.VERTICAL);
+    private String filesProblem() {
         SharedPreferences prefs = Settings.prefs(this);
         String path = prefs.getString(Settings.KEY_GAME_PATH, "");
         String kind = prefs.getString(Settings.KEY_GAME_KIND, "folder");
-        String problem = hasStorageAccess() ? GameFiles.checkSaved(path, kind) : (path.isEmpty()
+        return hasStorageAccess() ? GameFiles.checkSaved(path, kind) : (path.isEmpty()
                 ? "Select your game folder or .iso first." : "Allow file access so the game files can be read.");
-        boolean ready = problem == null;
-        TextView tip = Ui.text(this, ("logs".equals(page)
-                ? "Logs are saved in Download/" + Logs.FOLDER
-                : ready ? "Tip: Options > Performance > Frame monitor shows FPS while you play"
-                        : problem).toUpperCase(java.util.Locale.ROOT), 12, Ui.GREY, Ui.regular());
-        tip.setLetterSpacing(0.04f);
-        p.addView(tip);
-        TextView status = Ui.text(this, (ready ? "GAME FILES READY" : "GAME FILES NEEDED") + "   |   "
-                + BuildInfo.versionName(this), 16, ready ? Ui.GREEN : Ui.RED, Ui.semi());
-        status.setLetterSpacing(0.04f);
-        status.setPadding(0, Ui.dp(this, 6), 0, 0);
-        p.addView(status);
-        return p;
     }
 
-    /** Bottom-right: the credits. */
-    private View creditsBlock() {
+    // --- Top bar: the controller status ---
+
+    private View topBar() {
+        LinearLayout bar = new LinearLayout(this);
+        bar.setOrientation(LinearLayout.HORIZONTAL);
+        bar.setGravity(Gravity.CENTER_VERTICAL | Gravity.END);
+        boolean pad = gamepadConnected();
+        TextView chip = Ui.text(this, (pad ? "●  Gamepad connected" : "●  Touch controls"), 13,
+                pad ? Ui.GREEN : 0xFFCFCFD4, Ui.regular());
+        chip.setPadding(Ui.dp(this, 14), Ui.dp(this, 7), Ui.dp(this, 14), Ui.dp(this, 7));
+        chip.setBackground(Ui.rect(0x33FFFFFF, Ui.dp(this, 18)));
+        bar.addView(chip);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.bottomMargin = Ui.dp(this, 12);
+        bar.setLayoutParams(lp);
+        return bar;
+    }
+
+    private boolean gamepadConnected() {
+        for (int id : android.view.InputDevice.getDeviceIds()) {
+            android.view.InputDevice d = android.view.InputDevice.getDevice(id);
+            if (d == null || d.isVirtual()) continue;
+            int s = d.getSources();
+            if ((s & android.view.InputDevice.SOURCE_GAMEPAD) == android.view.InputDevice.SOURCE_GAMEPAD
+                    || (s & android.view.InputDevice.SOURCE_JOYSTICK) == android.view.InputDevice.SOURCE_JOYSTICK) return true;
+        }
+        return false;
+    }
+
+    // --- Home ---
+
+    private void homePage(LinearLayout content) {
+        SharedPreferences prefs = Settings.prefs(this);
+        // The hero card.
+        FrameLayout hero = new FrameLayout(this);
+        hero.setBackground(Ui.rect(0xFF200408, Ui.dp(this, 20)));
+        hero.setClipToOutline(true);
+        heroArt = new ImageView(this);
+        heroArt.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        if (!art.isEmpty()) setArt(heroArt, art.get(artIndex % art.size()), 1400);
+        hero.addView(heroArt, matchParent());
+        View shade = new View(this);
+        shade.setBackground(new GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT,
+                new int[] {0xF2120205, 0x99300509, 0x00000000}));
+        hero.addView(shade, matchParent());
+        View bottomShade = new View(this);
+        bottomShade.setBackground(new GradientDrawable(GradientDrawable.Orientation.BOTTOM_TOP,
+                new int[] {0xCC000000, 0x00000000}));
+        hero.addView(bottomShade, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                Ui.dp(this, 90), Gravity.BOTTOM));
+
+        LinearLayout text = new LinearLayout(this);
+        text.setOrientation(LinearLayout.VERTICAL);
+        int hp = Ui.dp(this, 24);
+        text.setPadding(hp, hp, hp, Ui.dp(this, 20));
+        TextView tag = Ui.text(this, "XBOX 360  →  ANDROID", 11.5f, Ui.WHITE, Ui.semi());
+        tag.setLetterSpacing(0.32f);
+        tag.setPadding(Ui.dp(this, 14), Ui.dp(this, 6), Ui.dp(this, 14), Ui.dp(this, 6));
+        tag.setBackground(Ui.rect(Ui.RED, Ui.dp(this, 5)));
+        text.addView(tag, wrap());
+        View grow = new View(this);
+        text.addView(grow, new LinearLayout.LayoutParams(1, 0, 1f));
+        TextView name = Ui.text(this, "WWE 2K16", 46, Ui.WHITE, Ui.bold());
+        name.setShadowLayer(12, 0, 3, 0xAA000000);
+        text.addView(name);
+        LinearLayout chips = new LinearLayout(this);
+        chips.setOrientation(LinearLayout.HORIZONTAL);
+        chips.setPadding(0, Ui.dp(this, 10), 0, 0);
+        String renderer = Settings.isNativeBuild(this)
+                ? Settings.RENDERER.labels[Settings.RENDERER.index(prefs)] : "Classic";
+        String fps = "on".equals(Settings.FRAME_GEN.value(prefs)) && Settings.isNativeBuild(this) ? "30 → 60 FG"
+                : Settings.FRAME_RATE.labels[Settings.FRAME_RATE.index(prefs)].replace(" (STEADY)", "");
+        String[] chipText = {"Recomp", "Vulkan", renderer, fps, "Build " + BuildInfo.versionName(this).split(" ")[0]};
+        for (int i = 0; i < chipText.length; i++) {
+            LinearLayout.LayoutParams cl = wrap();
+            if (i > 0) cl.leftMargin = Ui.dp(this, 8);
+            chips.addView(Home.chip(this, chipText[i]), cl);
+        }
+        text.addView(chips);
+        hero.addView(text, matchParent());
+
+        TextView play = Ui.text(this, "▶   Play", 24, Ui.WHITE, Ui.bold());
+        play.setGravity(Gravity.CENTER);
+        play.setPadding(Ui.dp(this, 34), Ui.dp(this, 12), Ui.dp(this, 38), Ui.dp(this, 12));
+        play.setBackground(Home.pill(this, Ui.RED, 0xFFF0364A, Ui.dp(this, 14)));
+        play.setElevation(Ui.dp(this, 6));
+        play.setFocusable(true);
+        play.setClickable(true);
+        play.setTag("first");
+        play.setOnClickListener(v -> play());
+        FrameLayout.LayoutParams pl = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.END | Gravity.BOTTOM);
+        pl.rightMargin = Ui.dp(this, 22);
+        pl.bottomMargin = Ui.dp(this, 20);
+        hero.addView(play, pl);
+        content.addView(hero, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                Math.max(Ui.dp(this, 200), Math.round(screenH() * 0.50f))));
+
+        // QUICK SETUP.
+        LinearLayout head = new LinearLayout(this);
+        head.setOrientation(LinearLayout.HORIZONTAL);
+        head.setGravity(Gravity.CENTER_VERTICAL);
+        head.setPadding(0, Ui.dp(this, 16), 0, Ui.dp(this, 10));
+        TextView qs = Ui.text(this, "QUICK SETUP", 18, Ui.WHITE, Ui.bold());
+        qs.setLetterSpacing(0.06f);
+        head.addView(qs, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        TextView all = Ui.text(this, "View all", 16, Ui.WHITE, Ui.semi());
+        all.setPadding(Ui.dp(this, 10), Ui.dp(this, 4), Ui.dp(this, 4), Ui.dp(this, 4));
+        all.setFocusable(true);
+        all.setClickable(true);
+        all.setOnClickListener(v -> openOptions(Settings.S_GRAPHICS));
+        head.addView(all);
+        content.addView(head);
+
+        LinearLayout cards = new LinearLayout(this);
+        cards.setOrientation(LinearLayout.HORIZONTAL);
+        String res = Settings.RESOLUTION.labels[Settings.RESOLUTION.index(prefs)];
+        String crowd = "Crowd " + Settings.CROWD.labels[Settings.CROWD.index(prefs)];
+        cards.addView(setupCard("Graphics", new String[] {renderer, res, crowd}, "Configure ›", 1,
+                v -> openOptions(Settings.S_GRAPHICS)), new LinearLayout.LayoutParams(0, Ui.dp(this, 128), 1f));
+        LinearLayout.LayoutParams second = new LinearLayout.LayoutParams(0, Ui.dp(this, 128), 1f);
+        second.leftMargin = Ui.dp(this, 16);
+        boolean pad = gamepadConnected();
+        cards.addView(setupCard("Controls", new String[] {"Touch", pad ? "Gamepad ✔" : "Gamepad"}, "Edit layout ›", 2,
+                v -> startActivity(new Intent(this, TouchEditActivity.class))), second);
+        content.addView(cards);
+    }
+
+    private View setupCard(String title, String[] chipText, String action, int artSlot, View.OnClickListener click) {
+        FrameLayout card = new FrameLayout(this);
+        card.setBackground(Ui.rect(0xFF1A0507, Ui.dp(this, 18)));
+        card.setClipToOutline(true);
+        if (art.size() > 0) {
+            ImageView img = new ImageView(this);
+            img.setScaleType(ImageView.ScaleType.CENTER_CROP);
+            setArt(img, art.get(artSlot % art.size()), 900);
+            img.setAlpha(0.55f);
+            card.addView(img, matchParent());
+        }
+        View shade = new View(this);
+        shade.setBackground(new GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT,
+                new int[] {0xE6140306, 0x80140306}));
+        card.addView(shade, matchParent());
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        col.setGravity(Gravity.BOTTOM);
+        int p = Ui.dp(this, 18);
+        col.setPadding(p, p, p, p);
+        col.addView(Ui.text(this, title, 28, Ui.WHITE, Ui.bold()));
+        LinearLayout chips = new LinearLayout(this);
+        chips.setOrientation(LinearLayout.HORIZONTAL);
+        chips.setPadding(0, Ui.dp(this, 10), 0, 0);
+        for (int i = 0; i < chipText.length; i++) {
+            LinearLayout.LayoutParams cl = wrap();
+            if (i > 0) cl.leftMargin = Ui.dp(this, 7);
+            chips.addView(Home.chip(this, chipText[i]), cl);
+        }
+        col.addView(chips);
+        card.addView(col, matchParent());
+        TextView b = Ui.text(this, action, 15, Ui.WHITE, Ui.semi());
+        b.setPadding(Ui.dp(this, 16), Ui.dp(this, 8), Ui.dp(this, 16), Ui.dp(this, 8));
+        b.setBackground(Home.outline(this, Ui.dp(this, 12)));
+        b.setFocusable(true);
+        b.setClickable(true);
+        b.setOnClickListener(click);
+        FrameLayout.LayoutParams bl = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.END | Gravity.BOTTOM);
+        bl.rightMargin = Ui.dp(this, 14);
+        bl.bottomMargin = Ui.dp(this, 14);
+        card.addView(b, bl);
+        card.setOnClickListener(click);
+        return card;
+    }
+
+    // --- Page banners and cards ---
+
+    private View banner(String title, String subtitle, int artSlot) {
+        FrameLayout b = new FrameLayout(this);
+        b.setBackground(Ui.rect(0xFF140306, Ui.dp(this, 18)));
+        b.setClipToOutline(true);
+        if (art.size() > 0) {
+            ImageView img = new ImageView(this);
+            img.setScaleType(ImageView.ScaleType.CENTER_CROP);
+            setArt(img, art.get(artSlot % art.size()), 1200);
+            card(b, img);
+        }
+        View shade = new View(this);
+        shade.setBackground(new GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT,
+                new int[] {0xFA0E0204, 0xCC1A0306, 0x33000000}));
+        b.addView(shade, matchParent());
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        col.setGravity(Gravity.CENTER_VERTICAL);
+        col.setPadding(Ui.dp(this, 24), Ui.dp(this, 14), Ui.dp(this, 24), Ui.dp(this, 14));
+        col.addView(Ui.text(this, title, 34, Ui.WHITE, Ui.bold()));
+        TextView sub = Ui.body(this, subtitle, 15, 0xFFE6E6EA);
+        sub.setPadding(0, Ui.dp(this, 6), 0, 0);
+        col.addView(sub);
+        b.addView(col, matchParent());
+        b.setLayoutParams(new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, Ui.dp(this, 104)));
+        return b;
+    }
+
+    private void card(FrameLayout parent, ImageView img) {
+        img.setAlpha(0.8f);
+        parent.addView(img, matchParent());
+    }
+
+    private LinearLayout panel() {
         LinearLayout p = new LinearLayout(this);
         p.setOrientation(LinearLayout.VERTICAL);
-        p.setGravity(Gravity.END);
-        TextView h = Ui.text(this, "CREDITS", 22, Ui.WHITE, Ui.bold());
-        h.setGravity(Gravity.END);
-        p.addView(h);
-        for (String[] line : Credits.HOME) {
-            TextView t = Ui.text(this, line[0] + ": " + line[1], 14, Ui.WHITE, Ui.regular());
-            t.setLetterSpacing(0.05f);
-            t.setGravity(Gravity.END);
-            t.setPadding(0, Ui.dp(this, 6), 0, Ui.dp(this, 3));
-            p.addView(t);
-            View rule = new View(this);
-            rule.setBackgroundColor(0x88FFFFFF);
-            p.addView(rule, new LinearLayout.LayoutParams(Ui.dp(this, 200), Math.max(1, Ui.dp(this, 1))));
-        }
+        int pad = Ui.dp(this, 20);
+        p.setPadding(pad, Ui.dp(this, 16), pad, Ui.dp(this, 18));
+        p.setBackground(Home.card(this, 18));
         return p;
     }
 
-    /** Bottom-right on the logs page: the last lines of the game log. */
-    private View logsInfo() {
-        String tail = Logs.tail(this, 8);
-        TextView last = Ui.body(this, tail.isEmpty() ? "No game log yet." : tail, 10, Ui.GREY);
+    private TextView redAction(String title, View.OnClickListener click) {
+        TextView b = Ui.text(this, title, 16, Ui.WHITE, Ui.bold());
+        b.setGravity(Gravity.CENTER);
+        b.setPadding(Ui.dp(this, 20), Ui.dp(this, 10), Ui.dp(this, 20), Ui.dp(this, 10));
+        b.setBackground(Home.pill(this, Ui.RED, 0xFFF0364A, Ui.dp(this, 12)));
+        b.setFocusable(true);
+        b.setClickable(true);
+        b.setOnClickListener(click);
+        return b;
+    }
+
+    private TextView outlineAction(String title, View.OnClickListener click) {
+        TextView b = Ui.text(this, title, 16, Ui.WHITE, Ui.bold());
+        b.setGravity(Gravity.CENTER);
+        b.setPadding(Ui.dp(this, 20), Ui.dp(this, 10), Ui.dp(this, 20), Ui.dp(this, 10));
+        b.setBackground(Home.outline(this, Ui.dp(this, 12)));
+        b.setFocusable(true);
+        b.setClickable(true);
+        b.setOnClickListener(click);
+        return b;
+    }
+
+    private LinearLayout.LayoutParams gapTop(int dp) {
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.topMargin = Ui.dp(this, dp);
+        return lp;
+    }
+
+    private View infoColumn(String label, String value, TextView[] out) {
+        LinearLayout c = new LinearLayout(this);
+        c.setOrientation(LinearLayout.VERTICAL);
+        c.addView(Ui.text(this, label, 13, Ui.GREY, Ui.regular()));
+        TextView v = Ui.text(this, value, 18, Ui.WHITE, Ui.bold());
+        v.setPadding(0, Ui.dp(this, 6), Ui.dp(this, 14), 0);
+        v.setMaxLines(2);
+        v.setEllipsize(android.text.TextUtils.TruncateAt.MIDDLE);
+        c.addView(v);
+        if (out != null) out[0] = v;
+        return c;
+    }
+
+    // --- Game files ---
+
+    private void filesPage(LinearLayout content) {
+        content.addView(banner("Game files", "Install location and verification", 0));
+        SharedPreferences prefs = Settings.prefs(this);
+        String path = prefs.getString(Settings.KEY_GAME_PATH, "");
+        String kind = prefs.getString(Settings.KEY_GAME_KIND, "folder");
+        String problem = filesProblem();
+        boolean ready = problem == null;
+
+        LinearLayout status = panel();
+        LinearLayout head = new LinearLayout(this);
+        head.setOrientation(LinearLayout.HORIZONTAL);
+        head.setGravity(Gravity.CENTER_VERTICAL);
+        TextView mark = Ui.text(this, ready ? "✔" : "✖", 18, Ui.WHITE, android.graphics.Typeface.DEFAULT_BOLD);
+        mark.setGravity(Gravity.CENTER);
+        GradientDrawable dot = new GradientDrawable();
+        dot.setShape(GradientDrawable.OVAL);
+        dot.setColor(ready ? 0xFF1F8A4C : Ui.RED_DARK);
+        mark.setBackground(dot);
+        head.addView(mark, new LinearLayout.LayoutParams(Ui.dp(this, 34), Ui.dp(this, 34)));
+        TextView ht = Ui.text(this, ready ? "Game files verified" : "Game files needed", 22, Ui.WHITE, Ui.bold());
+        ht.setPadding(Ui.dp(this, 14), 0, 0, 0);
+        head.addView(ht);
+        status.addView(head);
+        if (!ready) {
+            TextView why = Ui.body(this, problem, 14, Ui.GREY);
+            why.setPadding(0, Ui.dp(this, 10), 0, 0);
+            status.addView(why);
+        }
+        LinearLayout info = new LinearLayout(this);
+        info.setOrientation(LinearLayout.HORIZONTAL);
+        info.setPadding(0, Ui.dp(this, 16), 0, 0);
+        TextView[] sizeView = new TextView[1];
+        info.addView(infoColumn("Folder", path.isEmpty() ? "Not selected" : path, null),
+                new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 2.2f));
+        info.addView(infoColumn("Size", path.isEmpty() ? "-" : "…", sizeView),
+                new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        info.addView(infoColumn("Type", "iso".equals(kind) ? "ISO image" : "Extracted folder", null),
+                new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.2f));
+        info.addView(infoColumn("Version", "Xbox 360", null),
+                new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        status.addView(info);
+        content.addView(status, gapTop(14));
+        if (!path.isEmpty() && hasStorageAccess()) {
+            new Thread(() -> {
+                long bytes = sizeOf(new File(path), 0);
+                String text = bytes <= 0 ? "-" : String.format(java.util.Locale.US, "%.1f GB", bytes / 1073741824.0);
+                handler.post(() -> { if (sizeView[0] != null) sizeView[0].setText(text); });
+            }, "game-size").start();
+        }
+
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout install = panel();
+        install.addView(Ui.text(this, "Install location", 21, Ui.WHITE, Ui.bold()));
+        TextView isub = Ui.body(this, "Point the launcher at the extracted game folder or an .iso", 14, Ui.GREY);
+        isub.setPadding(0, Ui.dp(this, 6), 0, Ui.dp(this, 14));
+        install.addView(isub);
+        LinearLayout ib = new LinearLayout(this);
+        ib.setOrientation(LinearLayout.HORIZONTAL);
+        ib.addView(redAction("Change folder", v -> withStorageAccess(this::pickFolder)), wrap());
+        LinearLayout.LayoutParams l2 = wrap();
+        l2.leftMargin = Ui.dp(this, 10);
+        ib.addView(outlineAction("Select ISO", v -> withStorageAccess(this::pickIso)), l2);
+        LinearLayout.LayoutParams l3 = wrap();
+        l3.leftMargin = Ui.dp(this, 10);
+        ib.addView(outlineAction("Verify again", v -> {
+            String pr = filesProblem();
+            Toast.makeText(this, pr == null ? "Game files verified" : pr, Toast.LENGTH_LONG).show();
+            build();
+        }), l3);
+        HorizontalScrollView ibs = new HorizontalScrollView(this);
+        ibs.setHorizontalScrollBarEnabled(false);
+        ibs.addView(ib);
+        install.addView(ibs);
+        row.addView(install, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1.25f));
+
+        LinearLayout shader = panel();
+        shader.addView(Ui.text(this, "Shader cache", 21, Ui.WHITE, Ui.bold()));
+        long cache = sizeOf(new File(Settings.userDataDir(this), "cache"), 0) + sizeOf(new File(getFilesDir(), ".cache"), 0);
+        TextView ssub = Ui.body(this, String.format(java.util.Locale.US, "%.0f MB · rebuilds on the next launch if cleared",
+                cache / 1048576.0), 14, Ui.GREY);
+        ssub.setPadding(0, Ui.dp(this, 6), 0, Ui.dp(this, 14));
+        shader.addView(ssub);
+        shader.addView(outlineAction("Clear cache", v -> {
+            Settings.clearShaderCaches(this);
+            Toast.makeText(this, "Shader cache cleared: the first match compiles them again", Toast.LENGTH_LONG).show();
+            build();
+        }), wrap());
+        LinearLayout.LayoutParams sl = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f);
+        sl.leftMargin = Ui.dp(this, 16);
+        row.addView(shader, sl);
+        content.addView(row, gapTop(16));
+    }
+
+    private static long sizeOf(File f, int depth) {
+        if (f == null || !f.exists() || depth > 12) return 0;
+        if (f.isFile()) return f.length();
+        long total = 0;
+        File[] list = f.listFiles();
+        if (list != null) for (File c : list) total += sizeOf(c, depth + 1);
+        return total;
+    }
+
+    // --- Logs ---
+
+    private void logsPage(LinearLayout content) {
+        content.addView(banner("Logs", "Logs are saved in Download/" + Logs.FOLDER + " · send them with your report", 1));
+        LinearLayout p = panel();
+        LinearLayout b = new LinearLayout(this);
+        b.setOrientation(LinearLayout.HORIZONTAL);
+        TextView save = redAction("Save logs", v -> saveLogs(false));
+        save.setTag("first");
+        b.addView(save, wrap());
+        LinearLayout.LayoutParams l2 = wrap();
+        l2.leftMargin = Ui.dp(this, 10);
+        b.addView(outlineAction("Share logs", v -> saveLogs(true)), l2);
+        LinearLayout.LayoutParams l3 = wrap();
+        l3.leftMargin = Ui.dp(this, 10);
+        b.addView(outlineAction("Clear logs", v -> {
+            Logs.clear(this);
+            Toast.makeText(this, "Logs cleared", Toast.LENGTH_SHORT).show();
+            build();
+        }), l3);
+        p.addView(b);
+        String tail = Logs.tail(this, 10);
+        TextView last = Ui.body(this, tail.isEmpty() ? "No game log yet." : tail, 10.5f, Ui.GREY);
         last.setTypeface(android.graphics.Typeface.MONOSPACE);
-        last.setMaxWidth(Math.round(getResources().getDisplayMetrics().widthPixels * 0.55f));
-        last.setPadding(Ui.dp(this, 10), Ui.dp(this, 8), Ui.dp(this, 10), Ui.dp(this, 8));
-        last.setBackground(Ui.rect(0xB3000000, Ui.dp(this, 6)));
-        return last;
+        last.setPadding(Ui.dp(this, 12), Ui.dp(this, 10), Ui.dp(this, 12), Ui.dp(this, 10));
+        last.setBackground(Ui.rect(0xB3000000, Ui.dp(this, 10)));
+        p.addView(last, gapTop(14));
+        content.addView(p, gapTop(14));
+    }
+
+    // --- Credits ---
+
+    private void creditsPage(LinearLayout content) {
+        TextView h = Ui.text(this, "CREDITS", 28, Ui.WHITE, Ui.bold());
+        h.setLetterSpacing(0.04f);
+        content.addView(h);
+        content.addView(Credits.card(this), gapTop(14));
+        LinearLayout thanks = new LinearLayout(this);
+        thanks.setOrientation(LinearLayout.VERTICAL);
+        Credits.addThanks(this, thanks);
+        content.addView(thanks);
+    }
+
+    private FrameLayout.LayoutParams matchParent() {
+        return new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
+    }
+
+    private LinearLayout.LayoutParams wrap() {
+        return new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
     }
 
     // --- Actions ---------------------------------------------------------------------------------------------------

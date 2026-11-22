@@ -210,9 +210,26 @@ cp thirdparty/libadrenotools/LICENSE "$AP/app/src/main/assets/LICENSE-libadrenot
 cp thirdparty/wwe2k14-recomp/LICENSE "$AP/app/src/main/assets/LICENSE-wwe2k14-recomp.txt" 2>/dev/null || true
 # Marks this APK as the native renderer build (the launcher reads it: Options > Renderer).
 echo "k14" > "$AP/app/src/main/assets/sdk.txt"
-if [ -f "$ROOT/BG.jpg" ]; then
-    mkdir -p "$AP/app/src/main/res/drawable-nodpi" && cp "$ROOT/BG.jpg" "$AP/app/src/main/res/drawable-nodpi/home_bg.jpg"
-fi
+# Home screen art: the repository's BG1.png, BG2.jpg, BG3.jpg and BG34-.jpg as home_bg1..4 (JPEG, at most 1920 wide,
+# so the APK stays small); the old single BG.jpg is no longer used.
+rm -f "$AP/app/src/main/res/drawable-nodpi/home_bg."* "$AP/app/src/main/res/drawable-nodpi/home_bg"[0-9].*
+mkdir -p "$AP/app/src/main/res/drawable-nodpi"
+python3 -c "import PIL" 2>/dev/null || python3 -m pip install --user -q pillow 2>/dev/null || python3 -m pip install --user -q --break-system-packages pillow 2>/dev/null || true
+n=0
+for pair in "BG1.png:home_bg1" "BG2.jpg:home_bg2" "BG3.jpg:home_bg3" "BG34-.jpg:home_bg4"; do
+    src="$ROOT/${pair%%:*}"; dst="$AP/app/src/main/res/drawable-nodpi/${pair##*:}.jpg"
+    [ -f "$src" ] || continue
+    python3 - "$src" "$dst" <<'PY' 2>/dev/null || cp "$src" "${dst%.jpg}.${src##*.}"
+import sys
+from PIL import Image
+im = Image.open(sys.argv[1]).convert("RGB")
+if im.width > 1920:
+    im = im.resize((1920, round(im.height * 1920 / im.width)), Image.LANCZOS)
+im.save(sys.argv[2], "JPEG", quality=88, optimize=True)
+PY
+    n=$((n + 1))
+done
+echo "home screen art: $n picture(s)"
 if [ -f "$ROOT/APP_ICON.jpg" ]; then
     python3 -c "import PIL" 2>/dev/null || python3 -m pip install --user -q pillow 2>/dev/null || python3 -m pip install --user -q --break-system-packages pillow
     python3 - "$ROOT/APP_ICON.jpg" "$AP/app/src/main/res" <<'PY'
