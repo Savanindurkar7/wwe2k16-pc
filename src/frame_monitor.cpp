@@ -221,14 +221,17 @@ std::vector<int> ListThreads() {
   return tids;
 }
 
-// One sample: CPU used by each thread over `window`, busiest first.
-void SampleThreads(uint64_t stall_ms, int sample_index) {
+// One sample: CPU used by each thread over `window_ms`, busiest first. stall_ms 0 = the performance log's periodic
+// sample (WWE2K16_THREAD_PROFILE=1): logged as [wwe2k16-threads] with the frame rate of the window.
+void SampleThreads(uint64_t stall_ms, int sample_index, int window_ms = 100) {
+  const uint64_t frames_before = g_frame_count.load(std::memory_order_relaxed);
   std::map<int, ThreadStat> before;
   for (int tid : ListThreads()) {
     ThreadStat s;
     if (ReadThreadStat(tid, s)) before[tid] = s;
   }
-  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  std::this_thread::sleep_for(std::chrono::milliseconds(window_ms));
+  const uint64_t frames = g_frame_count.load(std::memory_order_relaxed) - frames_before;
   struct Row {
     int tid;
     ThreadStat stat;
@@ -244,13 +247,20 @@ void SampleThreads(uint64_t stall_ms, int sample_index) {
   const long hz = sysconf(_SC_CLK_TCK) > 0 ? sysconf(_SC_CLK_TCK) : 100;
   std::string busy;
   int shown = 0;
+  const int show_max = stall_ms ? 8 : 10;
   for (const Row& r : rows) {
-    if (shown >= 8) break;
+    if (shown >= show_max) break;
     if (r.ticks == 0 && shown >= 3) break;
-    busy += fmt::format(" | {}({}) {} {}%{}{}", r.stat.name, r.tid, r.stat.state, r.ticks * 1000 / hz / 1,
+    busy += fmt::format(" | {}({}) {} {}%{}{}", r.stat.name, r.tid, r.stat.state,
+                        r.ticks * 1000 / hz * 100 / uint64_t(window_ms),
                         r.stat.wchan.empty() || r.stat.wchan == "0" ? "" : " wait:",
                         r.stat.wchan == "0" ? "" : r.stat.wchan);
     ++shown;
+  }
+  if (!stall_ms) {
+    REXLOG_INFO("[wwe2k16-threads] {:.1f} fps over {} ms; CPU % of one core per thread:{}",
+                frames * 1000.0 / window_ms, window_ms, busy);
+    return;
   }
   const Totals t = ReadTotals();
   REXLOG_INFO("[wwe2k16-stall] no frame for {} ms (sample {}): pipelines {} ({} ms), textures {} ({} ms), "
@@ -353,6 +363,9 @@ void WatchdogMain() {
   pinning.Init();
   int stall_samples = 0;
   uint64_t last_pin_ns = 0;
+  uint64_t last_profile_ns = 0;
+  const char* profile_env = Env("WWE2K16_THREAD_PROFILE");
+  const bool profile = profile_env && profile_env[0] == '1';
 #endif
   std::unique_lock<std::mutex> lock(g_watchdog_mutex);
   while (!g_watchdog_stop) {
@@ -371,6 +384,13 @@ void WatchdogMain() {
       if (stall_samples < 20) SampleThreads((now - last) / 1'000'000, ++stall_samples);
     } else {
       stall_samples = 0;
+      // Performance log: every 5 s while the game presents, each thread's CPU over 1 s (is a thread at 100 %, i.e.
+      // the frame rate limited by the CPU, or is the GPU the limit?).
+      if (profile && last && g_frame_count.load(std::memory_order_relaxed) > 600 &&
+          now - last_profile_ns > 5'000'000'000ull) {
+        last_profile_ns = now;
+        SampleThreads(0, 0, 1000);
+      }
     }
 #endif
     lock.lock();

@@ -267,6 +267,13 @@ public final class Settings {
               + "(phone test A, 2026-11-21). No effect with the phone's own driver.",
               "Turnip's normal compiler: a little faster, but the skin spike glitch comes back. Only for testing."));
 
+    public static final Choice PERF_LOG = new Choice(S_ADVANCED, "perf_log", "PERFORMANCE LOG", 1,
+            a("on", "off"),
+            a("ON", "OFF"),
+            a("For finding what limits the frame rate: every few seconds the log gets each thread's CPU use and the "
+              + "GPU time of the scene. Costs 1-2 FPS. Send the logs after a match.",
+              "No extra measuring."));
+
     public static final Choice VK_DEBUG = new Choice(S_ADVANCED, "vk_debug", "VULKAN DEBUG MESSAGES", 1,
             a("1", "0"),
             a("ON", "OFF"),
@@ -278,7 +285,7 @@ public final class Settings {
             DISPLAY, SCREEN_SHAPE, VSYNC, SHARPNESS,
             CPU_CORES, SPEED_FIX, SHADER_CACHE, FRAME_MONITOR, PERF_HINT, SUSTAINED,
             TOUCH, TOUCH_VIBRATE, RUMBLE,
-            READBACK, SHORTCUTS, TURNIP_FIX, VK_DEBUG,
+            READBACK, SHORTCUTS, TURNIP_FIX, PERF_LOG, VK_DEBUG,
     };
 
     public static final String KEY_EXTRA_ARGS = "extra_args";
@@ -370,6 +377,10 @@ public final class Settings {
             l.env.put("WWE2K16_RENDERER", renderer);
             l.env.put("WWE2K16_NATIVE_SHORTCUTS", "all".equals(SHORTCUTS.value(p)) ? "1" : "0");
             l.env.put("WWE2K16_PASS_TRIM", "on".equals(PASS_TRIM.value(p)) ? "1" : "0");
+            if ("on".equals(PERF_LOG.value(p))) {
+                l.env.put("WWE2K16_THREAD_PROFILE", "1");
+                cvar(l, "gpu_native_gpu_timers", "true");
+            }
             // SDK scene levers from the WWE 2K14 port (keyed on shader hashes that 2K16 shares: its crowd draws are the
             // same three crowd shaders, the census shows).
             String crowd = CROWD.value(p);
