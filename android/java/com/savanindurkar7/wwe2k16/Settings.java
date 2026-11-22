@@ -267,6 +267,21 @@ public final class Settings {
               + "(phone test A, 2026-11-21). No effect with the phone's own driver.",
               "Turnip's normal compiler: a little faster, but the skin spike glitch comes back. Only for testing."));
 
+    public static final Choice CP_FAST = new Choice(S_ADVANCED, "cp_fast", "CPU FAST PATH", 0,
+            a("on", "off"),
+            a("ON (FAST)", "OFF"),
+            a("Native APK: the WWE 2K14 port's command-processor speed-ups (texture and constant bindings reused, "
+              + "unchanged uploads and texture requests skipped, register writes in bulk). The GPU command thread is "
+              + "one of the two threads limiting the frame rate on phones. If anything looks wrong, try OFF.",
+              "Native APK: without those speed-ups (as in r12)."));
+
+    public static final Choice NATIVE_FRAME = new Choice(S_ADVANCED, "native_frame", "NATIVE FRAME", 1,
+            a("on", "off"),
+            a("ON (TEST)", "OFF"),
+            a("Native APK, test: the GPU command thread answers the game at once and draws behind it, so the game "
+              + "does not wait for the drawing. From the WWE 2K14 port; untested on 2K16 (may crash or glitch).",
+              "Native APK: answers and drawing together (normal)."));
+
     public static final Choice PERF_LOG = new Choice(S_ADVANCED, "perf_log", "PERFORMANCE LOG", 1,
             a("on", "off"),
             a("ON", "OFF"),
@@ -285,7 +300,7 @@ public final class Settings {
             DISPLAY, SCREEN_SHAPE, VSYNC, SHARPNESS,
             CPU_CORES, SPEED_FIX, SHADER_CACHE, FRAME_MONITOR, PERF_HINT, SUSTAINED,
             TOUCH, TOUCH_VIBRATE, RUMBLE,
-            READBACK, SHORTCUTS, TURNIP_FIX, PERF_LOG, VK_DEBUG,
+            READBACK, SHORTCUTS, CP_FAST, NATIVE_FRAME, TURNIP_FIX, PERF_LOG, VK_DEBUG,
     };
 
     public static final String KEY_EXTRA_ARGS = "extra_args";
@@ -377,6 +392,8 @@ public final class Settings {
             l.env.put("WWE2K16_RENDERER", renderer);
             l.env.put("WWE2K16_NATIVE_SHORTCUTS", "all".equals(SHORTCUTS.value(p)) ? "1" : "0");
             l.env.put("WWE2K16_PASS_TRIM", "on".equals(PASS_TRIM.value(p)) ? "1" : "0");
+            l.env.put("WWE2K16_CP_FAST", "on".equals(CP_FAST.value(p)) ? "1" : "0");
+            l.env.put("WWE2K16_NATIVE_FRAME", "on".equals(NATIVE_FRAME.value(p)) ? "1" : "0");
             if ("on".equals(PERF_LOG.value(p))) {
                 l.env.put("WWE2K16_THREAD_PROFILE", "1");
                 cvar(l, "gpu_native_gpu_timers", "true");

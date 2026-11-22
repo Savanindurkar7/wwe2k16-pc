@@ -165,6 +165,34 @@ const std::vector<Flag> kPassTrim = {
     {"gpu_scene_crowd_cull", "2"},
 };
 
+// Command-processor fast path (WWE2K16_CP_FAST=1, Options > Advanced > CPU fast path, on by default): the WWE 2K14
+// port's Session 6 / 7 defaults (its wwe2k14_app.h, "CP work per frame -38% in the heavy stretch, -32% in the match",
+// each shadow-compared against the slow path with no difference). They live in 2K14's app, not in the SDK's defaults,
+// so this port never had them. The performance log (2026-11-22) showed why they matter here: in a match the game's
+// main thread (~65%) and the GPU command thread (~60%) take turns, the GPU itself needs only ~8.7 ms of a ~24 ms
+// frame - the GPU command thread's work per draw is on the critical path.
+const std::vector<Flag> kCpFast = {
+    {"gpu_type0_bulk_writes", "true"},                // CP1: register ranges written in bulk
+    {"gpu_type0_block_split", "true"},                // CP1B: mixed ranges split
+    {"gpu_request_ranges_fast", "true"},              // CP2: no allocation, lock-free check per range
+    {"vulkan_reuse_texture_bindings", "true"},        // CP5: texture descriptor sets reused when unchanged
+    {"vulkan_sampler_param_cache", "true"},           // CP6: sampler parameters cached
+    {"vulkan_constants_dynamic_offsets", "true"},     // CP7: constant buffers by dynamic offset (no set per draw)
+    {"vulkan_viewport_info_cache", "true"},           // viewport info cached
+    {"vulkan_async_swap", "true"},                    // no drain of the GPU at the swap
+    {"vulkan_pipeline_no_submit_wait", "true"},       // no wait on background pipeline compiles
+    {"gpu_request_textures_skip_unchanged", "true"},  // TEXREQ: unchanged texture requests skipped
+    {"gpu_upload_skip_unchanged", "true"},            // UPSKIP: pages whose bytes equal the GPU copy not re-uploaded
+};
+
+// The native frame (WWE2K16_NATIVE_FRAME=1, Options > Advanced, test): the command processor answers the game
+// (fences, waits) without drawing, a drawing side runs the same commands behind it - so the game's thread does not
+// wait for the drawing. The 2K14 port's own frame (its native_frame.h); untested on 2K16.
+const std::vector<Flag> kNativeFrame = {
+    {"gpu_native_frame", "true"},
+    {"gpu_native_frame_answers_lean", "true"},
+};
+
 // A value from the launcher's extra arguments (or the command line) wins: only settings still at default are set.
 int Apply(const std::vector<Flag>& flags) {
   int set = 0;
@@ -205,6 +233,14 @@ void Apply() {
   const char* shortcuts = std::getenv("WWE2K16_NATIVE_SHORTCUTS");
   const bool with_shortcuts = shortcuts && shortcuts[0] == '1' && profile != "classic";
   if (with_shortcuts) set += Apply(kShortcuts);
+  if (const char* cp = std::getenv("WWE2K16_CP_FAST"); cp && cp[0] == '1' && profile != "classic") {
+    set += Apply(kCpFast);
+    REXLOG_INFO("[wwe2k16-renderer] CPU fast path on ({} settings from the 2K14 port's Sessions 6 / 7)", kCpFast.size());
+  }
+  if (const char* nf = std::getenv("WWE2K16_NATIVE_FRAME"); nf && nf[0] == '1' && profile != "classic") {
+    set += Apply(kNativeFrame);
+    REXLOG_INFO("[wwe2k16-renderer] native frame on (answers and drawing apart)");
+  }
   const char* trim = std::getenv("WWE2K16_PASS_TRIM");
   const bool with_trim = trim && trim[0] == '1' && profile != "classic";
   if (with_trim) {
