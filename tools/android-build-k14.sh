@@ -222,6 +222,8 @@ cp -r "$ROOT/android/res/." "$AP/app/src/main/res/"
 mkdir -p "$AP/app/src/main/assets" && cp "$ROOT/android/licenses/"* "$AP/app/src/main/assets/"
 cp thirdparty/libadrenotools/LICENSE "$AP/app/src/main/assets/LICENSE-libadrenotools.txt" 2>/dev/null || true
 cp thirdparty/wwe2k14-recomp/LICENSE "$AP/app/src/main/assets/LICENSE-wwe2k14-recomp.txt" 2>/dev/null || true
+# Built-in GPU drivers (r17): Mesa Turnip for Adreno, malisx2 (PanVK) for Mali, from their GitHub releases.
+bash "$ROOT/tools/fetch-drivers.sh" "$AP/app/src/main/assets" || echo "  WARNING: built-in drivers not staged"
 # Marks this APK as the native renderer build (the launcher reads it: Options > Renderer).
 echo "k14" > "$AP/app/src/main/assets/sdk.txt"
 # Home screen art: the repository's BG1.png, BG2.jpg, BG3.jpg and BG34-.jpg as home_bg1..4 (JPEG, at most 1920 wide,
@@ -287,6 +289,7 @@ LISTING="$(unzip -l "$APK")"
 awk '/lib\//{print "  " $4 "  (" $1 " bytes)"}' <<<"$LISTING"
 for l in "$JNI"/*.so; do grep -q "lib/arm64-v8a/$(basename "$l")" <<<"$LISTING" || die "$(basename "$l") is missing from the APK"; done
 grep -q "assets/sdk.txt" <<<"$LISTING" || die "assets/sdk.txt is missing from the APK"
+echo "  built-in drivers: $(grep -c "assets/drivers/.*\.zip" <<<"$LISTING" || true)"
 "$ASDK/build-tools/35.0.0/aapt2" dump badging "$APK" 2>/dev/null | grep -E "^package:|^application-label:" | sed 's/^/  /' || true
 "$ASDK/build-tools/35.0.0/apksigner" verify "$APK" && echo "  signature ok"
 echo

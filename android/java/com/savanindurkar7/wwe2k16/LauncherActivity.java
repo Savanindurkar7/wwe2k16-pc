@@ -2,6 +2,7 @@ package com.savanindurkar7.wwe2k16;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
@@ -40,6 +41,7 @@ public class LauncherActivity extends Activity {
     private static final int REQ_FOLDER = 11;
     private static final int REQ_ISO = 12;
     private static final int REQ_LEGACY_STORAGE = 13;
+    private static final int REQ_DLC = 14;
 
     private Runnable afterPermission;
     private String page = "home";
@@ -53,6 +55,35 @@ public class LauncherActivity extends Activity {
         Ui.init(this);
         checkDriverTrial();
         build();
+        prepareDrivers();
+    }
+
+    /**
+     * r17: reads the GPU name once (Gpu) and unpacks the APK's built-in drivers (first start of each APK version), off
+     * the UI thread. On an Adreno phone that never picked a driver, the built-in Turnip for its GPU is selected once.
+     */
+    private void prepareDrivers() {
+        new Thread(() -> {
+            Gpu.renderer(this);
+            int unpacked = Drivers.installBundled(this);
+            SharedPreferences prefs = Settings.prefs(this);
+            boolean chose = false;
+            if (!prefs.getBoolean("driver_auto_done", false)) {
+                prefs.edit().putBoolean("driver_auto_done", true).apply();
+                Drivers.Driver rec = Drivers.recommended(this);
+                if (rec != null && prefs.getString(Settings.KEY_DRIVER, "").isEmpty()) {
+                    prefs.edit().putString(Settings.KEY_DRIVER, rec.name).apply();
+                    chose = true;
+                }
+            }
+            final boolean selected = chose;
+            final String name = selected ? prefs.getString(Settings.KEY_DRIVER, "") : "";
+            if (unpacked > 0 || selected) handler.post(() -> {
+                if (selected) Toast.makeText(this, "Built-in driver \"" + name + "\" selected for your GPU "
+                        + "(Settings > GPU driver)", Toast.LENGTH_LONG).show();
+                build();
+            });
+        }, "prepare-drivers").start();
     }
 
     @Override
@@ -96,6 +127,7 @@ public class LauncherActivity extends Activity {
     // over the dimmed wrestler art (BG1.png, BG2.jpg, BG3.jpg, BG34-.jpg from the repository, packed by the build):
     //   home     the hero card (art slideshow, WWE 2K16, chips, PLAY) and QUICK SETUP (Graphics, Controls)
     //   files    game files status, install location (folder / ISO / verify), shader cache
+    //   dlc      DLC packages: add (copied in, installed when the game starts), installed / waiting / failed lists
     //   logs     save / share / clear, the last lines of the log
     //   credits  the porter's card with the links, then everyone else's work
     // Graphics, Controls and Settings open OPTIONS at that section.
@@ -154,6 +186,7 @@ public class LauncherActivity extends Activity {
         content.setPadding(pad, Ui.dp(this, 14), pad, Ui.dp(this, 16));
         content.addView(topBar());
         if ("files".equals(page)) filesPage(content);
+        else if ("dlc".equals(page)) dlcPage(content);
         else if ("logs".equals(page)) logsPage(content);
         else if ("credits".equals(page)) creditsPage(content);
         else homePage(content);
@@ -569,6 +602,121 @@ public class LauncherActivity extends Activity {
         return total;
     }
 
+    // --- DLC (r17) ---
+
+    private void dlcPage(LinearLayout content) {
+        content.addView(banner("DLC", "Add Xbox 360 DLC packages: they install when you press PLAY", 2));
+        LinearLayout p = panel();
+        TextView how = Ui.body(this, "Pick the DLC files themselves (Xbox 360 content packages: LIVE / PIRS / CON, "
+                + "usually a long hex name with no extension, from a console's Content/0000000000000000/" + Dlc.TITLE_ID
+                + "/00000002 folder or a backup). They are copied into the app and unpacked the next time the game "
+                + "starts (that start takes a little longer). Only DLC for WWE 2K16 (" + Dlc.TITLE_ID + ") works.",
+                13, 0xFFE0E0E4);
+        p.addView(how);
+        LinearLayout b = new LinearLayout(this);
+        b.setOrientation(LinearLayout.HORIZONTAL);
+        TextView add = redAction("Add DLC files", v -> {
+            Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+            i.addCategory(Intent.CATEGORY_OPENABLE);
+            i.setType("*/*");
+            i.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+            startActivityForResult(i, REQ_DLC);
+        });
+        add.setTag("first");
+        b.addView(add, wrap());
+        p.addView(b, gapTop(12));
+        content.addView(p, gapTop(14));
+
+        java.util.List<Dlc.Item> waiting = Dlc.waiting(this);
+        java.util.List<Dlc.Item> installed = Dlc.installed(this);
+        java.util.List<String> results = Dlc.results(this);
+        if (!waiting.isEmpty()) {
+            LinearLayout w = panel();
+            w.addView(Ui.text(this, "WAITING · installs at the next PLAY", 15, Ui.WHITE, Ui.bold()));
+            for (Dlc.Item it : waiting) w.addView(dlcRow(it, "Remove", () -> Dlc.delete(this, it)), gapTop(8));
+            content.addView(w, gapTop(12));
+        }
+        LinearLayout inst = panel();
+        inst.addView(Ui.text(this, "INSTALLED (" + installed.size() + ")", 15, Ui.WHITE, Ui.bold()));
+        if (installed.isEmpty()) {
+            inst.addView(Ui.body(this, "No DLC installed yet.", 13, Ui.GREY), gapTop(6));
+        }
+        for (Dlc.Item it : installed) {
+            inst.addView(dlcRow(it, "Delete", () -> Dlc.delete(this, it)), gapTop(8));
+        }
+        content.addView(inst, gapTop(12));
+        if (!results.isEmpty()) {
+            LinearLayout r = panel();
+            r.addView(Ui.text(this, "LAST INSTALLS", 15, Ui.WHITE, Ui.bold()));
+            StringBuilder sb = new StringBuilder();
+            for (String line : results) sb.append(line).append('\n');
+            TextView t = Ui.body(this, sb.toString().trim(), 11.5f, Ui.GREY);
+            t.setTypeface(android.graphics.Typeface.MONOSPACE);
+            r.addView(t, gapTop(6));
+            LinearLayout.LayoutParams lp = wrap();
+            lp.topMargin = Ui.dp(this, 10);
+            r.addView(outlineAction("Clear list", v -> {
+                Dlc.clearResults(this);
+                build();
+            }), lp);
+            content.addView(r, gapTop(12));
+        }
+    }
+
+    private View dlcRow(Dlc.Item it, String action, Runnable remove) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(Ui.dp(this, 12), Ui.dp(this, 8), Ui.dp(this, 8), Ui.dp(this, 8));
+        row.setBackground(Ui.rect(0x66000000, Ui.dp(this, 10)));
+        LinearLayout texts = new LinearLayout(this);
+        texts.setOrientation(LinearLayout.VERTICAL);
+        TextView title = Ui.text(this, it.title, 15, Ui.WHITE, Ui.semi());
+        title.setMaxLines(1);
+        title.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        texts.addView(title);
+        TextView sub = Ui.text(this, (it.title.equals(it.name) ? "" : it.name + " · ") + Dlc.formatSize(it.bytes), 11.5f,
+                Ui.GREY, Ui.regular());
+        sub.setMaxLines(1);
+        sub.setEllipsize(android.text.TextUtils.TruncateAt.MIDDLE);
+        texts.addView(sub);
+        row.addView(texts, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        row.addView(Ui.smallButton(this, action, false, v -> new AlertDialog.Builder(this)
+                .setTitle(action + " " + it.title + "?")
+                .setPositiveButton(action, (d, w) -> {
+                    remove.run();
+                    build();
+                })
+                .setNegativeButton("Cancel", null)
+                .show()));
+        return row;
+    }
+
+    private void addDlc(java.util.List<Uri> uris) {
+        Toast.makeText(this, "Copying " + uris.size() + " DLC file(s)…", Toast.LENGTH_SHORT).show();
+        new Thread(() -> {
+            int ok = 0;
+            StringBuilder errors = new StringBuilder();
+            for (Uri u : uris) {
+                try {
+                    Dlc.add(this, u);
+                    ok++;
+                } catch (IOException e) {
+                    errors.append(e.getMessage()).append('\n');
+                }
+            }
+            final int added = ok;
+            final String err = errors.toString().trim();
+            handler.post(() -> {
+                if (added > 0) Toast.makeText(this, added + " DLC file(s) added: they install when you press PLAY",
+                        Toast.LENGTH_LONG).show();
+                if (!err.isEmpty()) new AlertDialog.Builder(this).setTitle("Some files were not added")
+                        .setMessage(err).setPositiveButton("OK", null).show();
+                build();
+            });
+        }, "add-dlc").start();
+    }
+
     // --- Logs ---
 
     private void logsPage(LinearLayout content) {
@@ -710,6 +858,16 @@ public class LauncherActivity extends Activity {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQ_DLC && resultCode == RESULT_OK && data != null) {
+            java.util.List<Uri> uris = new java.util.ArrayList<>();
+            if (data.getClipData() != null) {
+                for (int i = 0; i < data.getClipData().getItemCount(); i++) uris.add(data.getClipData().getItemAt(i).getUri());
+            } else if (data.getData() != null) {
+                uris.add(data.getData());
+            }
+            if (!uris.isEmpty()) addDlc(uris);
+            return;
+        }
         if (resultCode != RESULT_OK || data == null || data.getData() == null) return;
         Uri uri = data.getData();
         String path, problem, kind;

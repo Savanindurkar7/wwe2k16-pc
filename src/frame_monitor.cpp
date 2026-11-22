@@ -221,6 +221,50 @@ std::vector<int> ListThreads() {
   return tids;
 }
 
+// The GPU's own load, from the kernel driver's files when the phone lets an app read them (r17): Adreno (kgsl),
+// MediaTek Mali (GED), Exynos / Tensor Mali. Tells a GPU-limited frame rate (load near 100%) from a CPU-limited one.
+// Empty when none is readable (SELinux): the log line then has no GPU part.
+std::string ReadFirstLine(const char* path) {
+  std::ifstream in(path);
+  std::string line;
+  if (in) std::getline(in, line);
+  return line;
+}
+
+std::string GpuLoadText() {
+  struct Source {
+    const char* label;
+    const char* path;
+  };
+  static const Source kLoad[] = {
+      {"kgsl busy", "/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage"},
+      {"ged loading/idle/block", "/sys/kernel/ged/hal/gpu_utilization"},
+      {"mali utilization", "/sys/class/misc/mali0/device/utilization"},
+      {"gpu busy", "/sys/kernel/gpu/gpu_busy"},
+  };
+  static const Source kFreq[] = {
+      {"kgsl clock", "/sys/class/kgsl/kgsl-3d0/gpuclk"},
+      {"ged freq", "/sys/kernel/ged/hal/current_freqency"},
+      {"gpu clock", "/sys/kernel/gpu/gpu_clock"},
+  };
+  std::string out;
+  for (const Source& s : kLoad) {
+    std::string v = ReadFirstLine(s.path);
+    if (!v.empty()) {
+      out += fmt::format(" || GPU {}: {}", s.label, v);
+      break;
+    }
+  }
+  for (const Source& s : kFreq) {
+    std::string v = ReadFirstLine(s.path);
+    if (!v.empty()) {
+      out += fmt::format(" ({}: {})", s.label, v);
+      break;
+    }
+  }
+  return out;
+}
+
 // One sample: CPU used by each thread over `window_ms`, busiest first. stall_ms 0 = the performance log's periodic
 // sample (WWE2K16_THREAD_PROFILE=1): logged as [wwe2k16-threads] with the frame rate of the window.
 void SampleThreads(uint64_t stall_ms, int sample_index, int window_ms = 100) {
@@ -258,8 +302,8 @@ void SampleThreads(uint64_t stall_ms, int sample_index, int window_ms = 100) {
     ++shown;
   }
   if (!stall_ms) {
-    REXLOG_INFO("[wwe2k16-threads] {:.1f} fps over {} ms; CPU % of one core per thread:{}",
-                frames * 1000.0 / window_ms, window_ms, busy);
+    REXLOG_INFO("[wwe2k16-threads] {:.1f} fps over {} ms; CPU % of one core per thread:{}{}",
+                frames * 1000.0 / window_ms, window_ms, busy, GpuLoadText());
     return;
   }
   const Totals t = ReadTotals();
@@ -370,7 +414,18 @@ struct Pinning {
     std::vector<int> chosen;
     for (auto& [ticks, tid] : busy) {
       if (chosen.size() >= 2 || ticks < min_ticks) break;
+      // (r17) Driver threads never get a game core: on Mali phones the driver's shader compiler ("mali-compiler") took
+      // the fastest core from the game's main thread for seconds at a time (Infinix X6871 logs, 2026-11-22).
+      ThreadStat st;
+      if (ReadThreadStat(tid, st) && st.name.rfind("mali-", 0) == 0) continue;
       chosen.push_back(tid);
+    }
+    // (r17) Sticky cores: a thread chosen at the last check keeps the core it had, so the two busiest threads do not
+    // swap the fastest core and the next one every few seconds when their order flips (each swap empties its caches).
+    if (chosen.size() == 2 && hot_tids.size() == 2 && chosen[0] == hot_tids[1] && chosen[1] == hot_tids[0]) {
+      std::swap(chosen[0], chosen[1]);
+    } else if (chosen.size() == 2 && hot_tids.size() >= 1 && chosen[1] == hot_tids[0]) {
+      std::swap(chosen[0], chosen[1]);
     }
     cpu_set_t rest;
     CPU_ZERO(&rest);

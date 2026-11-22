@@ -252,12 +252,39 @@ public final class Settings {
             a("The phone vibrates when the game rumbles the controller (hits, slams, finishers).",
               "No rumble on the phone."));
 
+    // r17: AUTO adds the attire latch on Mali and other non-Adreno GPUs: the game builds a wrestler's attire on the GPU
+    // (a 2048-wide copy) and compresses it on the CPU; on a phone whose frames run ahead of its loader the read-back
+    // window closed before that copy and the wrestler came out pink / magenta hatched (Infinix X6871, Mali-G610,
+    // 2026-11-22). The latch reads back every 2048-wide one-off copy, and the 1024-wide ones for 300 frames after it
+    // (WWE 2K14 port, Session 95, "the purple Savage"). Adreno keeps the old AUTO.
     public static final Choice READBACK = new Choice(S_ADVANCED, "readback", "CHARACTER TEXTURE FIX", 0,
-            a("auto", "always"),
-            a("AUTO", "ALWAYS EXACT"),
-            a("Native APK: exact GPU readback while wrestler textures are built (loads), off in play.",
-              "Native APK: exact readback all the time. Use it if a wrestler or attire shows noise or black / magenta "
-              + "patches; it costs speed."));
+            a("auto", "latch", "always"),
+            a("AUTO", "ATTIRE LATCH", "ALWAYS EXACT"),
+            a("Native APK: exact GPU readback while wrestler textures are built (loads), off in play. On Mali and other "
+              + "non-Adreno GPUs the attire latch is added (fixes the pink / magenta hatched wrestler).",
+              "Native APK: the attire latch on any GPU: every attire the game builds on the GPU is read back when it is "
+              + "built, wherever it lands. Almost free. Use it if one wrestler shows pink, magenta or black patches.",
+              "Native APK: exact readback all the time. The strongest fix for wrestler / attire noise; it costs speed."));
+
+    // r17: Mali profile (only on phones whose GPU is a Mali; nothing changes on Adreno). The WWE 2K14 port's phone
+    // switches that are off by default because they were not measured on every GPU: geometry shaders avoided (on Mali
+    // they are the second biggest GPU cost: the primitive types are expanded in the vertex shader instead), classic
+    // render passes for the tile-based GPU, and vertices read as real attributes.
+    public static final Choice MALI_BOOST = new Choice(S_ADVANCED, "mali_boost", "MALI BOOST", 0,
+            a("all", "nogs", "off"),
+            a("ON (MALI ONLY)", "NO GEOMETRY SHADERS ONLY", "OFF"),
+            a("Mali phones: geometry shaders avoided, classic render passes for the tile-based GPU and vertices read as "
+              + "real attributes (the WWE 2K14 port's phone switches). Faster on Mali; no effect on Adreno or others.",
+              "Mali phones: only the geometry shaders avoided (if ON shows a glitch, this is the safest half).",
+              "Mali phones: the renderer as before r17."));
+
+    public static final Choice MALI_TEXTURES = new Choice(S_ADVANCED, "mali_textures", "MALI TEXTURES", 0,
+            a("normal", "small"),
+            a("NORMAL", "SMALL (ASTC / EAC)"),
+            a("GPUs without the game's compressed formats (most Mali) get them unpacked to full size (4-8x the memory).",
+              "Those textures are converted to ASTC / EAC instead, which Mali reads directly: less memory and bandwidth "
+              + "(about +2 FPS in the Mali test), a little slower to load and slightly lossy. Only on GPUs that lack the "
+              + "formats: no effect on Adreno."));
 
     // (Key "native_shortcuts_v2": ON is the new default for everyone. The spikes blamed on these shortcuts were
     // Turnip's (fixed by the Turnip skin fix); phone test T3, 2026-11-22: ALL ran 38-47 FPS with no glitches.)
@@ -335,7 +362,7 @@ public final class Settings {
             DISPLAY, SCREEN_SHAPE, VSYNC, SHARPNESS,
             CPU_CORES, SPEED_FIX, SHADER_CACHE, FRAME_MONITOR, PERF_HINT, SUSTAINED,
             TOUCH, TOUCH_VIBRATE, RUMBLE,
-            READBACK, SHORTCUTS, CP_FAST, CROWD_CULL, HOT_CORES, GPU_WAIT, NATIVE_FRAME, TURNIP_FIX, PERF_LOG, VK_DEBUG,
+            READBACK, MALI_BOOST, MALI_TEXTURES, SHORTCUTS, CP_FAST, CROWD_CULL, HOT_CORES, GPU_WAIT, NATIVE_FRAME, TURNIP_FIX, PERF_LOG, VK_DEBUG,
     };
 
     public static final String KEY_EXTRA_ARGS = "extra_args";
@@ -504,10 +531,31 @@ public final class Settings {
         l.env.put("WWE2K16_LOG_DIR", logs.getAbsolutePath());
         l.env.put("WWE2K16_LOG_FILE", new File(logs, "wwe2k16.log").getAbsolutePath());
         cvar(l, "user_data_root", userDataDir(ctx).getAbsolutePath());
+        // r17: the phone's GPU family (Gpu: read from the phone's OpenGL ES driver) for the GPU-specific choices below.
+        final String gpuFamily = Gpu.family(ctx);
+        final boolean mali = Gpu.MALI.equals(gpuFamily);
+        l.env.put("WWE2K16_GPU_FAMILY", gpuFamily);
         if (nat) {
             // The 0.10 SDK names its log with --log_file (0.7 reads WWE2K16_LOG_FILE).
             cvar(l, "log_file", new File(logs, "wwe2k16.log").getAbsolutePath());
-            l.env.put("WWE2K16_READBACK_ALWAYS", "always".equals(READBACK.value(p)) ? "1" : "0");
+            String readback = READBACK.value(p);
+            l.env.put("WWE2K16_READBACK_ALWAYS", "always".equals(readback) ? "1" : "0");
+            if ("latch".equals(readback) || ("auto".equals(readback) && !Gpu.ADRENO.equals(gpuFamily))) {
+                cvar(l, "readback_resolve_attire_latch", "300");
+            }
+            if (mali) {
+                String boost = MALI_BOOST.value(p);
+                if (!"off".equals(boost)) cvar(l, "gpu_quirks_mobile_no_gs", "true");
+                if ("all".equals(boost)) {
+                    cvar(l, "gpu_quirks_tiler_classic_passes", "true");
+                    cvar(l, "gpu_quirks_vertex_input_phone", "true");
+                }
+            }
+            // ASTC / EAC instead of full-size RGBA8 (the SDK applies it only when the GPU lacks the BC formats).
+            if ("small".equals(MALI_TEXTURES.value(p))) {
+                cvar(l, "vulkan_texture_transcode", "true");
+                cvar(l, "vulkan_texture_transcode_eac", "true");
+            }
         }
 
         // Custom driver.
@@ -520,7 +568,9 @@ public final class Settings {
                 l.env.put("WWE2K16_DRIVER_DIR", d.dir.getAbsolutePath() + "/");
                 l.env.put("WWE2K16_DRIVER_TRIAL", Drivers.trialFile(ctx).getAbsolutePath());
                 // Turnip on newer Adrenos is steadier without its tile-based fast path.
-                l.env.put("TU_DEBUG", "sysmem");
+                if (d.isTurnip()) l.env.put("TU_DEBUG", "sysmem");
+                // malisx2 (Mesa PanVK on Mali) has no MSAA: the game's scene must be built 1x.
+                if (Gpu.MALI.equals(d.family) && nat) cvar(l, "wwe2k16_force_no_msaa", "true");
                 // Turnip skin fix: the bone matrices are read with an index known only while the shader runs; Turnip's
                 // copy of uniform buffers into the constant registers ("UBO optimisation") gets those wrong on the
                 // A8xx (spikes in close-ups). Without it: clean (test A, 2026-11-21).
@@ -559,6 +609,9 @@ public final class Settings {
         for (Choice c : CHOICES) l.summary.append(c.title).append(": ").append(c.labels[c.index(p)]).append('\n');
         l.summary.append("BUILD: ").append(nat ? "native (WWE 2K14 SDK)" : "classic (ReXGlue 0.7)").append('\n');
         l.summary.append("GPU DRIVER: ").append(driver.isEmpty() ? "System" : driver).append('\n');
+        l.summary.append("GPU: ").append(Gpu.renderer(ctx)).append(" (").append(gpuFamily).append(")\n");
+        l.summary.append("DLC: ").append(Dlc.installed(ctx).size()).append(" installed, ").append(Dlc.waiting(ctx).size())
+                .append(" waiting\n");
         l.summary.append("EXTRA ARGUMENTS: ").append(extra).append('\n');
         l.summary.append("GAME: ").append(game).append('\n');
         return l;

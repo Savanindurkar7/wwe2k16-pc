@@ -15,13 +15,13 @@ import android.widget.TextView;
 
 /**
  * The frame every launcher screen shares: the dimmed wrestler art and the sidebar (2K16 RECOMP, Home, Graphics,
- * Controls, Game files, Logs, Credits, the game files' status, Settings). The home pages (LauncherActivity) and the
+ * Controls, Game files, DLC, Logs, Credits, the game files' status, Settings). The home pages (LauncherActivity) and the
  * settings (OptionsActivity) both draw it, so moving between them looks like one screen: no new menu opens.
  */
 final class Shell {
     private Shell() {}
 
-    static final String HOME = "home", FILES = "files", LOGS = "logs", CREDITS = "credits";
+    static final String HOME = "home", FILES = "files", DLC = "dlc", LOGS = "logs", CREDITS = "credits";
     static final String GRAPHICS = "graphics", CONTROLS = "controls", SETTINGS = "settings";
     static final String EXTRA_PAGE = "page";
 
@@ -76,6 +76,7 @@ final class Shell {
         list.addView(item(a, "▣", "Graphics", GRAPHICS.equals(selected), v -> nav.go(GRAPHICS)));
         list.addView(item(a, "✚", "Controls", CONTROLS.equals(selected), v -> nav.go(CONTROLS)));
         list.addView(item(a, "▤", "Game files", FILES.equals(selected), v -> nav.go(FILES)));
+        list.addView(item(a, "✦", "DLC", DLC.equals(selected), v -> nav.go(DLC)));
         list.addView(rule(a), ruleLp(a, 8, 8));
         list.addView(item(a, "≡", "Logs", LOGS.equals(selected), v -> nav.go(LOGS)));
         list.addView(item(a, "★", "Credits", CREDITS.equals(selected), v -> nav.go(CREDITS)));

@@ -172,3 +172,37 @@ generation is on, so the command thread never waits on the swapchain.
   that made a game thread spin in r13.
 - **Crowd culling** (`gpu_scene_crowd_cull=2`, default on): crowd members outside the view are not drawn (exact).
 - **GPU thread waiting:** SPIN (default) or SLEEP (`gpu_wait_reg_mem_sleep_us=50`, test, less heat).
+
+### r17 (2026-11-22): Mali, built-in drivers, DLC
+
+Mali logs (Infinix X6871, Mali-G610 MC6, r54p1, System driver):
+- **Match FPS:** 29-35 at 480p with crowd 20%. The game's two busiest threads used about 90% and 70% of a core
+  (Cortex-A78) at 30 FPS. On the Adreno 810 phone the main game thread used about 74% at 58 FPS. ASTC / EAC textures
+  gave about +2 FPS.
+- **Pink / magenta hatched wrestler:** the game builds an attire on the GPU (a 2048-wide copy) and compresses it on the
+  CPU. On this phone the read-back window closed before that copy. CHARACTER TEXTURE FIX = AUTO now adds the 2K14
+  port's attire latch on every GPU that is not an Adreno (`readback_resolve_attire_latch=300`). The new ATTIRE LATCH
+  value does the same on any GPU.
+
+Changes:
+- **GPU family** (`Gpu.java`): GL_RENDERER from a 1x1 EGL context, cached per system build, passed to the game as
+  `WWE2K16_GPU_FAMILY`. Every Mali choice below applies only when the GPU is a Mali. Adreno launches get the same
+  arguments as r16; the only change there is the sticky cores below.
+- **MALI BOOST** (Advanced, ON): `gpu_quirks_mobile_no_gs`, `gpu_quirks_tiler_classic_passes`, `gpu_quirks_vertex_input_phone`.
+  NO GEOMETRY SHADERS ONLY = the first of these alone.
+- **MALI TEXTURES** (Advanced, NORMAL): SMALL = `vulkan_texture_transcode` + `_eac`.
+- **Busy threads on own cores:** threads named `mali-*` (the driver's shader compiler) are never pinned. On every GPU,
+  a thread chosen at the last check now keeps its core, so the two busiest threads no longer swap cores when their
+  order flips.
+- **Performance log:** `[wwe2k16-threads]` lines add the GPU load and clock when the kernel lets the app read them:
+  kgsl (Adreno), GED (MediaTek Mali), mali0 / gpu_busy (Exynos, Tensor).
+- **Built-in drivers** (`tools/fetch-drivers.sh`, run by step 6): the latest Banners-Turnip release (A6xx-A7xx, A8xx,
+  A710-A722) and malisx2 (Mesa PanVK for Mali, experimental), staged in `assets/drivers/` with `index.txt`. The
+  launcher unpacks them on the first start of each APK (`Drivers.installBundled`) and marks them BUILT-IN /
+  RECOMMENDED. An Adreno phone that never chose a driver gets the matching Turnip once. Pin a release with
+  `TURNIP_TAG=` / `MALISX2_TAG=`; `SKIP_DRIVERS=1` builds without them. Qualcomm's own drivers are not
+  redistributable, so players can still only import those.
+- **DLC** (sidebar > DLC, `Dlc.java`, `src/dlc_install.cpp`): picked packages (LIVE / PIRS / CON) are copied to
+  `userdata/dlc_import/`. Before the game's main thread runs, the SDK's `ContentManager::InstallContent` unpacks each
+  one to `userdata/0000000000000000/315A07D2/00000002/<name>/`, plus its header. The result of each install goes to
+  `dlc_import/result.txt` and `[wwe2k16-dlc]` log lines. `WWE2K16_DLC=0` turns installing off.

@@ -103,7 +103,7 @@ public class OptionsActivity extends Activity {
             case Settings.S_DISPLAY: return "How the picture is shown on your screen.";
             case Settings.S_PERFORMANCE: return "Frame rate helpers, CPU cores and the frame monitor.";
             case Settings.S_CONTROLS: return "Touch controls, vibration and rumble.";
-            case Settings.S_DRIVER: return "The Vulkan driver the game uses: the phone's own or an imported Turnip.";
+            case Settings.S_DRIVER: return "The Vulkan driver the game uses: the phone's own, a built-in one or one you import.";
             case Settings.S_ADVANCED: return "Renderer switches for testing, logs and extra arguments.";
             default: return "";
         }
@@ -287,13 +287,27 @@ public class OptionsActivity extends Activity {
     private void addDriverRows(LinearLayout p, SharedPreferences prefs) {
         int gap = Ui.dp(this, 8);
         String current = prefs.getString(Settings.KEY_DRIVER, "");
-        TextView info = Ui.body(this, "Custom Vulkan drivers (Turnip) can be faster on Snapdragon (Adreno) phones. "
-                + "Import a driver zip in the adrenotools format, e.g. from Banners-Turnip or K11MCH1/AdrenoToolsDrivers on "
-                + "GitHub. Pick the build for your GPU (A6xx/A7xx, or A8xx for Adreno 8xx). Mali phones (MediaTek, Exynos) "
-                + "keep the System driver. If a driver crashes the game, the launcher switches back to System by itself.\n\n"
-                + "Measured on an Adreno 810 (Nothing Phone 3a): Turnip A8xx gave about 19 FPS in a match against 6 to 11 "
-                + "FPS with the System driver, but it builds shaders more slowly, so the first match stutters more.",
-                12.5f, Ui.GREY);
+        String family = Gpu.family(this);
+        String renderer = Gpu.renderer(this);
+        Drivers.Driver recommended = Drivers.recommended(this);
+        String phone = renderer.isEmpty() ? "Your GPU could not be read" : "Your GPU: " + renderer;
+        String advice;
+        if (Gpu.ADRENO.equals(family)) {
+            advice = recommended != null
+                    ? "Recommended: " + recommended.name + " (built in). Turnip is usually much faster than the System "
+                    + "driver on Adreno (about 20 FPS more on an Adreno 810)."
+                    : "Turnip drivers are usually faster on Adreno. Pick the built-in one for your GPU generation.";
+        } else if (Gpu.MALI.equals(family)) {
+            advice = "Mali phones normally use the System driver. The built-in malisx2 (Mesa PanVK for Mali) is an "
+                    + "EXPERIMENTAL open driver: it may be faster (it can read the game's compressed textures directly), "
+                    + "or it may not start, show glitches or crash. Try it once; if the game ends early the launcher "
+                    + "goes back to the System driver by itself.";
+        } else {
+            advice = "Keep the System driver unless you know a custom driver for your GPU.";
+        }
+        TextView info = Ui.body(this, phone + ".\n" + advice + "\n\nBUILT-IN drivers come with the app. You can still "
+                + "import any adrenotools driver zip (meta.json + libvulkan_*.so). If a driver crashes the game, the "
+                + "launcher switches back to System by itself.", 12.5f, Ui.GREY);
         info.setPadding(0, Ui.dp(this, 4), 0, Ui.dp(this, 6));
         p.addView(info);
 
@@ -301,21 +315,43 @@ public class OptionsActivity extends Activity {
             prefs.edit().putString(Settings.KEY_DRIVER, "").apply();
             build();
         }, null), Ui.fill(gap));
-        for (Drivers.Driver d : Drivers.list(this)) {
-            p.addView(driverRow(d.name, d.library + (d.description.isEmpty() ? "" : " · " + d.description),
-                    d.name.equals(current), v -> {
-                        prefs.edit().putString(Settings.KEY_DRIVER, d.name).apply();
-                        build();
-                    }, v -> new AlertDialog.Builder(this)
-                            .setTitle("Delete " + d.name + "?")
-                            .setPositiveButton("Delete", (dlg, w) -> {
-                                Drivers.delete(this, d.name);
-                                if (d.name.equals(prefs.getString(Settings.KEY_DRIVER, "")))
-                                    prefs.edit().putString(Settings.KEY_DRIVER, "").apply();
+        java.util.List<Drivers.Driver> drivers = Drivers.list(this);
+        // Built-in first: the recommended one, then those for this GPU family, then the rest; imported after.
+        java.util.Collections.sort(drivers, (x, y) -> Integer.compare(rank(x, recommended), rank(y, recommended)));
+        for (Drivers.Driver d : drivers) {
+            StringBuilder detail = new StringBuilder();
+            if (d.bundled) detail.append("BUILT-IN · ");
+            if (recommended != null && d.name.equals(recommended.name)) detail.append("RECOMMENDED FOR YOUR GPU · ");
+            if (Drivers.wrongFamily(this, d)) detail.append("NOT FOR YOUR GPU · ");
+            detail.append(d.note.isEmpty() ? d.library : d.note);
+            if (!d.description.isEmpty()) detail.append(" · ").append(d.description);
+            p.addView(driverRow(d.name, detail.toString(), d.name.equals(current), v -> {
+                if (Drivers.wrongFamily(this, d)) {
+                    new AlertDialog.Builder(this)
+                            .setTitle(d.name)
+                            .setMessage("This driver is made for " + d.family.toUpperCase(java.util.Locale.ROOT)
+                                    + " GPUs and your phone has " + (renderer.isEmpty() ? "another GPU" : renderer)
+                                    + ". It will most likely not start (the game then uses the System driver).")
+                            .setPositiveButton("Use anyway", (dlg, w) -> {
+                                prefs.edit().putString(Settings.KEY_DRIVER, d.name).apply();
                                 build();
                             })
                             .setNegativeButton("Cancel", null)
-                            .show()), Ui.fill(gap));
+                            .show();
+                    return;
+                }
+                prefs.edit().putString(Settings.KEY_DRIVER, d.name).apply();
+                build();
+            }, d.bundled ? null : v -> new AlertDialog.Builder(this)
+                    .setTitle("Delete " + d.name + "?")
+                    .setPositiveButton("Delete", (dlg, w) -> {
+                        Drivers.delete(this, d.name);
+                        if (d.name.equals(prefs.getString(Settings.KEY_DRIVER, "")))
+                            prefs.edit().putString(Settings.KEY_DRIVER, "").apply();
+                        build();
+                    })
+                    .setNegativeButton("Cancel", null)
+                    .show()), Ui.fill(gap));
         }
         p.addView(Ui.menuButton(this, "Import driver (.zip)", "Choose a Turnip / adrenotools driver zip", true, v -> {
             Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
@@ -323,6 +359,13 @@ public class OptionsActivity extends Activity {
             i.setType("*/*");
             startActivityForResult(i, REQ_DRIVER_ZIP);
         }), Ui.fill(Ui.dp(this, 14)));
+    }
+
+    private int rank(Drivers.Driver d, Drivers.Driver recommended) {
+        if (recommended != null && d.name.equals(recommended.name)) return 0;
+        if (d.bundled && !Drivers.wrongFamily(this, d)) return 1;
+        if (d.bundled) return 3;
+        return 2;
     }
 
     private View driverRow(String name, String detail, boolean selected, View.OnClickListener select,

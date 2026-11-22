@@ -39,6 +39,7 @@
 #endif
 #include "android_driver.h"
 #include "disc_image.h"
+#include "dlc_install.h"
 #include "display_refresh_rate.h"
 #include "fps_overlay.h"
 #include "frame_monitor.h"
@@ -368,6 +369,8 @@ class Wwe2k16App : public rex::ReXApp {
   // unlock state, plus the icons, for the launcher's Achievements panel.
   void OnPostLaunchModule(rex::system::XThread* thread) override {
     (void)thread;
+    // DLC added in the launcher: unpacked before the game's main thread runs (it lists its content at boot).
+    wwe2k16::dlc::InstallPending(runtime());
 #if WWE2K16_HAVE_ACHIEVEMENT_API
     rex::system::xam::WriteAchievementSummary();
 #endif
