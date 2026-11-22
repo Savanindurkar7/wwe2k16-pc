@@ -38,6 +38,7 @@
 
 #include <fmt/format.h>
 
+#include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/ppc/context.h>
 #include "ppc_compat.h"
@@ -125,6 +126,39 @@ uint32_t g_d3d_device = 0;
 
 }  // namespace
 
+// --- Entrance scene settings ----------------------------------------------------------------------------------------
+
+// Entrances (and victory motions) are the game's 30 FPS phases: the engine asks for 30 at their start (ToThirty, kept at
+// 60 here) and for 60 at their end (ToSixty). The performance log (2026-11-22) showed them as the slowest part (38-48
+// FPS against 50-56 in the match: the whole arena and its crowd on screen). WWE2K16_ENTRANCE_CROWD (percent, the
+// launcher's ENTRANCE CROWD) sets the crowd share for those phases only; the match keeps its own (CROWD). The SDK reads
+// gpu_scene_crowd_density at every crowd draw, so the switch applies from the next frame.
+namespace {
+int EntranceCrowd() {
+  static const int value = [] {
+    const char* v = std::getenv("WWE2K16_ENTRANCE_CROWD");
+    return (v && *v) ? std::clamp(std::atoi(v), 0, 100) : -1;  // -1 = same as the match
+  }();
+  return value;
+}
+int g_match_crowd = -1;
+bool g_in_entrance = false;
+
+void EntranceScene(bool entering) {
+#if WWE2K16_SDK_K14
+  const int entrance = EntranceCrowd();
+  if (entrance < 0 || entering == g_in_entrance) return;
+  if (g_match_crowd < 0) g_match_crowd = std::atoi(rex::cvar::GetFlagByName("gpu_scene_crowd_density").c_str());
+  g_in_entrance = entering;
+  const int value = entering ? std::min(entrance, g_match_crowd) : g_match_crowd;
+  rex::cvar::SetFlagByName("gpu_scene_crowd_density", std::to_string(value));
+  REXLOG_INFO("[wwe2k16-entrance] {}: crowd {}%", entering ? "entrance phase" : "match phase", value);
+#else
+  (void)entering;
+#endif
+}
+}  // namespace
+
 // --- Engine frame rate --------------------------------------------------------------------------------------------
 
 // The engine's own switch to 30 FPS. Its animation runs on these time steps (not on wall-clock time), so skipping the
@@ -134,6 +168,7 @@ extern "C" PPC_FUNC(WWE2K16_IMP_ToThirty);
 extern "C" PPC_FUNC(WWE2K16_FN_ToThirty) {
   const uint32_t rate = PPC_LOAD_U32(kFrameRate);
   REXLOG_INFO("[wwe2k16-rate] halve request at rate {} ({})", rate, Keep60() ? "suppressed, staying at 60" : "applied");
+  EntranceScene(true);
   if (Keep60()) {
     return;
   }
@@ -144,6 +179,7 @@ extern "C" PPC_FUNC(WWE2K16_FN_ToThirty) {
 extern "C" PPC_FUNC(WWE2K16_IMP_ToSixty);
 extern "C" PPC_FUNC(WWE2K16_FN_ToSixty) {
   REXLOG_INFO("[wwe2k16-rate] restore request at rate {}", PPC_LOAD_U32(kFrameRate));
+  EntranceScene(false);
   WWE2K16_IMP_ToSixty(ctx, base);
 }
 

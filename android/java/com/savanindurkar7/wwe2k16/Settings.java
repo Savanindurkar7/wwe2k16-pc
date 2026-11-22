@@ -86,6 +86,15 @@ public final class Settings {
               + "crowd OFF for speed. Recommended.",
               "Native APK: no crowd at all (about 44 FPS, up to 60 in close shots)."));
 
+    public static final Choice ENTRANCE_CROWD = new Choice(S_GRAPHICS, "entrance_crowd", "ENTRANCE CROWD", 1,
+            a("same", "10", "0"),
+            a("SAME AS MATCH", "10%", "OFF"),
+            a("Native APK: entrances keep the CROWD setting.",
+              "Native APK: during entrances and victory scenes 10% of the crowd (or CROWD if that is lower), back to "
+              + "CROWD when the match starts. Entrances are the slowest part (about 40 FPS with the whole arena in view). "
+              + "Recommended.",
+              "Native APK: no crowd during entrances (fastest), the match keeps CROWD."));
+
     public static final Choice SHADOWS = new Choice(S_GRAPHICS, "shadows", "DYNAMIC SHADOWS", 0,
             a("on", "half", "off"),
             a("ON", "HALF RATE", "OFF"),
@@ -297,7 +306,7 @@ public final class Settings {
               "Off: the Adreno driver alone sends about a million messages per match."));
 
     public static final Choice[] CHOICES = {
-            RENDERER, RESOLUTION, FRAME_GEN, CROWD, SHADOWS, DOF, PASS_TRIM, FRAME_RATE, MSAA, FAST_AA, UPSCALER, TEXTURES, FILTER,
+            RENDERER, RESOLUTION, FRAME_GEN, CROWD, ENTRANCE_CROWD, SHADOWS, DOF, PASS_TRIM, FRAME_RATE, MSAA, FAST_AA, UPSCALER, TEXTURES, FILTER,
             DISPLAY, SCREEN_SHAPE, VSYNC, SHARPNESS,
             CPU_CORES, SPEED_FIX, SHADER_CACHE, FRAME_MONITOR, PERF_HINT, SUSTAINED,
             TOUCH, TOUCH_VIBRATE, RUMBLE,
@@ -403,6 +412,8 @@ public final class Settings {
             // same three crowd shaders, the census shows).
             String crowd = CROWD.value(p);
             if (!"100".equals(crowd)) cvar(l, "gpu_scene_crowd_density", crowd);
+            String entranceCrowd = ENTRANCE_CROWD.value(p);
+            if (!"same".equals(entranceCrowd)) l.env.put("WWE2K16_ENTRANCE_CROWD", entranceCrowd);
             String shadows = SHADOWS.value(p);
             if ("off".equals(shadows)) cvar(l, "gpu_dynamic_shadows", "false");
             if ("half".equals(shadows)) cvar(l, "gpu_shadow_half_rate", "true");
