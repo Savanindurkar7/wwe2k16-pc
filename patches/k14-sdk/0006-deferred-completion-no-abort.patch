@@ -1,0 +1,42 @@
+diff --git a/src/kernel/xam/xam_content.cpp b/src/kernel/xam/xam_content.cpp
+index 1fb1e16..f6ac2c1 100644
+--- a/src/kernel/xam/xam_content.cpp
++++ b/src/kernel/xam/xam_content.cpp
+@@ -146,6 +146,9 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
+               license_mask_ptr](uint32_t& extended_error, uint32_t& length) -> X_RESULT {
+     X_RESULT result = X_ERROR_INVALID_PARAMETER;
+     kDispositionState disposition = kDispositionState::Unknown;
++    // wwe2k16 patch (0006): which content the game opens (DLC problems are found from these lines).
++    REXKRNL_INFO("[content] create root '{}' type {:08X} file '{}' flags {:X}", root_name,
++                 uint32_t(content_data.content_type), content_data.file_name(), flags);
+     switch (flags & 0xF) {
+       case 1:  // CREATE_NEW
+                // Fail if exists.
+diff --git a/src/system/kernel_state.cpp b/src/system/kernel_state.cpp
+index 596bc8e..b546dc2 100644
+--- a/src/system/kernel_state.cpp
++++ b/src/system/kernel_state.cpp
+@@ -1293,9 +1293,21 @@ void KernelState::CompleteOverlappedDeferredEx(
+         REXSYS_DEBUG("Deferred overlapped {:08X}: sleeping {}ms", overlapped_ptr,
+                      kDeferredOverlappedDelayMillis);
+         rex::thread::Sleep(std::chrono::milliseconds(kDeferredOverlappedDelayMillis));
+-        uint32_t extended_error, length;
++        uint32_t extended_error = 0, length = 0;
+         REXSYS_DEBUG("Deferred overlapped {:08X}: running completion", overlapped_ptr);
+-        auto result = completion_callback(extended_error, length);
++        // wwe2k16 patch (0006): a completion that throws (seen: 'Invalid UTF-8' on a Mali phone with a DLC installed,
++        // 2026-11-22) used to end the whole game (REX_FATAL in the dispatch thread). It now completes its overlapped
++        // with an error, so the game gets a failed call it can handle, and the log says which one.
++        X_RESULT result;
++        try {
++          result = completion_callback(extended_error, length);
++        } catch (const std::exception& e) {
++          REXSYS_ERROR("[deferred] overlapped {:08X}: completion threw '{}': completed with ERROR_FUNCTION_FAILED "
++                       "instead of ending the game (wwe2k16 patch 0006)", overlapped_ptr, e.what());
++          result = X_ERROR_FUNCTION_FAILED;
++          extended_error = X_HRESULT_FROM_WIN32(result);
++          length = 0;
++        }
+         REXSYS_DEBUG("Deferred overlapped {:08X}: completing with result {:08X}", overlapped_ptr,
+                      result);
+         CompleteOverlappedEx(overlapped_ptr, result, extended_error, length);
