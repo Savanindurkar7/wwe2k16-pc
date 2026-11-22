@@ -1,3 +1,13 @@
-# Scene tile-layout hooks for the native (WWE 2K14 SDK) build: src/k14_tiling_hooks.h. Empty until
-# tools/k14-tiling-hooks.py --apply finds WWE 2K16's scene-target builder in the local generated code and writes the
-# two [[midasm_hook]] entries here (android-build-k14.sh runs it). Addresses only, no game code.
+# Scene tile-layout hooks for the native (WWE 2K14 SDK) build: src/k14_tiling_hooks.h. Written by
+# tools/k14-tiling-hooks.py from the local generated code (addresses only, no game code).
+# sub_82B8A1F0: the scene-target builder (2K14's sub_82C22AF8), scene object r31.
+
+[[midasm_hook]]
+address = 0x82B8A2C4
+name = "wwe2k16_tiling_layout_chosen"
+registers = ["r31"]
+
+[[midasm_hook]]
+address = 0x82B8A2DC
+name = "wwe2k16_tiling_create_gate"
+registers = ["r11", "r31"]
