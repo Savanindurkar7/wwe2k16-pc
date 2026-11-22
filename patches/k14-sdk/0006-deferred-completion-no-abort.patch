@@ -8,7 +8,7 @@ index 1fb1e16..f6ac2c1 100644
      kDispositionState disposition = kDispositionState::Unknown;
 +    // wwe2k16 patch (0006): which content the game opens (DLC problems are found from these lines).
 +    REXKRNL_INFO("[content] create root '{}' type {:08X} file '{}' flags {:X}", root_name,
-+                 uint32_t(content_data.content_type), content_data.file_name(), flags);
++                 uint32_t(XContentType(content_data.content_type)), content_data.file_name(), uint32_t(flags));
      switch (flags & 0xF) {
        case 1:  // CREATE_NEW
                 // Fail if exists.
