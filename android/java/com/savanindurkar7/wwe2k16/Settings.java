@@ -278,12 +278,37 @@ public final class Settings {
 
     // Phone tests 2026-11-22 (r13): CPU fast path ON 26-35 FPS in a match (a game thread at ~89%: worse), native frame
     // ON 42-57 (about 51, the best so far). New keys so the new defaults reach everyone.
-    public static final Choice CP_FAST = new Choice(S_ADVANCED, "cp_fast_v2", "CPU FAST PATH", 1,
+    // (Key "cp_fast_v3": SAFE is the new default. Phone test r13: ALL 26-35 FPS, a game thread spinning at ~89%.)
+    public static final Choice CP_FAST = new Choice(S_ADVANCED, "cp_fast_v3", "CPU FAST PATH", 0,
+            a("safe", "all", "off"),
+            a("SAFE (FAST)", "ALL (TEST)", "OFF"),
+            a("Native APK: the GPU command thread's own speed-ups from the WWE 2K14 port (register writes in bulk, "
+              + "texture / sampler bindings reused, unchanged texture requests skipped), without the parts that made "
+              + "the game wait (r13 test). Recommended.",
+              "Native APK, test: all eleven speed-ups. Slower on 2K16 in the r13 test (about 30 FPS).",
+              "Native APK: none of them."));
+
+    public static final Choice CROWD_CULL = new Choice(S_ADVANCED, "crowd_cull", "CROWD CULLING", 0,
             a("on", "off"),
-            a("ON (TEST)", "OFF"),
-            a("Native APK, test: the WWE 2K14 port's command-processor speed-ups. Slower on 2K16 in the phone test "
-              + "(about 30 FPS instead of 45); only for testing.",
-              "Native APK: without those speed-ups. Recommended."));
+            a("ON (FAST)", "OFF"),
+            a("Native APK: crowd members entirely outside the camera's view are not drawn (exact: nothing visible "
+              + "changes). Fewer draws for the GPU command thread, mostly in entrances.",
+              "Native APK: every crowd member the game sends is drawn."));
+
+    public static final Choice HOT_CORES = new Choice(S_ADVANCED, "hot_cores", "BUSY THREADS ON OWN CORES", 0,
+            a("on", "off"),
+            a("ON (FAST)", "OFF"),
+            a("The two busiest threads (the game's main thread and the GPU command thread) each get one of the "
+              + "fastest cores to themselves; every other thread runs on the remaining cores. Checked every 2 s.",
+              "Threads placed by CPU CORES only."));
+
+    public static final Choice GPU_WAIT = new Choice(S_ADVANCED, "gpu_wait", "GPU THREAD WAITING", 0,
+            a("spin", "sleep"),
+            a("SPIN (FAST)", "SLEEP (COOLER)"),
+            a("The GPU command thread spins while it waits for the game: quickest answers, but one fast core stays "
+              + "busy (more heat in long sessions).",
+              "Native APK, test: it sleeps 50 microseconds per check instead. Less heat, so the frame rate may hold "
+              + "better in long sessions; answers can come a little later."));
 
     public static final Choice NATIVE_FRAME = new Choice(S_ADVANCED, "native_frame_v2", "NATIVE FRAME", 0,
             a("on", "off"),
@@ -310,7 +335,7 @@ public final class Settings {
             DISPLAY, SCREEN_SHAPE, VSYNC, SHARPNESS,
             CPU_CORES, SPEED_FIX, SHADER_CACHE, FRAME_MONITOR, PERF_HINT, SUSTAINED,
             TOUCH, TOUCH_VIBRATE, RUMBLE,
-            READBACK, SHORTCUTS, CP_FAST, NATIVE_FRAME, TURNIP_FIX, PERF_LOG, VK_DEBUG,
+            READBACK, SHORTCUTS, CP_FAST, CROWD_CULL, HOT_CORES, GPU_WAIT, NATIVE_FRAME, TURNIP_FIX, PERF_LOG, VK_DEBUG,
     };
 
     public static final String KEY_EXTRA_ARGS = "extra_args";
@@ -402,7 +427,9 @@ public final class Settings {
             l.env.put("WWE2K16_RENDERER", renderer);
             l.env.put("WWE2K16_NATIVE_SHORTCUTS", "all".equals(SHORTCUTS.value(p)) ? "1" : "0");
             l.env.put("WWE2K16_PASS_TRIM", "on".equals(PASS_TRIM.value(p)) ? "1" : "0");
-            l.env.put("WWE2K16_CP_FAST", "on".equals(CP_FAST.value(p)) ? "1" : "0");
+            l.env.put("WWE2K16_CP_FAST", CP_FAST.value(p));
+            if ("on".equals(CROWD_CULL.value(p))) cvar(l, "gpu_scene_crowd_cull", "2");
+            if ("sleep".equals(GPU_WAIT.value(p))) cvar(l, "gpu_wait_reg_mem_sleep_us", "50");
             l.env.put("WWE2K16_NATIVE_FRAME", "on".equals(NATIVE_FRAME.value(p)) ? "1" : "0");
             if ("on".equals(PERF_LOG.value(p))) {
                 l.env.put("WWE2K16_THREAD_PROFILE", "1");
@@ -461,6 +488,7 @@ public final class Settings {
         l.env.put("WWE2K16_VSYNC", VSYNC.value(p));
 
         l.env.put("WWE2K16_CPU_CORES", CPU_CORES.value(p));
+        l.env.put("WWE2K16_HOT_CORES", "on".equals(HOT_CORES.value(p)) ? "1" : "0");
         l.env.put("WWE2K16_SPEED_FIX", SPEED_FIX.value(p));
         boolean cache = "1".equals(SHADER_CACHE.value(p));
         cvar(l, nat ? "vulkan_disk_pipeline_cache" : "vulkan_pipeline_cache", cache ? "true" : "false");

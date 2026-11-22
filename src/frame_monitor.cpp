@@ -278,6 +278,7 @@ struct CoreSets {
   cpu_set_t not_little{};
   int fast_count = 0, not_little_count = 0, total = 0;
   bool valid = false;
+  std::vector<std::pair<int, long>> by_speed;  // (cpu, max kHz), fastest first
 };
 
 CoreSets DetectCores() {
@@ -298,6 +299,9 @@ CoreSets DetectCores() {
     low = low ? std::min(low, khz) : khz;
   }
   if (cores.empty() || !top) return sets;
+  sets.by_speed = cores;
+  std::stable_sort(sets.by_speed.begin(), sets.by_speed.end(),
+                   [](const std::pair<int, long>& x, const std::pair<int, long>& y) { return x.second > y.second; });
   for (auto& [cpu, khz] : cores) {
     ++sets.total;
     if (khz * 100 >= top * 85) {
@@ -321,6 +325,16 @@ struct Pinning {
   bool logged = false;
 
   void Init() {
+    if (const char* h = Env("WWE2K16_HOT_CORES"); h && h[0] == '1') {
+      cores = DetectCores();
+      hot = cores.valid && cores.by_speed.size() >= 4;
+      if (hot) {
+        REXLOG_INFO("[wwe2k16-cores] busy threads get their own cores; fastest cores: cpu{} ({} MHz), cpu{} ({} MHz)",
+                    cores.by_speed[0].first, cores.by_speed[0].second / 1000, cores.by_speed[1].first,
+                    cores.by_speed[1].second / 1000);
+        return;
+      }
+    }
     const char* setting = Env("WWE2K16_CPU_CORES");
     if (!setting || std::strcmp(setting, "all") == 0) return;
     mode = std::strcmp(setting, "big") == 0 ? Mode::kBig : Mode::kAuto;
@@ -331,8 +345,66 @@ struct Pinning {
     else if (cores.fast_count >= 2) target = &cores.fast;
   }
 
+  // Busy threads on their own cores (WWE2K16_HOT_CORES=1): the two threads that used the most CPU since the last check
+  // (at least 30% of a core: the game's main thread and the GPU command thread in a match) each get one of the fastest
+  // cores alone; every other thread is kept off those two. Re-chosen every check (2 s), so a new busiest thread (the
+  // entrances have their own) gets a core too.
+  bool hot = false;
+  std::map<int, uint64_t> last_ticks;
+  std::vector<int> hot_tids;
+  void ApplyHot() {
+    if (!cores.valid || cores.by_speed.size() < 4) return;
+    std::vector<std::pair<uint64_t, int>> busy;
+    std::map<int, uint64_t> now_ticks;
+    for (int tid : ListThreads()) {
+      ThreadStat st;
+      if (!ReadThreadStat(tid, st)) continue;
+      now_ticks[tid] = st.cpu_ticks;
+      auto it = last_ticks.find(tid);
+      if (it != last_ticks.end() && st.cpu_ticks >= it->second) busy.push_back({st.cpu_ticks - it->second, tid});
+    }
+    last_ticks.swap(now_ticks);
+    std::sort(busy.begin(), busy.end(), [](auto& x, auto& y) { return x.first > y.first; });
+    const long hz = sysconf(_SC_CLK_TCK) > 0 ? sysconf(_SC_CLK_TCK) : 100;
+    const uint64_t min_ticks = uint64_t(hz) * 2 * 30 / 100;  // 30% of a core over the 2 s between checks
+    std::vector<int> chosen;
+    for (auto& [ticks, tid] : busy) {
+      if (chosen.size() >= 2 || ticks < min_ticks) break;
+      chosen.push_back(tid);
+    }
+    cpu_set_t rest;
+    CPU_ZERO(&rest);
+    for (auto& [cpu, khz] : cores.by_speed) CPU_SET(cpu, &rest);
+    for (size_t i = 0; i < chosen.size(); ++i) CPU_CLR(cores.by_speed[i].first, &rest);
+    for (auto& [tid, ticks] : last_ticks) {
+      auto pos = std::find(chosen.begin(), chosen.end(), tid);
+      if (pos != chosen.end()) {
+        cpu_set_t own;
+        CPU_ZERO(&own);
+        CPU_SET(cores.by_speed[size_t(pos - chosen.begin())].first, &own);
+        sched_setaffinity(tid, sizeof(cpu_set_t), &own);
+      } else {
+        sched_setaffinity(tid, sizeof(cpu_set_t), &rest);
+      }
+    }
+    if (chosen != hot_tids) {
+      hot_tids = chosen;
+      std::string names;
+      for (size_t i = 0; i < chosen.size(); ++i) {
+        ThreadStat st;
+        ReadThreadStat(chosen[i], st);
+        names += fmt::format("{}{} -> cpu{}", i ? ", " : "", st.name, cores.by_speed[i].first);
+      }
+      REXLOG_INFO("[wwe2k16-cores] busy threads on their own cores: {}", names.empty() ? "none busy enough" : names);
+    }
+  }
+
   // New threads appear while the game loads: everything not pinned yet is pinned.
   void Apply() {
+    if (hot) {
+      ApplyHot();
+      return;
+    }
     if (!target) return;
     int newly = 0;
     for (int tid : ListThreads()) {

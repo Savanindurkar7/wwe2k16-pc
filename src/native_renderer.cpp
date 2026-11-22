@@ -185,6 +185,19 @@ const std::vector<Flag> kCpFast = {
     {"gpu_upload_skip_unchanged", "true"},            // UPSKIP: pages whose bytes equal the GPU copy not re-uploaded
 };
 
+// The safe part of it (WWE2K16_CP_FAST=safe, the default since r16): only the GPU command thread's own bookkeeping -
+// register writes in bulk, texture / sampler bindings and viewport info reused, unchanged texture requests skipped.
+// Left out: the parts that change when the game or the GPU wait (async swap, no wait on pipeline compiles), the
+// lock-free range check and the upload skip - with all of them one game thread spun at ~89% (phone test r13).
+const std::vector<Flag> kCpSafe = {
+    {"gpu_type0_bulk_writes", "true"},
+    {"gpu_type0_block_split", "true"},
+    {"vulkan_reuse_texture_bindings", "true"},
+    {"vulkan_sampler_param_cache", "true"},
+    {"vulkan_viewport_info_cache", "true"},
+    {"gpu_request_textures_skip_unchanged", "true"},
+};
+
 // The native frame (WWE2K16_NATIVE_FRAME=1, Options > Advanced, test): the command processor answers the game
 // (fences, waits) without drawing, a drawing side runs the same commands behind it - so the game's thread does not
 // wait for the drawing. The 2K14 port's own frame (its native_frame.h); untested on 2K16.
@@ -233,9 +246,15 @@ void Apply() {
   const char* shortcuts = std::getenv("WWE2K16_NATIVE_SHORTCUTS");
   const bool with_shortcuts = shortcuts && shortcuts[0] == '1' && profile != "classic";
   if (with_shortcuts) set += Apply(kShortcuts);
-  if (const char* cp = std::getenv("WWE2K16_CP_FAST"); cp && cp[0] == '1' && profile != "classic") {
-    set += Apply(kCpFast);
-    REXLOG_INFO("[wwe2k16-renderer] CPU fast path on ({} settings from the 2K14 port's Sessions 6 / 7)", kCpFast.size());
+  if (const char* cp = std::getenv("WWE2K16_CP_FAST"); cp && profile != "classic") {
+    const std::string_view mode = cp;
+    if (mode == "1" || mode == "all") {
+      set += Apply(kCpFast);
+      REXLOG_INFO("[wwe2k16-renderer] CPU fast path: all ({} settings from the 2K14 port's Sessions 6 / 7)", kCpFast.size());
+    } else if (mode == "safe") {
+      set += Apply(kCpSafe);
+      REXLOG_INFO("[wwe2k16-renderer] CPU fast path: safe part ({} settings)", kCpSafe.size());
+    }
   }
   if (const char* nf = std::getenv("WWE2K16_NATIVE_FRAME"); nf && nf[0] == '1' && profile != "classic") {
     set += Apply(kNativeFrame);

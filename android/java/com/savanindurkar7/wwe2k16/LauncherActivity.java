@@ -139,19 +139,10 @@ public class LauncherActivity extends Activity {
         FrameLayout root = new FrameLayout(this);
         root.setBackgroundColor(0xFF0A0204);
 
-        backArt = new ImageView(this);
-        backArt.setScaleType(ImageView.ScaleType.CENTER_CROP);
-        backArt.setAlpha(0.30f);
-        if (!art.isEmpty()) setArt(backArt, art.get(artIndex % art.size()), 960);
-        root.addView(backArt, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-        View tint = new View(this);
-        tint.setBackground(new GradientDrawable(GradientDrawable.Orientation.TL_BR,
-                new int[] {0xE6160306, 0xB3420810, 0xD90A0203}));
-        root.addView(tint, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-
+        backArt = Shell.background(this, root, artIndex);
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
-        int sideW = Math.max(Ui.dp(this, 200), Math.round(screenW() * 0.2f));
+        int sideW = Shell.sidebarWidth(this);
         row.addView(sidebar(), new LinearLayout.LayoutParams(sideW, ViewGroup.LayoutParams.MATCH_PARENT));
 
         ScrollView scroll = new ScrollView(this);
@@ -176,101 +167,17 @@ public class LauncherActivity extends Activity {
         if ("home".equals(page) && art.size() > 1) handler.postDelayed(slideshow, 7000);
     }
 
-    // --- Sidebar ---
+    // --- Sidebar (Shell, shared with the settings) ---
 
     private View sidebar() {
-        LinearLayout side = new LinearLayout(this);
-        side.setOrientation(LinearLayout.VERTICAL);
-        side.setPadding(Ui.dp(this, 22), Ui.dp(this, 20), Ui.dp(this, 14), Ui.dp(this, 12));
-        side.setBackground(new GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT,
-                new int[] {0xFA0C0204, 0xF2160407}));
-
-        LinearLayout title = new LinearLayout(this);
-        title.setOrientation(LinearLayout.HORIZONTAL);
-        title.setGravity(Gravity.BOTTOM);
-        title.addView(Ui.text(this, "2K16", 38, Ui.WHITE, Ui.bold()));
-        TextView recomp = Ui.text(this, "RECOMP", 11, Ui.RED, Ui.semi());
-        recomp.setLetterSpacing(0.35f);
-        recomp.setPadding(Ui.dp(this, 10), 0, 0, Ui.dp(this, 5));
-        title.addView(recomp);
-        side.addView(title);
-        side.addView(rule(), ruleLp(14, 10));
-
-        LinearLayout nav = new LinearLayout(this);
-        nav.setOrientation(LinearLayout.VERTICAL);
-        nav.addView(navItem("⌂", "Home", "home".equals(page), v -> show("home")));
-        nav.addView(navItem("▣", "Graphics", false, v -> openOptions(Settings.S_GRAPHICS)));
-        nav.addView(navItem("✚", "Controls", false, v -> openOptions(Settings.S_CONTROLS)));
-        nav.addView(navItem("▤", "Game files", "files".equals(page), v -> show("files")));
-        nav.addView(rule(), ruleLp(8, 8));
-        nav.addView(navItem("≡", "Logs", "logs".equals(page), v -> show("logs")));
-        nav.addView(navItem("★", "Credits", "credits".equals(page), v -> show("credits")));
-        ScrollView navScroll = new ScrollView(this);
-        navScroll.setVerticalScrollBarEnabled(false);
-        navScroll.addView(nav);
-        side.addView(navScroll, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
-
-        side.addView(statusCard());
-        side.addView(navItem("⚙", "Settings", false, v -> openOptions(Settings.S_PERFORMANCE)));
-        return side;
-    }
-
-    private View rule() {
-        View r = new View(this);
-        r.setBackgroundColor(0x40FFFFFF);
-        return r;
-    }
-
-    private LinearLayout.LayoutParams ruleLp(int topDp, int bottomDp) {
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, Math.max(1, Ui.dp(this, 1.5f)));
-        lp.topMargin = Ui.dp(this, topDp);
-        lp.bottomMargin = Ui.dp(this, bottomDp);
-        return lp;
-    }
-
-    private View navItem(String icon, String label, boolean selected, View.OnClickListener click) {
-        LinearLayout item = new LinearLayout(this);
-        item.setOrientation(LinearLayout.HORIZONTAL);
-        item.setGravity(Gravity.CENTER_VERTICAL);
-        item.setPadding(0, Ui.dp(this, 7), Ui.dp(this, 6), Ui.dp(this, 7));
-        item.setBackground(Home.pill(this, 0x00000000, 0x26FFFFFF, Ui.dp(this, 8)));
-        item.setFocusable(true);
-        item.setClickable(true);
-        item.setOnClickListener(click);
-        if (selected) item.setTag("first");
-
-        View bar = new View(this);
-        bar.setBackground(Ui.rect(selected ? Ui.WHITE : 0x00000000, Ui.dp(this, 2)));
-        LinearLayout.LayoutParams bl = new LinearLayout.LayoutParams(Ui.dp(this, 4), Ui.dp(this, 26));
-        bl.rightMargin = Ui.dp(this, 12);
-        item.addView(bar, bl);
-        TextView ic = Ui.text(this, icon, 19, selected ? Ui.WHITE : 0xFFCFCFD4, android.graphics.Typeface.DEFAULT_BOLD);
-        ic.setGravity(Gravity.CENTER);
-        item.addView(ic, new LinearLayout.LayoutParams(Ui.dp(this, 26), ViewGroup.LayoutParams.WRAP_CONTENT));
-        TextView t = Ui.text(this, label, 18, selected ? Ui.WHITE : 0xFFD4D4D8, selected ? Ui.bold() : Ui.regular());
-        t.setPadding(Ui.dp(this, 12), 0, 0, 0);
-        item.addView(t);
-        return item;
-    }
-
-    private View statusCard() {
-        LinearLayout card = new LinearLayout(this);
-        card.setOrientation(LinearLayout.VERTICAL);
-        card.setPadding(Ui.dp(this, 12), Ui.dp(this, 10), Ui.dp(this, 10), Ui.dp(this, 10));
-        card.setBackground(Ui.rect(0x99202024, Ui.dp(this, 10)));
-        String problem = filesProblem();
-        boolean ready = problem == null;
-        TextView s = Ui.text(this, (ready ? "✔  Game files ready" : "✖  Game files needed"), 14,
-                ready ? Ui.GREEN : Ui.RED, Ui.semi());
-        card.addView(s);
-        TextView v = Ui.text(this, BuildInfo.versionName(this), 11, Ui.GREY, Ui.regular());
-        v.setPadding(0, Ui.dp(this, 5), 0, 0);
-        card.addView(v);
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT);
-        lp.bottomMargin = Ui.dp(this, 6);
-        card.setLayoutParams(lp);
-        return card;
+        return Shell.sidebar(this, page, target -> {
+            switch (target) {
+                case Shell.GRAPHICS: openOptions(Settings.S_GRAPHICS); break;
+                case Shell.CONTROLS: openOptions(Settings.S_CONTROLS); break;
+                case Shell.SETTINGS: openOptions(Settings.S_PERFORMANCE); break;
+                default: show(target); break;
+            }
+        });
     }
 
     private void show(String p) {
@@ -279,9 +186,14 @@ public class LauncherActivity extends Activity {
     }
 
     private void openOptions(String section) {
-        Intent i = new Intent(this, OptionsActivity.class);
-        i.putExtra(OptionsActivity.EXTRA_SECTION, section);
-        startActivity(i);
+        Shell.toSettings(this, section);
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        String p = intent.getStringExtra(Shell.EXTRA_PAGE);
+        if (p != null) page = p;
     }
 
     private String filesProblem() {

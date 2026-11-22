@@ -112,9 +112,17 @@ echo "Using $JOBS parallel jobs (${MEM_GB} GB RAM free, $(nproc) cores, $(df -h 
 # Small disks (a 32 GB Codespace holds the NDK, two SDKs and the game): no debug info (-g0, about a third of the object
 # size), and the SDK's build folder is deleted once the SDK is installed (KEEP_SDK_BUILD=1 keeps it). The libraries in
 # the APK are the same; only crash stacks lose line numbers.
-FLAGS="-march=armv8.2-a -g0"
+# CPU target (CPU_TUNE): "new" (default since r16) = the ARMv8.2 instructions every phone from about 2019 has (dot
+# product, half-precision floats, RCpc loads), with the code scheduled for Cortex-A720 / A715-class big cores
+# (Snapdragon 7s Gen 3, 8 Gen 2 / 3 and similar): the game's threads and the GPU command thread run a little faster.
+# "generic" = plain ARMv8.2 (the r1-r15 builds), for older phones.
+case "${CPU_TUNE:-new}" in
+    generic) FLAGS="-march=armv8.2-a -g0" ;;
+    *)       FLAGS="-march=armv8.2-a+dotprod+fp16+rcpc -mtune=cortex-a720 -g0" ;;
+esac
+echo "CPU target: ${CPU_TUNE:-new} ($FLAGS)"
 SDK_STAMP="$SDK_INSTALL/.built-from"
-SDK_ID="$(git -C "$SDK" rev-parse HEAD) $(cat "$SDK/.wwe2k14-patched") ndk $NDK_VER k14-sdk $K14_PATCHES_ID"
+SDK_ID="$(git -C "$SDK" rev-parse HEAD) $(cat "$SDK/.wwe2k14-patched") ndk $NDK_VER k14-sdk $K14_PATCHES_ID flags $FLAGS"
 free_gb() { df -Pk "$ROOT" | awk 'NR==2{print int($4/1048576)}'; }
 
 step "3/8 The WWE 2K14 SDK for Android arm64 (-> out/k14-android-sdk)"
@@ -150,6 +158,11 @@ for so in librexruntime.so librexgpu-xenos.so; do
 done
 
 step "4/8 The game: libmain.so (native/CMakeLists.txt)"
+# Compiler flags changed (CPU_TUNE): configure again (a full rebuild of the game's code, once).
+if [ -f "$GAME_BUILD/CMakeCache.txt" ] && [ "$(cat "$GAME_BUILD/.flags" 2>/dev/null)" != "$FLAGS" ]; then
+    echo "compiler flags changed: the game's code is built again (once)"
+    rm -f "$GAME_BUILD/CMakeCache.txt"
+fi
 if [ ! -f "$GAME_BUILD/CMakeCache.txt" ]; then
     cmake -S native -B "$GAME_BUILD" -G Ninja \
         -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-$API \
@@ -161,6 +174,7 @@ if [ ! -f "$GAME_BUILD/CMakeCache.txt" ]; then
 fi
 echo "disk free: $(free_gb) GB (the game's objects take about 4-6 GB)"
 cmake --build "$GAME_BUILD" --target wwe2k16 --parallel "$JOBS"
+echo "$FLAGS" > "$GAME_BUILD/.flags"
 
 step "5/8 Verify native libraries"
 MAIN="$(find "$GAME_BUILD" -name libmain.so -type f -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2- || true)"

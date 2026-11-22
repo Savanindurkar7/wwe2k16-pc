@@ -64,141 +64,120 @@ public class OptionsActivity extends Activity {
         }
     }
 
-    // Landscape only (manifest). Left: the title, the sections and the game files' status. Right: the section's
-    // options in an outlined panel over the dimmed background, with HOME at the top right.
+    // Landscape only (manifest). The same frame as the home screen (Shell: art, sidebar), so the settings are a page of
+    // it, not another menu: a row of section tabs at the top, the section's title with a red underline and a line
+    // about it, then its options.
     private void build() {
         FrameLayout root = new FrameLayout(this);
-        root.setBackgroundColor(0xFF000000);
-        ImageView art = new ImageView(this);
-        art.setScaleType(ImageView.ScaleType.CENTER_CROP);
-        java.util.List<Integer> arts = Home.artIds(this);
-        if (!arts.isEmpty()) {
-            android.graphics.Bitmap b = Home.art(this, arts.get(arts.size() > 1 ? 1 : 0), 960);
-            if (b != null) art.setImageBitmap(b);
-        }
-        art.setAlpha(0.28f);
-        root.addView(art, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-
+        Shell.background(this, root, 1);
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
-        int sideWidth = Math.max(Ui.dp(this, 230), Math.round(getResources().getDisplayMetrics().widthPixels * 0.2f));
-        row.addView(sidebar(), new LinearLayout.LayoutParams(sideWidth, ViewGroup.LayoutParams.MATCH_PARENT));
+        String selected = Settings.S_GRAPHICS.equals(section) ? Shell.GRAPHICS
+                : Settings.S_CONTROLS.equals(section) ? Shell.CONTROLS : Shell.SETTINGS;
+        row.addView(Shell.sidebar(this, selected, target -> {
+            switch (target) {
+                case Shell.GRAPHICS: section = Settings.S_GRAPHICS; build(); break;
+                case Shell.CONTROLS: section = Settings.S_CONTROLS; build(); break;
+                case Shell.SETTINGS: section = Settings.S_PERFORMANCE; build(); break;
+                default: Shell.toHome(this, target); break;
+            }
+        }), new LinearLayout.LayoutParams(Shell.sidebarWidth(this), ViewGroup.LayoutParams.MATCH_PARENT));
         row.addView(contentArea(), new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f));
         root.addView(row);
         setContentView(root);
     }
 
-    private View sidebar() {
-        LinearLayout side = new LinearLayout(this);
-        side.setOrientation(LinearLayout.VERTICAL);
-        int pad = Ui.dp(this, 18);
-        side.setPadding(pad, Ui.dp(this, 18), Ui.dp(this, 10), Ui.dp(this, 12));
-        side.setBackground(new GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT, new int[] {0xF2000000, 0xB3000000}));
+    @Override
+    public void onBackPressed() {
+        Shell.toHome(this, Shell.HOME);
+    }
 
-        SpannableString title = new SpannableString("WWE 2K16");
-        title.setSpan(new ForegroundColorSpan(Ui.RED), 4, 8, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
-        TextView t = Ui.text(this, "", 32, Ui.WHITE, Ui.bold());
-        t.setText(title);
-        side.addView(t);
-        TextView sub = Ui.text(this, "XBOX 360 RECOMPILED", 10.5f, Ui.GREY, Ui.regular());
-        sub.setLetterSpacing(0.3f);
-        sub.setPadding(0, Ui.dp(this, 6), 0, Ui.dp(this, 14));
-        side.addView(sub);
+    private static String tabLabel(String sec) {
+        if (Settings.S_DRIVER.equals(sec)) return "GPU driver";
+        return sec.charAt(0) + sec.substring(1).toLowerCase(java.util.Locale.ROOT);
+    }
 
-        LinearLayout nav = new LinearLayout(this);
-        nav.setOrientation(LinearLayout.VERTICAL);
-        for (String sec : Settings.SECTIONS) {
-            boolean active = sec.equals(section);
-            String label = sec.charAt(0) + sec.substring(1).toLowerCase(java.util.Locale.ROOT);
-            if (Settings.S_DRIVER.equals(sec)) label = "GPU driver";
-            // Compact, so all seven sections fit a phone held sideways without scrolling the menu.
-            TextView item = Ui.text(this, label, 14, active ? 0xFF111114 : Ui.WHITE, Ui.semi());
-            item.setGravity(Gravity.CENTER_VERTICAL);
-            item.setPadding(Ui.dp(this, 14), Ui.dp(this, 5), Ui.dp(this, 8), Ui.dp(this, 5));
-            item.setBackground(Ui.navBackground(this, active));
-            item.setFocusable(true);
-            item.setClickable(true);
-            item.setOnClickListener(v -> {
-                section = sec;
-                build();
-            });
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT);
-            lp.bottomMargin = Ui.dp(this, 3);
-            nav.addView(item, lp);
-            if (active) item.post(item::requestFocus);
+    private static String about(String sec) {
+        switch (sec) {
+            case Settings.S_GRAPHICS: return "Pick the renderer and how much the game draws: the options below are its own.";
+            case Settings.S_DISPLAY: return "How the picture is shown on your screen.";
+            case Settings.S_PERFORMANCE: return "Frame rate helpers, CPU cores and the frame monitor.";
+            case Settings.S_CONTROLS: return "Touch controls, vibration and rumble.";
+            case Settings.S_DRIVER: return "The Vulkan driver the game uses: the phone's own or an imported Turnip.";
+            case Settings.S_ADVANCED: return "Renderer switches for testing, logs and extra arguments.";
+            default: return "";
         }
-        ScrollView navScroll = new ScrollView(this);
-        navScroll.setVerticalScrollBarEnabled(false);
-        navScroll.addView(nav);
-        side.addView(navScroll, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
-
-        // Game files status card.
-        SharedPreferences prefs = Settings.prefs(this);
-        String path = prefs.getString(Settings.KEY_GAME_PATH, "");
-        String problem = GameFiles.checkSaved(path, prefs.getString(Settings.KEY_GAME_KIND, "folder"));
-        LinearLayout card = new LinearLayout(this);
-        card.setOrientation(LinearLayout.VERTICAL);
-        card.setPadding(Ui.dp(this, 12), Ui.dp(this, 10), Ui.dp(this, 12), Ui.dp(this, 10));
-        card.setBackground(Ui.rect(0xCC16161B, Ui.dp(this, 8)));
-        TextView ok = Ui.text(this, problem == null ? "✓  Game files ready" : "✕  Game files needed", 14,
-                problem == null ? Ui.GREEN : Ui.RED, Ui.semi());
-        card.addView(ok);
-        TextView where = Ui.body(this, path.isEmpty() ? "None selected" : new java.io.File(path).getName(), 11, Ui.GREY);
-        where.setPadding(0, Ui.dp(this, 4), 0, 0);
-        where.setMaxLines(2);
-        card.addView(where);
-        LinearLayout.LayoutParams cardLp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT);
-        cardLp.topMargin = Ui.dp(this, 8);
-        side.addView(card, cardLp);
-        TextView ver = Ui.text(this, BuildInfo.versionName(this), 10.5f, Ui.DIM, Ui.regular());
-        ver.setPadding(0, Ui.dp(this, 8), 0, 0);
-        side.addView(ver);
-        return side;
     }
 
     private View contentArea() {
         LinearLayout area = new LinearLayout(this);
         area.setOrientation(LinearLayout.VERTICAL);
-        area.setPadding(Ui.dp(this, 20), Ui.dp(this, 14), Ui.dp(this, 20), Ui.dp(this, 10));
-        LinearLayout header = new LinearLayout(this);
-        header.setOrientation(LinearLayout.HORIZONTAL);
-        header.setGravity(Gravity.CENTER_VERTICAL);
-        String heading = Settings.S_DRIVER.equals(section) ? "GPU DRIVER" : section;
-        TextView h = Ui.text(this, heading, 26, Ui.WHITE, Ui.bold());
-        h.setLetterSpacing(0.03f);
-        header.addView(h, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-        if (!Settings.S_CREDITS.equals(section)) {
-            TextView reset = Ui.smallButton(this, "Reset all", false, v -> new AlertDialog.Builder(this)
-                    .setTitle("Reset all options?")
-                    .setMessage("Every option goes back to its default. Your game files, drivers and touch layout stay.")
-                    .setPositiveButton("Reset", (d, w) -> {
-                        Settings.resetAll(this);
-                        build();
-                    })
-                    .setNegativeButton("Cancel", null)
-                    .show());
-            LinearLayout.LayoutParams rl = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
+        area.setPadding(Ui.dp(this, 22), Ui.dp(this, 14), Ui.dp(this, 22), 0);
+
+        // Section tabs (pills), the current one red.
+        LinearLayout tabs = new LinearLayout(this);
+        tabs.setOrientation(LinearLayout.HORIZONTAL);
+        tabs.setGravity(Gravity.CENTER_VERTICAL);
+        for (String sec : Settings.SECTIONS) {
+            if (Settings.S_CREDITS.equals(sec)) continue;  // the sidebar's Credits page
+            boolean active = sec.equals(section);
+            TextView tab = Ui.text(this, tabLabel(sec), 15, active ? Ui.WHITE : 0xFFD8D8DC, active ? Ui.semi() : Ui.regular());
+            tab.setGravity(Gravity.CENTER);
+            tab.setPadding(Ui.dp(this, 18), Ui.dp(this, 8), Ui.dp(this, 18), Ui.dp(this, 8));
+            tab.setBackground(active ? Home.pill(this, Ui.RED, 0xFFF0364A, Ui.dp(this, 20))
+                    : Home.pill(this, 0x99281418, 0xCC3A2026, Ui.dp(this, 20)));
+            tab.setFocusable(true);
+            tab.setClickable(true);
+            tab.setOnClickListener(v -> {
+                section = sec;
+                build();
+            });
+            LinearLayout.LayoutParams tl = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
                     ViewGroup.LayoutParams.WRAP_CONTENT);
-            rl.rightMargin = Ui.dp(this, 8);
-            header.addView(reset, rl);
+            tl.rightMargin = Ui.dp(this, 10);
+            tabs.addView(tab, tl);
+            if (active) tab.post(tab::requestFocus);
         }
-        TextView home = Ui.smallButton(this, "Home", false, v -> finish());
-        home.setMinWidth(Ui.dp(this, 120));
-        header.addView(home);
-        area.addView(header);
+        android.widget.HorizontalScrollView tabScroll = new android.widget.HorizontalScrollView(this);
+        tabScroll.setHorizontalScrollBarEnabled(false);
+        tabScroll.addView(tabs);
+        area.addView(tabScroll);
 
         ScrollView scroll = new ScrollView(this);
-        scroll.setFillViewport(false);
-        LinearLayout panel = (LinearLayout) sectionContent();
-        GradientDrawable panelBg = Ui.rect(0xB3060608, Ui.dp(this, 12));
-        panelBg.setStroke(Math.max(1, Ui.dp(this, 1)), 0x33FFFFFF);
-        panel.setBackground(panelBg);
-        scroll.addView(panel);
-        LinearLayout.LayoutParams sl = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f);
-        sl.topMargin = Ui.dp(this, 12);
-        area.addView(scroll, sl);
+        scroll.setVerticalScrollBarEnabled(false);
+        LinearLayout page = new LinearLayout(this);
+        page.setOrientation(LinearLayout.VERTICAL);
+        page.setPadding(Ui.dp(this, 18), Ui.dp(this, 20), Ui.dp(this, 18), Ui.dp(this, 20));
+
+        LinearLayout header = new LinearLayout(this);
+        header.setOrientation(LinearLayout.HORIZONTAL);
+        header.setGravity(Gravity.BOTTOM);
+        TextView h = Ui.text(this, Settings.S_DRIVER.equals(section) ? "GPU DRIVER" : section, 40, Ui.WHITE, Ui.bold());
+        h.setLetterSpacing(0.02f);
+        header.addView(h, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        TextView reset = Ui.smallButton(this, "Reset all", false, v -> new AlertDialog.Builder(this)
+                .setTitle("Reset all options?")
+                .setMessage("Every option goes back to its default. Your game files, drivers and touch layout stay.")
+                .setPositiveButton("Reset", (d, w) -> {
+                    Settings.resetAll(this);
+                    build();
+                })
+                .setNegativeButton("Cancel", null)
+                .show());
+        header.addView(reset);
+        page.addView(header);
+        View underline = new View(this);
+        underline.setBackgroundColor(Ui.RED);
+        LinearLayout.LayoutParams ul = new LinearLayout.LayoutParams(Ui.dp(this, 46), Ui.dp(this, 4));
+        ul.topMargin = Ui.dp(this, 10);
+        page.addView(underline, ul);
+        TextView sub = Ui.body(this, about(section), 15, 0xFFB9B4B8);
+        sub.setPadding(0, Ui.dp(this, 14), 0, Ui.dp(this, 8));
+        page.addView(sub);
+
+        page.addView(sectionContent());
+        scroll.addView(page);
+        area.addView(scroll, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
         return area;
     }
 
@@ -206,7 +185,7 @@ public class OptionsActivity extends Activity {
         LinearLayout p = new LinearLayout(this);
         p.setOrientation(LinearLayout.VERTICAL);
         int pad = Ui.dp(this, 18);
-        p.setPadding(pad, Ui.dp(this, 8), pad, Ui.dp(this, 18));
+        p.setPadding(0, Ui.dp(this, 4), 0, Ui.dp(this, 10));
         int gap = Ui.dp(this, 8);
         SharedPreferences prefs = Settings.prefs(this);
         if (Settings.S_CREDITS.equals(section)) {

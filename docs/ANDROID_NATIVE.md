@@ -158,3 +158,17 @@ generation is on, so the command thread never waits on the swapchain.
 - **r13 tests:** the CPU fast path (the 2K14 port's Session 6 / 7 defaults) ran at 26-35 FPS, with one game thread
   at about 89%: worse. The native frame (`gpu_native_frame`) ran at 42-57, about 51: the best result so far.
 - **r14 defaults:** native frame ON, CPU fast path OFF. Both options stay in Advanced.
+
+### r16 (2026-11-22)
+
+- **One screen:** `Shell.java` draws the art and the sidebar for both the home pages and the settings. Graphics,
+  Controls and Settings open the settings in the same frame (section tabs at the top, title with a red underline, a
+  line about the section), with no animation. Every option is still there.
+- **CPU target:** `CPU_TUNE=new` (default) builds with `-march=armv8.2-a+dotprod+fp16+rcpc -mtune=cortex-a720`.
+  `CPU_TUNE=generic` gives the old build for older phones. Changing it rebuilds the SDK and the game once.
+- **Busy threads on their own cores** (`WWE2K16_HOT_CORES`, `src/frame_monitor.cpp`): every 2 s the two busiest
+  threads each get one of the fastest cores, and all other threads are kept off those cores.
+- **CPU fast path SAFE** (default): `kCpSafe`, six of the eleven 2K14 command-processor settings, without the ones
+  that made a game thread spin in r13.
+- **Crowd culling** (`gpu_scene_crowd_cull=2`, default on): crowd members outside the view are not drawn (exact).
+- **GPU thread waiting:** SPIN (default) or SLEEP (`gpu_wait_reg_mem_sleep_us=50`, test, less heat).
