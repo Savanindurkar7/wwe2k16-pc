@@ -150,3 +150,11 @@ Phone tests on 2026-11-22, crowd 20%:
 
 r11 (`0005-frame-generation-paint-thread.patch`) moves every paint to the frame generation thread when frame
 generation is on, so the command thread never waits on the swapchain.
+
+### r12 performance log and r13 / r14
+
+- **Performance log (r12):** in a match the game's main thread ran at about 65% and the GPU command thread at about
+  60%, while the GPU needed about 8.7 ms of each ~24 ms frame. The two threads take turns.
+- **r13 tests:** the CPU fast path (the 2K14 port's Session 6 / 7 defaults) ran at 26-35 FPS, with one game thread
+  at about 89%: worse. The native frame (`gpu_native_frame`) ran at 42-57, about 51: the best result so far.
+- **r14 defaults:** native frame ON, CPU fast path OFF. Both options stay in Advanced.

@@ -267,20 +267,21 @@ public final class Settings {
               + "(phone test A, 2026-11-21). No effect with the phone's own driver.",
               "Turnip's normal compiler: a little faster, but the skin spike glitch comes back. Only for testing."));
 
-    public static final Choice CP_FAST = new Choice(S_ADVANCED, "cp_fast", "CPU FAST PATH", 0,
-            a("on", "off"),
-            a("ON (FAST)", "OFF"),
-            a("Native APK: the WWE 2K14 port's command-processor speed-ups (texture and constant bindings reused, "
-              + "unchanged uploads and texture requests skipped, register writes in bulk). The GPU command thread is "
-              + "one of the two threads limiting the frame rate on phones. If anything looks wrong, try OFF.",
-              "Native APK: without those speed-ups (as in r12)."));
-
-    public static final Choice NATIVE_FRAME = new Choice(S_ADVANCED, "native_frame", "NATIVE FRAME", 1,
+    // Phone tests 2026-11-22 (r13): CPU fast path ON 26-35 FPS in a match (a game thread at ~89%: worse), native frame
+    // ON 42-57 (about 51, the best so far). New keys so the new defaults reach everyone.
+    public static final Choice CP_FAST = new Choice(S_ADVANCED, "cp_fast_v2", "CPU FAST PATH", 1,
             a("on", "off"),
             a("ON (TEST)", "OFF"),
-            a("Native APK, test: the GPU command thread answers the game at once and draws behind it, so the game "
-              + "does not wait for the drawing. From the WWE 2K14 port; untested on 2K16 (may crash or glitch).",
-              "Native APK: answers and drawing together (normal)."));
+            a("Native APK, test: the WWE 2K14 port's command-processor speed-ups. Slower on 2K16 in the phone test "
+              + "(about 30 FPS instead of 45); only for testing.",
+              "Native APK: without those speed-ups. Recommended."));
+
+    public static final Choice NATIVE_FRAME = new Choice(S_ADVANCED, "native_frame_v2", "NATIVE FRAME", 0,
+            a("on", "off"),
+            a("ON (FAST)", "OFF"),
+            a("Native APK: the GPU command thread answers the game at once and draws behind it, so the game does not "
+              + "wait for the drawing (about 51 FPS in a match instead of 43 in the phone test). Recommended.",
+              "Native APK: answers and drawing together (slower)."));
 
     public static final Choice PERF_LOG = new Choice(S_ADVANCED, "perf_log", "PERFORMANCE LOG", 1,
             a("on", "off"),
