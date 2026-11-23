@@ -1,0 +1,87 @@
+diff --git a/include/rex/system/util/string_utils.h b/include/rex/system/util/string_utils.h
+index e2b0470..abb219f 100644
+--- a/include/rex/system/util/string_utils.h
++++ b/include/rex/system/util/string_utils.h
+@@ -33,9 +33,49 @@ inline std::string_view TranslateAnsiString(const memory::Memory* memory,
+                           ansi_string->length);
+ }
+ 
++// wwe2k16 patch (0007): guest names are bytes, not UTF-8. WWE 2K16 opens its DLC under root names made of raw bytes
++// ('pB\xNN0'); the SDK's path and case-folding code (utf8 iterators) threw 'Invalid UTF-8' on them, so the DLC never
++// mounted and the game said "The downloadable content was not loaded properly". A name that is not valid UTF-8 is
++// read as Latin-1 (each byte 0x80-0xFF becomes its 2-byte UTF-8 character): the same mapping everywhere a guest name
++// enters (content root names, file paths), so a root and the paths into it still match. Valid UTF-8 is unchanged.
++inline bool IsValidUtf8(std::string_view s) {
++  size_t i = 0;
++  while (i < s.size()) {
++    const unsigned char c = static_cast<unsigned char>(s[i]);
++    size_t n;
++    if (c < 0x80) n = 0;
++    else if (c >= 0xC2 && c <= 0xDF) n = 1;
++    else if (c >= 0xE0 && c <= 0xEF) n = 2;
++    else if (c >= 0xF0 && c <= 0xF4) n = 3;
++    else return false;
++    if (i + n >= s.size() && n) return false;
++    for (size_t k = 1; k <= n; ++k) {
++      if ((static_cast<unsigned char>(s[i + k]) & 0xC0) != 0x80) return false;
++    }
++    i += n + 1;
++  }
++  return true;
++}
++
++inline std::string GuestNameToUtf8(std::string_view s) {
++  if (IsValidUtf8(s)) return std::string(s);
++  std::string out;
++  out.reserve(s.size() * 2);
++  for (char ch : s) {
++    const unsigned char c = static_cast<unsigned char>(ch);
++    if (c < 0x80) {
++      out.push_back(ch);
++    } else {
++      out.push_back(static_cast<char>(0xC0 | (c >> 6)));
++      out.push_back(static_cast<char>(0x80 | (c & 0x3F)));
++    }
++  }
++  return out;
++}
++
+ inline std::string TranslateAnsiPath(const memory::Memory* memory,
+                                      const X_ANSI_STRING* ansi_string) {
+-  return rex::string::trim_string(std::string(TranslateAnsiString(memory, ansi_string)));
++  return rex::string::trim_string(GuestNameToUtf8(TranslateAnsiString(memory, ansi_string)));
+ }
+ 
+ inline std::string_view TranslateAnsiStringAddress(const memory::Memory* memory,
+diff --git a/src/kernel/xam/xam_content.cpp b/src/kernel/xam/xam_content.cpp
+index 8b5d7bc..72fba7c 100644
+--- a/src/kernel/xam/xam_content.cpp
++++ b/src/kernel/xam/xam_content.cpp
+@@ -20,6 +20,7 @@
+ #include <rex/system/xam/content_device.h>
+ #include <rex/system/xenumerator.h>
+ #include <rex/system/xtypes.h>
++#include <rex/system/util/string_utils.h>  // wwe2k16 patch 0007
+ 
+ REXCVAR_DEFINE_UINT32(license_mask, 0, "Kernel", "Set license mask for activated content");
+ 
+@@ -141,7 +142,8 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
+     *disposition_ptr = 0;
+   }
+ 
+-  auto run = [content_manager, xuid, root_name = root_name.value(), flags, content_data,
++  auto run = [content_manager, xuid, root_name = rex::system::util::GuestNameToUtf8(root_name.value()), flags,
++              content_data,
+               disposition_ptr,
+               license_mask_ptr](uint32_t& extended_error, uint32_t& length) -> X_RESULT {
+     X_RESULT result = X_ERROR_INVALID_PARAMETER;
+@@ -283,7 +285,8 @@ u32 XamContentFlush_entry(mapped_string root_name, mapped_void overlapped_ptr) {
+ 
+ u32 XamContentClose_entry(mapped_string root_name, mapped_void overlapped_ptr) {
+   // Closes a previously opened root from XamContentCreate*.
+-  auto result = REX_KERNEL_STATE()->content_manager()->CloseContent(root_name.value());
++  auto result = REX_KERNEL_STATE()->content_manager()->CloseContent(
++      rex::system::util::GuestNameToUtf8(root_name.value()));  // wwe2k16 patch 0007
+ 
+   if (overlapped_ptr) {
+     REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(), result);
