@@ -9,6 +9,12 @@
 // dlc_import is deleted when the install succeeds; a package that fails is moved to dlc_import/failed/ and the reason
 // is logged ([wwe2k16-dlc] lines) and written to dlc_import/result.txt for the launcher.
 //
+// Licenses (r17e): the SDK writes into each .header file the license bits of the package's own license table, and
+// nothing when that table has none (most packages copied from a console or a backup): the game then opens the DLC
+// with license mask 0, i.e. not owned, and it stays locked in the game (2015 Hall Of Fame Showcase, 2026-11-23).
+// Every installed DLC header is given the full mask 0xFFFFFFFF at each start (WWE2K16_DLC_UNLOCK=0: as the package
+// says).
+//
 // Kill switch: WWE2K16_DLC=0.
 
 #include "dlc_install.h"
@@ -52,9 +58,54 @@ bool LooksLikePackage(const fs::path& p) {
 
 }  // namespace
 
+#if WWE2K16_HAVE_DLC_INSTALL
+namespace {
+// Gives every marketplace-content header of this title the full license mask (see the top of the file).
+void UnlockInstalled(rex::Runtime* runtime) {
+  if (const char* v = std::getenv("WWE2K16_DLC_UNLOCK"); v && v[0] == '0') return;
+  const uint32_t title_id = runtime->kernel_state()->title_id();
+  const fs::path dir = runtime->user_data_root() / "0000000000000000" / fmt::format("{:08X}", title_id) /
+                       "Headers" / "00000002";
+  std::error_code ec;
+  if (!fs::is_directory(dir, ec)) return;
+  constexpr size_t kData = sizeof(rex::system::xam::XCONTENT_AGGREGATE_DATA);
+  constexpr uint32_t kAll = 0xFFFFFFFFu;
+  int changed = 0, total = 0;
+  for (const auto& e : fs::directory_iterator(dir, ec)) {
+    if (!e.is_regular_file(ec) || e.path().extension() != ".header") continue;
+    ++total;
+    const auto size = fs::file_size(e.path(), ec);
+    if (ec || size < kData) continue;
+    uint32_t have = 0;
+    if (size >= kData + 4) {
+      std::ifstream in(e.path(), std::ios::binary);
+      in.seekg(kData);
+      in.read(reinterpret_cast<char*>(&have), 4);
+    }
+    if (have == kAll) continue;
+    std::fstream f(e.path(), std::ios::binary | std::ios::in | std::ios::out);
+    if (!f) continue;
+    f.seekp(kData);
+    f.write(reinterpret_cast<const char*>(&kAll), 4);
+    if (f) {
+      ++changed;
+      REXLOG_INFO("[wwe2k16-dlc] {}: license mask {:08X} -> FFFFFFFF (unlocked)", e.path().stem().string(), have);
+    }
+  }
+  REXLOG_INFO("[wwe2k16-dlc] {} DLC installed, {} unlocked now", total, changed);
+}
+}  // namespace
+#endif
+
 void InstallPending(rex::Runtime* runtime) {
 #if WWE2K16_HAVE_DLC_INSTALL
   if (const char* v = std::getenv("WWE2K16_DLC"); v && v[0] == '0') return;
+  struct Unlock {
+    rex::Runtime* r;
+    ~Unlock() {
+      if (r && r->kernel_state()) UnlockInstalled(r);
+    }
+  } unlock{runtime};
   if (!runtime || !runtime->kernel_state() || !runtime->kernel_state()->content_manager()) return;
   const fs::path root = runtime->user_data_root();
   if (root.empty()) return;
