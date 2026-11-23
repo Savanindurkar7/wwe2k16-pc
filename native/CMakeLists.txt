@@ -72,6 +72,7 @@ set(WWE2K16_SOURCES
     touch_input.cpp
     native_renderer.cpp
     dlc_install.cpp
+    integrity.cpp
 )
 # achievement_toast.cpp is left out: the 0.10 SDK draws its own achievement pop-ups (rex/ui/overlay/achievement_*).
 list(TRANSFORM WWE2K16_SOURCES PREPEND "${WWE2K16_ROOT}/src/")

@@ -37,6 +37,7 @@ set(WWE2K16_SOURCES
     src/touch_input.cpp
     src/native_renderer.cpp
     src/dlc_install.cpp
+    src/integrity.cpp
 )
 
 if(ANDROID)

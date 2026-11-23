@@ -206,3 +206,29 @@ Changes:
   `userdata/dlc_import/`. Before the game's main thread runs, the SDK's `ContentManager::InstallContent` unpacks each
   one to `userdata/0000000000000000/315A07D2/00000002/<name>/`, plus its header. The result of each install goes to
   `dlc_import/result.txt` and `[wwe2k16-dlc]` log lines. `WWE2K16_DLC=0` turns installing off.
+
+### r18 (2026-11-23): version 1.2.0, GPU presets, Mali heat fix, update popup, tamper check
+
+- **Version** is now a real number: `WWE2K16_RELEASE` (default **1.2.0**) becomes `versionName`, shown in Android App
+  Info and in the app. The git hash is kept as a build id (`resValue wwe2k16_build_id`), shown in the status card and
+  Logs, so a build is still identifiable. `BuildInfo.versionName` → "1.2.0 (build <hash>)".
+- **GPU auto-preset** (`Settings.applyPreset`, `Gpu.family`): on first start the launcher detects the GPU and applies
+  the best settings once (`preset_applied_v1`); re-applied any time from Graphics ("Apply best settings for <GPU>").
+  Adreno preset = the tested r14-r16 setup (existing users unchanged). Mali preset = 480p, crowd 20 / entrance 10,
+  shadows off, DoF off, 45 cap, GPU wait SLEEP, MALI BOOST all, MALI TEXTURES small, native frame on.
+- **Mali heat fix:** a Mali-G57 (vivo V2432) held ~58 FPS for 90 s then collapsed to 10 FPS from heat at a 60 cap.
+  Fixes: (1) the Mali preset caps at 45 and uses SLEEP wait (SPIN burns a core); (2) a **thermal governor** in
+  `frame_rate.cpp` — `GameActivity` forwards the Android thermal status (PowerManager) through
+  `nativeSetThermalStatus`, and the governor lowers the cap to the next value the speed-fix handles (60 → 45 → 30)
+  while the phone is hot, lifting it as it cools. `HEAT PROTECTION` setting (`WWE2K16_THERMAL_GUARD`: 0 off, 1 normal
+  = Adreno default, 2 earlier = Mali default). `[wwe2k16-thermal]` log lines. A cool phone never reaches it, so Adreno
+  is unaffected.
+- **Update popup** (`VolvisionUpdateChannel`, supplied by the site owner): on launcher start it checks
+  volvisionmods.com and offers to open the game page when the site has a newer version than the installed
+  `versionName`. Needs INTERNET (added to the manifest). Set the site's version to 1.2.0 for this release, bump it when
+  pushing updates.
+- **Tamper / anti-repackage** (`Integrity`, `src/integrity.cpp`): if `VolvisionUpdateChannel` is removed or its APP_ID
+  edited, if the package name is wrong, if the update check doesn't run at launch, or (game process) if the native
+  brand token doesn't match the Java one, the app kills itself after a random delay. Optional signing-cert pin via
+  `WWE2K16_CERT_SHA256` (empty by default, so the owner's debug builds run). Both brand copies use the same FNV-1a, so
+  the Java and native branding can't be edited apart.

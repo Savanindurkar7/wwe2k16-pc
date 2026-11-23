@@ -192,6 +192,23 @@ public class OptionsActivity extends Activity {
             addCredits(p);
             return p;
         }
+        if (Settings.S_GRAPHICS.equals(section)) {
+            // r18: re-apply the best-settings preset for this phone's GPU.
+            String fam = Gpu.family(this);
+            String famLabel = Gpu.MALI.equals(fam) ? "Mali" : Gpu.ADRENO.equals(fam) ? "Adreno" : "your";
+            p.addView(Ui.menuButton(this, "Apply best settings for " + famLabel + " GPU",
+                    "Sets the recommended graphics and advanced options for your phone (" + Gpu.renderer(this) + ")",
+                    true, v -> new AlertDialog.Builder(this)
+                            .setTitle("Apply best settings?")
+                            .setMessage("This sets the recommended options for your " + famLabel + " GPU. Anything you "
+                                    + "changed will be overwritten.")
+                            .setPositiveButton("Apply", (d, w) -> {
+                                Settings.applyPreset(this, fam);
+                                build();
+                            })
+                            .setNegativeButton("Cancel", null)
+                            .show()), Ui.fill(Ui.dp(this, 14)));
+        }
         List<Settings.Choice> choices = Settings.inSection(section);
         for (Settings.Choice c : choices) p.addView(choiceRow(c, prefs), Ui.fill(gap));
         if (Settings.S_CONTROLS.equals(section)) {

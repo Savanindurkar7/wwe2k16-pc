@@ -276,9 +276,13 @@ echo "sdk.dir=$ASDK" > "$AP/local.properties"
 
 step "7/8 Build APK"
 VCODE="$(git rev-list --count HEAD 2>/dev/null || echo 1)"
-VNAME="native-$(git rev-parse --short HEAD 2>/dev/null || echo dev)"
-git diff --quiet 2>/dev/null || VNAME="$VNAME+"
-(cd "$AP" && chmod +x gradlew && ./gradlew --no-daemon -q assembleDebug -PWWE2K16_VERSION_CODE="$VCODE" -PWWE2K16_VERSION_NAME="$VNAME")
+# r18: the version shown in Android App Info and in the app. The release number is WWE2K16_RELEASE (default 1.2.0);
+# the git hash goes in as a build id, shown in the status card and Logs, so a build is still identifiable.
+RELEASE="${WWE2K16_RELEASE:-1.2.0}"
+VNAME="$RELEASE"
+BUILD_ID="$(git rev-parse --short HEAD 2>/dev/null || echo dev)"
+git diff --quiet 2>/dev/null || BUILD_ID="$BUILD_ID+"
+(cd "$AP" && chmod +x gradlew && ./gradlew --no-daemon -q assembleDebug -PWWE2K16_VERSION_CODE="$VCODE" -PWWE2K16_VERSION_NAME="$VNAME" -PWWE2K16_BUILD_ID="$BUILD_ID")
 
 step "8/8 Verify APK"
 APK_SRC="$AP/app/build/outputs/apk/debug/app-debug.apk"
@@ -293,7 +297,7 @@ echo "  built-in drivers: $(grep -c "assets/drivers/.*\.zip" <<<"$LISTING" || tr
 "$ASDK/build-tools/35.0.0/aapt2" dump badging "$APK" 2>/dev/null | grep -E "^package:|^application-label:" | sed 's/^/  /' || true
 "$ASDK/build-tools/35.0.0/apksigner" verify "$APK" && echo "  signature ok"
 echo
-echo "==== DONE. APK: $APK ($(du -h "$APK" | cut -f1)), version $VNAME ($VCODE)"
+echo "==== DONE. APK: $APK ($(du -h "$APK" | cut -f1)), version $VNAME ($VCODE), build $BUILD_ID"
 echo "In the game: Options > Renderer: Classic / Native / Native+ (Native+ is the fastest, the least tested)."
 
 # Termux: the command that brings this APK to the phone (the Codespace's own name, from GitHub's environment).

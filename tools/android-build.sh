@@ -203,9 +203,11 @@ echo "sdk.dir=$ASDK" > "$AP/local.properties"
 
 step "7/9 Build APK"
 VCODE="$(git rev-list --count HEAD 2>/dev/null || echo 1)"
-VNAME="android-$(git rev-parse --short HEAD 2>/dev/null || echo dev)"
-git diff --quiet 2>/dev/null || VNAME="$VNAME+"
-(cd "$AP" && chmod +x gradlew && ./gradlew --no-daemon -q assembleDebug -PWWE2K16_VERSION_CODE="$VCODE" -PWWE2K16_VERSION_NAME="$VNAME")
+RELEASE="${WWE2K16_RELEASE:-1.2.0}"   # r18: real version in App Info; git hash kept as the build id
+VNAME="$RELEASE"
+BUILD_ID="$(git rev-parse --short HEAD 2>/dev/null || echo dev)"
+git diff --quiet 2>/dev/null || BUILD_ID="$BUILD_ID+"
+(cd "$AP" && chmod +x gradlew && ./gradlew --no-daemon -q assembleDebug -PWWE2K16_VERSION_CODE="$VCODE" -PWWE2K16_VERSION_NAME="$VNAME" -PWWE2K16_BUILD_ID="$BUILD_ID")
 
 step "8/9 Verify APK"
 APK_SRC="$AP/app/build/outputs/apk/debug/app-debug.apk"
@@ -218,7 +220,7 @@ for l in "$JNI"/*.so; do grep -q "lib/arm64-v8a/$(basename "$l")" <<<"$(unzip -l
 "$ASDK/build-tools/35.0.0/apksigner" verify "$APK" && echo "  signature ok"
 
 step "9/9 Done"
-echo "APK: $APK ($(du -h "$APK" | cut -f1)), version $VNAME ($VCODE)"
+echo "APK: $APK ($(du -h "$APK" | cut -f1)), version $VNAME ($VCODE), build $BUILD_ID"
 echo "Package com.savanindurkar7.wwe2k16: it installs next to the earlier test APK (org.libsdl.app), which you can uninstall."
 echo "Built and verified as a package only. Installing and playing on the phone is the real test."
 

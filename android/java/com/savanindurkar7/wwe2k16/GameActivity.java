@@ -108,6 +108,34 @@ public class GameActivity extends SDLActivity {
         applyRefreshRate();
         setupTouchControls();
         setupFpsLabel();
+        setupThermalGuard();
+        Integrity.enforceWithNative(this);
+    }
+
+    // --- Heat protection (r18) --------------------------------------------------------------------------------------
+    // The native frame limiter lowers the cap while the phone is hot (src/frame_rate.cpp). Android reports how hot the
+    // phone is through PowerManager; we forward each change to native. Off when WWE2K16_THERMAL_GUARD=0.
+
+    static native void nativeSetThermalStatus(int status);
+
+    private PowerManager.OnThermalStatusChangedListener thermalListener;
+
+    private void setupThermalGuard() {
+        if ("0".equals(System.getenv("WWE2K16_THERMAL_GUARD"))) return;
+        PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+        if (pm == null) return;
+        try {
+            nativeSetThermalStatus(pm.getCurrentThermalStatus());
+            thermalListener = status -> {
+                try {
+                    nativeSetThermalStatus(status);
+                } catch (Throwable ignored) {
+                }
+            };
+            pm.addThermalStatusListener(thermalListener);
+        } catch (Throwable t) {
+            Log.w(TAG, "thermal guard unavailable: " + t);
+        }
     }
 
     // --- FPS label with frame generation ----------------------------------------------------------------------------
@@ -325,6 +353,13 @@ public class GameActivity extends SDLActivity {
     protected void onDestroy() {
         handler.removeCallbacksAndMessages(null);
         if (inputManager != null) inputManager.unregisterInputDeviceListener(padListener);
+        if (thermalListener != null) {
+            PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+            if (pm != null) try {
+                pm.removeThermalStatusListener(thermalListener);
+            } catch (Throwable ignored) {
+            }
+        }
         super.onDestroy();
         // The launcher (below this activity) comes back; this process ends so the next PLAY starts clean.
         android.os.Process.killProcess(android.os.Process.myPid());

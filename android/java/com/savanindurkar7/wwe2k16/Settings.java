@@ -329,6 +329,17 @@ public final class Settings {
               + "fastest cores to themselves; every other thread runs on the remaining cores. Checked every 2 s.",
               "Threads placed by CPU CORES only."));
 
+    // r18: when the phone gets hot the game lowers its own frame cap for a while, so a long session stays steady
+    // instead of collapsing (a Mali-G57 held ~58 FPS then fell to 10 FPS from heat at a 60 cap, vivo V2432,
+    // 2026-11-23). It only ever lowers, never above your cap, and lifts again as the phone cools. A cool phone (most
+    // Adreno sessions) never reaches it, so nothing changes there.
+    public static final Choice THERMAL = new Choice(S_ADVANCED, "thermal_guard", "HEAT PROTECTION", 0,
+            a("on", "off"),
+            a("ON (COOLER)", "OFF"),
+            a("Lowers the frame rate while the phone is hot, then lifts it as it cools: steadier long sessions, less "
+              + "heat. Recommended, especially on Mali phones.",
+              "The frame rate never changes for heat (the phone may get hot and throttle itself)."));
+
     public static final Choice GPU_WAIT = new Choice(S_ADVANCED, "gpu_wait", "GPU THREAD WAITING", 0,
             a("spin", "sleep"),
             a("SPIN (FAST)", "SLEEP (COOLER)"),
@@ -362,7 +373,7 @@ public final class Settings {
             DISPLAY, SCREEN_SHAPE, VSYNC, SHARPNESS,
             CPU_CORES, SPEED_FIX, SHADER_CACHE, FRAME_MONITOR, PERF_HINT, SUSTAINED,
             TOUCH, TOUCH_VIBRATE, RUMBLE,
-            READBACK, MALI_BOOST, MALI_TEXTURES, SHORTCUTS, CP_FAST, CROWD_CULL, HOT_CORES, GPU_WAIT, NATIVE_FRAME, TURNIP_FIX, PERF_LOG, VK_DEBUG,
+            READBACK, MALI_BOOST, MALI_TEXTURES, SHORTCUTS, CP_FAST, CROWD_CULL, HOT_CORES, THERMAL, GPU_WAIT, NATIVE_FRAME, TURNIP_FIX, PERF_LOG, VK_DEBUG,
     };
 
     public static final String KEY_EXTRA_ARGS = "extra_args";
@@ -403,6 +414,66 @@ public final class Settings {
         e.remove(KEY_EXTRA_ARGS);
         e.remove(KEY_DRIVER);
         e.apply();
+    }
+
+    // --- GPU presets (r18) -----------------------------------------------------------------------------------------
+    // The best settings differ by GPU. On first start the launcher detects the GPU (Gpu.family) and applies the
+    // matching preset once (KEY_PRESET_APPLIED); the player can re-apply it any time from Graphics. Re-applying only
+    // sets the keys below, so anything the player changed afterwards stays until they apply again.
+
+    public static final String KEY_PRESET_APPLIED = "preset_applied_v1";
+
+    private static void put(SharedPreferences.Editor e, Choice c, String value) {
+        e.putString(c.key, value);
+    }
+
+    /** Applies the best-known settings for this GPU family ("mali", "adreno", others get the Adreno set). */
+    public static void applyPreset(Context ctx, String family) {
+        SharedPreferences.Editor e = prefs(ctx).edit();
+        boolean mali = Gpu.MALI.equals(family);
+        // Shared base (matches the tested Adreno setup, so existing Adreno users see no change).
+        put(e, RENDERER, "native_plus");
+        put(e, RESOLUTION, "480");
+        put(e, CROWD, "20");
+        put(e, ENTRANCE_CROWD, "10");
+        put(e, SHADOWS, "off");
+        put(e, MSAA, "off");
+        put(e, NATIVE_FRAME, "on");
+        put(e, SHORTCUTS, "all");
+        put(e, CROWD_CULL, "on");
+        put(e, HOT_CORES, "on");
+        put(e, PASS_TRIM, "off");
+        put(e, READBACK, "auto");
+        put(e, CP_FAST, "safe");
+        if (mali) {
+            // Mali: 45 cap (the thermal governor drops it when hot — see THERMAL), sleep wait (far less heat than
+            // spin on Mali phones), both Mali boosts on, smaller textures (Mali reads them directly). A low-end Mali
+            // like the G57 held ~58 FPS then collapsed to 10 at a 60 cap from heat (vivo V2432, 2026-11-23); a 45 cap
+            // plus the governor keeps it steady.
+            put(e, FRAME_RATE, "45");
+            put(e, GPU_WAIT, "sleep");
+            put(e, MALI_BOOST, "all");
+            put(e, MALI_TEXTURES, "small");
+            put(e, DOF, "off");
+        } else {
+            // Adreno / others: 60 cap, spin wait, DoF on — the r14-r16 setup (Nothing A059 ~50-55 in matches).
+            put(e, FRAME_RATE, "60");
+            put(e, GPU_WAIT, "spin");
+            put(e, MALI_BOOST, "off");
+            put(e, MALI_TEXTURES, "normal");
+            put(e, DOF, "on");
+        }
+        e.putBoolean(KEY_PRESET_APPLIED, true);
+        e.apply();
+    }
+
+    /** First start only: detect the GPU and apply its preset once. Returns the family applied, or null if already done. */
+    public static String applyPresetOnceForThisGpu(Context ctx) {
+        SharedPreferences p = prefs(ctx);
+        if (p.getBoolean(KEY_PRESET_APPLIED, false)) return null;
+        String family = Gpu.family(ctx);
+        applyPreset(ctx, family);
+        return family;
     }
 
     // --- Folders ---------------------------------------------------------------------------------------------------
@@ -535,6 +606,9 @@ public final class Settings {
         final String gpuFamily = Gpu.family(ctx);
         final boolean mali = Gpu.MALI.equals(gpuFamily);
         l.env.put("WWE2K16_GPU_FAMILY", gpuFamily);
+        // r18: heat protection. The game lowers its own cap when the phone reports it is hot (GameActivity feeds it the
+        // Android thermal status). Default on; on Mali the governor is a touch earlier since those phones throttle hard.
+        l.env.put("WWE2K16_THERMAL_GUARD", "off".equals(THERMAL.value(p)) ? "0" : (mali ? "2" : "1"));
         if (nat) {
             // The 0.10 SDK names its log with --log_file (0.7 reads WWE2K16_LOG_FILE).
             cvar(l, "log_file", new File(logs, "wwe2k16.log").getAbsolutePath());

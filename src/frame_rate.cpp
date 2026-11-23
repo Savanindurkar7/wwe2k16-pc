@@ -27,12 +27,14 @@
 // block does not hold the expected values (wrong address or layout), logging what it found.
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <jni.h>
 #include <string>
 #include <thread>
 
@@ -113,6 +115,44 @@ uint32_t FrameCap() {
     return value ? uint32_t(std::atoi(value)) : 0u;
   }();
   return cap;
+}
+
+// --- Heat protection (r18) ------------------------------------------------------------------------------------------
+// GameActivity feeds the game the Android thermal status (PowerManager, 0 NONE .. 6 SHUTDOWN) through the JNI call
+// below. When the phone is hot the governor lowers the frame cap to the next value the game already paces cleanly
+// (60 -> 45 -> 30), so a long session stays steady instead of collapsing (a Mali-G57 fell from ~58 to 10 FPS from
+// heat at a 60 cap, vivo V2432, 2026-11-23). It only lowers, never above the player's own cap, and lifts again as the
+// phone cools. WWE2K16_THERMAL_GUARD: 0 off, 1 normal (Adreno default), 2 earlier (Mali default, they throttle hard).
+std::atomic<int> g_thermal_status{0};
+
+int ThermalGuard() {
+  static const int guard = [] {
+    const char* v = std::getenv("WWE2K16_THERMAL_GUARD");
+    return (v && *v) ? std::clamp(std::atoi(v), 0, 2) : 1;
+  }();
+  return guard;
+}
+
+// The highest cap allowed at the current temperature (snapped to 30 / 45 / 60 so the game-speed fix stays on a step
+// it handles). 60 = no heat limit.
+uint32_t ThermalCeiling() {
+  const int guard = ThermalGuard();
+  if (guard == 0) return 60;
+  const int status = g_thermal_status.load(std::memory_order_relaxed);
+  if (guard == 2) {  // Mali: start earlier
+    if (status >= 3) return 30;   // SEVERE+
+    if (status >= 2) return 45;   // MODERATE
+    return 60;
+  }
+  if (status >= 4) return 30;     // CRITICAL+
+  if (status >= 3) return 45;     // SEVERE
+  return 60;
+}
+
+// The cap actually enforced this frame: the player's cap (60 when they chose "no host cap"), lowered by heat.
+uint32_t EffectiveCap() {
+  const uint32_t base = FrameCap() ? FrameCap() : 60u;
+  return std::min(base, ThermalCeiling());
 }
 
 uint64_t SteadyNs() {
@@ -273,7 +313,17 @@ void SpeedFixOnFrame(uint8_t* base, uint64_t now_ns) {
 // WWE2K16_FRAME_CAP=30: the guest waits here until a 30 FPS frame's time is up (the speed fix then sees 33 ms frames
 // and steps the game by 1/30 s, so it runs at normal speed).
 void FrameCapOnFrame() {
-  const uint32_t cap = FrameCap();
+  const uint32_t cap = EffectiveCap();
+  // Log when heat moves the cap, so the perf log shows the governor working.
+  static uint32_t last_logged = 0;
+  if (cap != last_logged) {
+    if (cap < 60 && (last_logged == 0 || last_logged >= 60)) {
+      REXLOG_INFO("[wwe2k16-thermal] phone hot (status {}): frame cap lowered to {} FPS", g_thermal_status.load(), cap);
+    } else if (cap >= 60 && last_logged && last_logged < 60) {
+      REXLOG_INFO("[wwe2k16-thermal] phone cooled: frame cap back to normal");
+    }
+    last_logged = cap;
+  }
   if (cap < 10 || cap >= 60) return;
   static uint64_t next_ns = 0;
   const uint64_t period_ns = 1'000'000'000ull / cap;
@@ -375,4 +425,11 @@ extern "C" PPC_FUNC(WWE2K16_IMP_GpuInterrupt);
 extern "C" PPC_FUNC(WWE2K16_FN_GpuInterrupt) {
   g_d3d_device = ctx.r4.u32;
   WWE2K16_IMP_GpuInterrupt(ctx, base);
+}
+
+// r18: GameActivity reports the Android thermal status here (PowerManager.OnThermalStatusChangedListener), so the
+// heat governor above can lower the frame cap while the phone is hot. 0 NONE .. 6 SHUTDOWN.
+extern "C" JNIEXPORT void JNICALL Java_com_savanindurkar7_wwe2k16_GameActivity_nativeSetThermalStatus(JNIEnv*, jclass,
+                                                                                                     jint status) {
+  g_thermal_status.store(int(status), std::memory_order_relaxed);
 }

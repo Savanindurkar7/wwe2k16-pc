@@ -53,6 +53,8 @@ public class LauncherActivity extends Activity {
         requestWindowFeature(Window.FEATURE_NO_TITLE);
         setRequestedOrientation(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
         Ui.init(this);
+        Integrity.enforce(this);
+        VolvisionUpdateChannel.checkForUpdates(this, BuildInfo.rawVersion(this));
         checkDriverTrial();
         build();
         prepareDrivers();
@@ -65,6 +67,8 @@ public class LauncherActivity extends Activity {
     private void prepareDrivers() {
         new Thread(() -> {
             Gpu.renderer(this);
+            // r18: first start only — detect the GPU and apply its best-settings preset once.
+            final String presetFamily = Settings.applyPresetOnceForThisGpu(this);
             int unpacked = Drivers.installBundled(this);
             SharedPreferences prefs = Settings.prefs(this);
             boolean chose = false;
@@ -78,7 +82,10 @@ public class LauncherActivity extends Activity {
             }
             final boolean selected = chose;
             final String name = selected ? prefs.getString(Settings.KEY_DRIVER, "") : "";
-            if (unpacked > 0 || selected) handler.post(() -> {
+            if (unpacked > 0 || selected || presetFamily != null) handler.post(() -> {
+                if (presetFamily != null) Toast.makeText(this, "Best settings applied for your "
+                        + presetFamily.toUpperCase(java.util.Locale.ROOT) + " GPU (change them in Settings)",
+                        Toast.LENGTH_LONG).show();
                 if (selected) Toast.makeText(this, "Built-in driver \"" + name + "\" selected for your GPU "
                         + "(Settings > GPU driver)", Toast.LENGTH_LONG).show();
                 build();
