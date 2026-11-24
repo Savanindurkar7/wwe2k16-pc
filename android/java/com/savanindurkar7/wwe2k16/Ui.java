@@ -36,7 +36,17 @@ final class Ui {
 
     private Ui() {}
 
+    // r19: the launcher was laid out for a ~900 x 410 dp landscape phone. On a smaller screen, a tablet in an unusual
+    // shape, or with a large system font, parts of the main menu did not fit (1.2.0 testers). Every size now goes
+    // through `scale` (the screen's fit, 0.68 .. 1.0) and text no longer follows the system font size (the layout
+    // can't grow with it), so the menu fits on any screen.
+    static float scale = 1f;
+
     static void init(Context c) {
+        android.util.DisplayMetrics m = c.getResources().getDisplayMetrics();
+        float wDp = Math.max(m.widthPixels, m.heightPixels) / m.density;
+        float hDp = Math.min(m.widthPixels, m.heightPixels) / m.density;
+        scale = Math.max(0.68f, Math.min(1f, Math.min(wDp / 880f, hDp / 400f)));
         if (bold != null) return;
         bold = load(c, R.font.oswald_bold, Typeface.DEFAULT_BOLD);
         semi = load(c, R.font.oswald_semibold, Typeface.DEFAULT_BOLD);
@@ -57,13 +67,14 @@ final class Ui {
     static Typeface regular() { return regular; }
 
     static int dp(Context c, float v) {
-        return Math.round(TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v, c.getResources().getDisplayMetrics()));
+        return Math.round(TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v * scale,
+                c.getResources().getDisplayMetrics()));
     }
 
     static TextView text(Context c, String s, float sp, int color, Typeface face) {
         TextView t = new TextView(c);
         t.setText(s);
-        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, sp);
+        t.setTextSize(TypedValue.COMPLEX_UNIT_DIP, sp * scale);  // r19: fits the screen, not the system font size
         t.setTextColor(color);
         t.setTypeface(face);
         t.setIncludeFontPadding(false);

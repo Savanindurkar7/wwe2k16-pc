@@ -203,7 +203,7 @@ echo "sdk.dir=$ASDK" > "$AP/local.properties"
 
 step "7/9 Build APK"
 VCODE="$(git rev-list --count HEAD 2>/dev/null || echo 1)"
-RELEASE="${WWE2K16_RELEASE:-1.2.0}"   # r18: real version in App Info; git hash kept as the build id
+RELEASE="${WWE2K16_RELEASE:-1.2.1}"   # r18: real version in App Info; git hash kept as the build id
 VNAME="$RELEASE"
 BUILD_ID="$(git rev-parse --short HEAD 2>/dev/null || echo dev)"
 git diff --quiet 2>/dev/null || BUILD_ID="$BUILD_ID+"

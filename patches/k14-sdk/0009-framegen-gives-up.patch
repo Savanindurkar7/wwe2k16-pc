@@ -1,0 +1,43 @@
+diff --git a/src/ui/vulkan/vulkan_presenter_framegen.cpp b/src/ui/vulkan/vulkan_presenter_framegen.cpp
+index 2aa29cc..294aa9b 100644
+--- a/src/ui/vulkan/vulkan_presenter_framegen.cpp
++++ b/src/ui/vulkan/vulkan_presenter_framegen.cpp
+@@ -23,6 +23,7 @@
+  * @license     BSD 3-Clause License (as the SDK)
+  */
+ 
++#include <atomic>
+ #include <algorithm>
+ #include <chrono>
+ #include <cmath>
+@@ -52,6 +53,13 @@ REXCVAR_DEFINE_INT32(present_frame_generation_log_s, 10, "UI/Presenter",
+     .range(0, 3600)
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++
++// wwe2k16 patch (0009): set once frame generation gave up for the session (see the guard below); read by the game.
++static std::atomic<bool> wwe2k16_fg_gave_up{false};
++extern "C" __attribute__((visibility("default"))) int wwe2k16_framegen_gave_up() {
++  return wwe2k16_fg_gave_up.load(std::memory_order_relaxed) ? 1 : 0;
++}
++
+ namespace rex {
+ namespace ui {
+ namespace vulkan {
+@@ -474,6 +482,16 @@ std::shared_ptr<VulkanPresenter::GuestOutputImage> VulkanPresenter::FrameGenProc
+       REXLOG_INFO("[framegen] paused 10 s: {} of {} real frames came after the next new one (paints too slow; only "
+                   "in-between frames would be shown). Pauses so far: {}",
+                   fg.guard_overtaken, fg.guard_new, fg.pauses);
++      // wwe2k16 patch (0009): a phone that can't keep up twice won't later in the session either; frame generation then
++      // stops for good, and the game (src/frame_rate.cpp, wwe2k16_framegen_gave_up) lifts its 30 FPS cap back to the
++      // player's frame rate, so it runs at whatever the phone can do instead of a paused 30 (1.2.0 testers: "frame
++      // generation makes the FPS go down").
++      if (fg.pauses >= 2 && !wwe2k16_fg_gave_up.load(std::memory_order_relaxed)) {
++        fg.pause_until_ns = ~0ull;
++        wwe2k16_fg_gave_up.store(true, std::memory_order_relaxed);
++        REXLOG_INFO("[framegen] stopped for this session after {} pauses: the phone cannot paint the in-between "
++                    "frames in time; the game's own frame rate is used instead", fg.pauses);
++      }
+     }
+     fg.guard_start_ns = now;
+     fg.guard_new = 0;

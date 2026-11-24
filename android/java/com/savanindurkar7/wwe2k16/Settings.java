@@ -333,6 +333,20 @@ public final class Settings {
     // instead of collapsing (a Mali-G57 held ~58 FPS then fell to 10 FPS from heat at a 60 cap, vivo V2432,
     // 2026-11-23). It only ever lowers, never above your cap, and lifts again as the phone cools. A cool phone (most
     // Adreno sessions) never reaches it, so nothing changes there.
+    // r19: how hard the phone is pushed. The 1.2.0 testers' phones ran smoothly but got hot: the busiest game threads
+    // were pinned to the single fastest core (the one that heats most), the GPU thread spun on a core while waiting,
+    // and the heat governor only acted once Android already reported the phone hot. BALANCED keeps the frame rate but
+    // avoids those; COOL also lowers the cap. Applied on top of the other settings at launch (Settings.buildLaunch).
+    public static final Choice PERF_MODE = new Choice(S_GRAPHICS, "perf_mode", "PERFORMANCE MODE", 1,
+            a("max", "balanced", "cool"),
+            a("MAX (HOTTER)", "BALANCED", "COOL (BATTERY)"),
+            a("Everything for frame rate: the busiest threads on the fastest core, the GPU thread spins while waiting, "
+              + "heat protection only when Android says the phone is hot. Runs hottest.",
+              "Recommended. Same frame rate target, less heat: threads kept off the single hottest core, the GPU "
+              + "thread sleeps while waiting, and heat protection acts early from Android's heat forecast.",
+              "Coolest and longest battery: also caps the frame rate (45 on Adreno, 30 on Mali). For long sessions, "
+              + "hot rooms or phones that heat up quickly."));
+
     public static final Choice THERMAL = new Choice(S_ADVANCED, "thermal_guard", "HEAT PROTECTION", 0,
             a("on", "off"),
             a("ON (COOLER)", "OFF"),
@@ -369,7 +383,7 @@ public final class Settings {
               "Off: the Adreno driver alone sends about a million messages per match."));
 
     public static final Choice[] CHOICES = {
-            RENDERER, RESOLUTION, FRAME_GEN, CROWD, ENTRANCE_CROWD, SHADOWS, DOF, PASS_TRIM, FRAME_RATE, MSAA, FAST_AA, UPSCALER, TEXTURES, FILTER,
+            PERF_MODE, RENDERER, RESOLUTION, FRAME_GEN, CROWD, ENTRANCE_CROWD, SHADOWS, DOF, PASS_TRIM, FRAME_RATE, MSAA, FAST_AA, UPSCALER, TEXTURES, FILTER,
             DISPLAY, SCREEN_SHAPE, VSYNC, SHARPNESS,
             CPU_CORES, SPEED_FIX, SHADER_CACHE, FRAME_MONITOR, PERF_HINT, SUSTAINED,
             TOUCH, TOUCH_VIBRATE, RUMBLE,
@@ -416,28 +430,30 @@ public final class Settings {
         e.apply();
     }
 
-    // --- GPU presets (r18) -----------------------------------------------------------------------------------------
-    // The best settings differ by GPU. On first start the launcher detects the GPU (Gpu.family) and applies the
-    // matching preset once (KEY_PRESET_APPLIED); the player can re-apply it any time from Graphics. Re-applying only
-    // sets the keys below, so anything the player changed afterwards stays until they apply again.
+    // --- GPU presets (r18, r19) -----------------------------------------------------------------------------------
+    // The best settings differ by GPU. On first start (and once more after an update that improves them: the key's
+    // version) the launcher detects the GPU (Gpu.family / Gpu.maliTier) and applies the matching preset; the player
+    // can re-apply it any time from Graphics. Re-applying only sets the keys below.
 
-    public static final String KEY_PRESET_APPLIED = "preset_applied_v1";
+    public static final String KEY_PRESET_APPLIED = "preset_applied_v2";  // r19: v2 = re-applied once after 1.2.1
 
     private static void put(SharedPreferences.Editor e, Choice c, String value) {
         e.putString(c.key, value);
     }
 
-    /** Applies the best-known settings for this GPU family ("mali", "adreno", others get the Adreno set). */
+    /** Applies the best-known settings for this phone's GPU (family: "mali", "adreno", others get the Adreno set). */
     public static void applyPreset(Context ctx, String family) {
         SharedPreferences.Editor e = prefs(ctx).edit();
         boolean mali = Gpu.MALI.equals(family);
-        // Shared base (matches the tested Adreno setup, so existing Adreno users see no change).
+        int tier = mali ? Gpu.maliTier(ctx) : Gpu.MALI_NONE;
+        // Shared base (the tested Adreno setup).
         put(e, RENDERER, "native_plus");
         put(e, RESOLUTION, "480");
         put(e, CROWD, "20");
         put(e, ENTRANCE_CROWD, "10");
         put(e, SHADOWS, "off");
         put(e, MSAA, "off");
+        put(e, FRAME_GEN, "off");
         put(e, NATIVE_FRAME, "on");
         put(e, SHORTCUTS, "all");
         put(e, CROWD_CULL, "on");
@@ -445,35 +461,128 @@ public final class Settings {
         put(e, PASS_TRIM, "off");
         put(e, READBACK, "auto");
         put(e, CP_FAST, "safe");
+        put(e, THERMAL, "on");
+        put(e, PERF_MODE, "balanced");
         if (mali) {
-            // Mali: 45 cap (the thermal governor drops it when hot — see THERMAL), sleep wait (far less heat than
-            // spin on Mali phones), both Mali boosts on, smaller textures (Mali reads them directly). A low-end Mali
-            // like the G57 held ~58 FPS then collapsed to 10 at a 60 cap from heat (vivo V2432, 2026-11-23); a 45 cap
-            // plus the governor keeps it steady.
-            put(e, FRAME_RATE, "45");
+            // r19: the safe half of the Mali boost only (geometry shaders avoided). The other two switches (classic
+            // render passes, vertices as attributes) and the ASTC textures were suspects in the 1.2.0 Mali glitches
+            // (flat brown / orange scenes, stretched ropes, a red screen on a Mali-G615), so they are off.
+            put(e, MALI_BOOST, "nogs");
+            put(e, MALI_TEXTURES, "normal");
             put(e, GPU_WAIT, "sleep");
-            put(e, MALI_BOOST, "all");
-            put(e, MALI_TEXTURES, "small");
             put(e, DOF, "off");
+            put(e, FILTER, "0");
+            if (tier == Gpu.MALI_LOW) {
+                put(e, RESOLUTION, "360");
+                put(e, FRAME_RATE, "30");
+                put(e, CROWD, "0");
+                put(e, ENTRANCE_CROWD, "0");
+            } else {
+                put(e, FRAME_RATE, "45");
+            }
         } else {
-            // Adreno / others: 60 cap, spin wait, DoF on — the r14-r16 setup (Nothing A059 ~50-55 in matches).
+            // Adreno / others: 60 cap, DoF on — the r14-r16 setup (Nothing A059 ~50-55 in matches).
             put(e, FRAME_RATE, "60");
             put(e, GPU_WAIT, "spin");
-            put(e, MALI_BOOST, "off");
+            put(e, MALI_BOOST, "nogs");
             put(e, MALI_TEXTURES, "normal");
             put(e, DOF, "on");
         }
         e.putBoolean(KEY_PRESET_APPLIED, true);
         e.apply();
+        enforceLocks(ctx);
     }
 
-    /** First start only: detect the GPU and apply its preset once. Returns the family applied, or null if already done. */
+    /** First start (or first start of a version with a better preset): apply it once. Returns the family, or null. */
     public static String applyPresetOnceForThisGpu(Context ctx) {
         SharedPreferences p = prefs(ctx);
         if (p.getBoolean(KEY_PRESET_APPLIED, false)) return null;
         String family = Gpu.family(ctx);
         applyPreset(ctx, family);
         return family;
+    }
+
+    // --- High-settings lock for Mali (r19) --------------------------------------------------------------------------
+    // Settings that make the game unplayable on a Mali phone (single-digit FPS, overheating, glitches) cannot be chosen
+    // there. The limits depend on the Mali tier (Gpu.maliTier). Adreno and other GPUs have no locks.
+
+    /** Why `value` of `c` is locked on this phone, or null when it may be chosen. */
+    public static String lockReason(Context ctx, Choice c, String value) {
+        // r19: frame generation needs a GPU that paints the in-between frames in time: Adreno 7xx / 8xx. Elsewhere it
+        // only lowered the real frame rate (and on a Mali-G52 lost the GPU device), so it is locked.
+        if (c == FRAME_GEN && "on".equals(value) && !(Gpu.ADRENO.equals(Gpu.family(ctx))
+                && Gpu.adrenoGeneration(ctx) >= 7)) {
+            return "Frame generation needs an Adreno 7xx / 8xx GPU";
+        }
+        int tier = Gpu.maliTier(ctx);
+        if (tier == Gpu.MALI_NONE) return null;
+        String tierName = Gpu.maliTierName(tier) + " Mali";
+        if (c == FRAME_GEN && "on".equals(value)) return "Frame generation is locked on Mali (it lowers the real FPS)";
+        if (c == MSAA && !"off".equals(value)) return "MSAA is locked on Mali";
+        if (c == MALI_BOOST && "all".equals(value)) return "The experimental Mali boost is locked (it caused glitches)";
+        if (c == CP_FAST && "all".equals(value)) return "Locked on Mali";
+        if (c == SHADOWS && "on".equals(value)) return "Full shadows are locked on Mali";
+        if (c == SHADOWS && "half".equals(value) && tier < Gpu.MALI_HIGH) return "Shadows are locked on " + tierName;
+        if (c == RESOLUTION) {
+            int max = tier == Gpu.MALI_HIGH ? 540 : 480;
+            if (parse(value) > max) return "Above " + max + "p is locked on " + tierName;
+        }
+        if (c == CROWD) {
+            int max = tier == Gpu.MALI_HIGH ? 50 : 20;
+            if (parse(value) > max) return "Crowd above " + max + "% is locked on " + tierName;
+        }
+        if (c == FRAME_RATE && "60".equals(value) && tier < Gpu.MALI_HIGH) {
+            return "60 FPS is locked on " + tierName + " (it overheats and drops to a stutter)";
+        }
+        if (c == FILTER && parse(value) > 2 && tier < Gpu.MALI_HIGH) return "Locked on " + tierName;
+        if (c == DOF && "on".equals(value) && tier == Gpu.MALI_LOW) return "Depth of field is locked on " + tierName;
+        if (c == RENDERER && "classic".equals(value)) return "The classic renderer is locked on Mali (far slower)";
+        return null;
+    }
+
+    private static int parse(String v) {
+        try {
+            return Integer.parseInt(v);
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
+    /** True when at least one value of this choice is locked on this phone (shown on its row). */
+    public static boolean hasLocks(Context ctx, Choice c) {
+        for (String v : c.values) if (lockReason(ctx, c, v) != null) return true;
+        return false;
+    }
+
+    /**
+     * Moves every locked setting to the nearest allowed value (run at start and before each launch, so an old saved
+     * value or an edited preferences file can't get past the lock). Returns how many were changed.
+     */
+    public static int enforceLocks(Context ctx) {
+        SharedPreferences p = prefs(ctx);
+        SharedPreferences.Editor e = p.edit();
+        int changed = 0;
+        for (Choice c : CHOICES) {
+            String v = c.value(p);
+            if (lockReason(ctx, c, v) == null) continue;
+            int i = c.index(p);
+            String pick = null;
+            for (int d = 1; d < c.values.length && pick == null; d++) {  // the nearest allowed, lower first
+                for (int sgn : new int[] {+1, -1}) {
+                    int j = i + sgn * d;
+                    if (j >= 0 && j < c.values.length && lockReason(ctx, c, c.values[j]) == null) {
+                        pick = c.values[j];
+                        break;
+                    }
+                }
+            }
+            if (pick != null) {
+                e.putString(c.key, pick);
+                changed++;
+            }
+        }
+        if (changed > 0) e.apply();
+        return changed;
     }
 
     // --- Folders ---------------------------------------------------------------------------------------------------
@@ -515,6 +624,7 @@ public final class Settings {
     }
 
     public static Launch buildLaunch(Context ctx) {
+        enforceLocks(ctx);  // r19: no locked value reaches the game, whatever is saved
         SharedPreferences p = prefs(ctx);
         Launch l = new Launch();
         // Resolution: the SDK draws at whole multiples of the game's 720p.
@@ -527,7 +637,10 @@ public final class Settings {
             l.env.put("WWE2K16_PASS_TRIM", "on".equals(PASS_TRIM.value(p)) ? "1" : "0");
             l.env.put("WWE2K16_CP_FAST", CP_FAST.value(p));
             if ("on".equals(CROWD_CULL.value(p))) cvar(l, "gpu_scene_crowd_cull", "2");
-            if ("sleep".equals(GPU_WAIT.value(p))) cvar(l, "gpu_wait_reg_mem_sleep_us", "50");
+            // r19: BALANCED / COOL make the GPU thread sleep while it waits (a spinning wait keeps a core at 100%).
+            if ("sleep".equals(GPU_WAIT.value(p)) || !"max".equals(PERF_MODE.value(p))) {
+                cvar(l, "gpu_wait_reg_mem_sleep_us", "50");
+            }
             l.env.put("WWE2K16_NATIVE_FRAME", "on".equals(NATIVE_FRAME.value(p)) ? "1" : "0");
             if ("on".equals(PERF_LOG.value(p))) {
                 l.env.put("WWE2K16_THREAD_PROFILE", "1");
@@ -565,7 +678,14 @@ public final class Settings {
 
         String fr = FRAME_RATE.value(p);
         boolean fg = nat && "on".equals(FRAME_GEN.value(p));
+        // r19: the player's own cap, restored if frame generation gives up for the session (SDK patch 0009).
+        l.env.put("WWE2K16_FG_RESTORE_CAP", "45".equals(fr) ? "45" : "30".equals(fr) ? "30" : "0");
         if (fg) fr = "30";  // frame generation v3: a steady 30 from the game, 60 on the screen
+        // r19: COOL caps the frame rate (45 on Adreno and others, 30 on Mali), never raising a lower choice.
+        if ("cool".equals(PERF_MODE.value(p)) && !fg) {
+            String coolCap = Gpu.isMali(ctx) ? "30" : "45";
+            if ("60".equals(fr) || "classic".equals(fr) || ("45".equals(fr) && "30".equals(coolCap))) fr = coolCap;
+        }
         l.env.put("WWE2K16_KEEP_60", "classic".equals(fr) ? "0" : "1");
         l.env.put("WWE2K16_FRAME_CAP", "30".equals(fr) ? "30" : "45".equals(fr) ? "45" : "0");
         // The screen's refresh rate (GameActivity): 60 Hz for frame generation (30 + 30 evenly), 90 Hz for 45 FPS.
@@ -586,7 +706,10 @@ public final class Settings {
         l.env.put("WWE2K16_VSYNC", VSYNC.value(p));
 
         l.env.put("WWE2K16_CPU_CORES", CPU_CORES.value(p));
-        l.env.put("WWE2K16_HOT_CORES", "on".equals(HOT_CORES.value(p)) ? "1" : "0");
+        // r19: 1 = MAX (the two fastest cores), 2 = BALANCED (a lone prime core skipped), 3 = COOL (and left idle).
+        String perfMode = PERF_MODE.value(p);
+        l.env.put("WWE2K16_HOT_CORES", !"on".equals(HOT_CORES.value(p)) ? "0"
+                : "max".equals(perfMode) ? "1" : "cool".equals(perfMode) ? "3" : "2");
         l.env.put("WWE2K16_SPEED_FIX", SPEED_FIX.value(p));
         boolean cache = "1".equals(SHADER_CACHE.value(p));
         cvar(l, nat ? "vulkan_disk_pipeline_cache" : "vulkan_pipeline_cache", cache ? "true" : "false");
@@ -608,7 +731,11 @@ public final class Settings {
         l.env.put("WWE2K16_GPU_FAMILY", gpuFamily);
         // r18: heat protection. The game lowers its own cap when the phone reports it is hot (GameActivity feeds it the
         // Android thermal status). Default on; on Mali the governor is a touch earlier since those phones throttle hard.
-        l.env.put("WWE2K16_THERMAL_GUARD", "off".equals(THERMAL.value(p)) ? "0" : (mali ? "2" : "1"));
+        boolean coolMode = "cool".equals(PERF_MODE.value(p));
+        l.env.put("WWE2K16_THERMAL_GUARD", "off".equals(THERMAL.value(p)) ? "0" : ((mali || coolMode) ? "2" : "1"));
+        // r19: BALANCED / COOL also use Android's heat forecast, so the cap drops before the phone is hot.
+        l.env.put("WWE2K16_THERMAL_FORECAST",
+                !"off".equals(THERMAL.value(p)) && !"max".equals(PERF_MODE.value(p)) ? "1" : "0");
         if (nat) {
             // The 0.10 SDK names its log with --log_file (0.7 reads WWE2K16_LOG_FILE).
             cvar(l, "log_file", new File(logs, "wwe2k16.log").getAbsolutePath());
@@ -684,6 +811,7 @@ public final class Settings {
         l.summary.append("BUILD: ").append(nat ? "native (WWE 2K14 SDK)" : "classic (ReXGlue 0.7)").append('\n');
         l.summary.append("GPU DRIVER: ").append(driver.isEmpty() ? "System" : driver).append('\n');
         l.summary.append("GPU: ").append(Gpu.renderer(ctx)).append(" (").append(gpuFamily).append(")\n");
+        if (mali) l.summary.append("MALI TIER: ").append(Gpu.maliTierName(Gpu.maliTier(ctx))).append('\n');
         l.summary.append("DLC: ").append(Dlc.installed(ctx).size()).append(" installed, ").append(Dlc.waiting(ctx).size())
                 .append(" waiting\n");
         l.summary.append("EXTRA ARGUMENTS: ").append(extra).append('\n');

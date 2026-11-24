@@ -47,6 +47,7 @@ public class OptionsActivity extends Activity {
         requestWindowFeature(Window.FEATURE_NO_TITLE);
         setRequestedOrientation(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
         Ui.init(this);
+        Settings.enforceLocks(this);  // r19: the Mali high-settings lock
         String wanted = getIntent().getStringExtra(EXTRA_SECTION);
         if (wanted != null) for (String sec : Settings.SECTIONS) if (sec.equals(wanted)) section = sec;
         build();
@@ -260,6 +261,23 @@ public class OptionsActivity extends Activity {
         TextView note = Ui.body(this, c.notes[c.index(prefs)], 12, Ui.GREY);
         note.setPadding(0, Ui.dp(this, 5), Ui.dp(this, 8), 0);
         row.addView(note);
+        if (Settings.hasLocks(this, c)) {
+            // r19: say which choices are locked on this Mali and why.
+            StringBuilder locked = new StringBuilder();
+            String reason = null;
+            for (int k = 0; k < c.values.length; k++) {
+                String r = Settings.lockReason(this, c, c.values[k]);
+                if (r == null) continue;
+                if (locked.length() > 0) locked.append(", ");
+                locked.append(c.labels[k]);
+                if (reason == null) reason = r;
+            }
+            String where = Gpu.isMali(this) ? "your " + Gpu.maliTierName(Gpu.maliTier(this)) + " Mali GPU" : "your GPU";
+            TextView lock = Ui.body(this, "\uD83D\uDD12 Locked on " + where + ": " + locked + ". " + reason + ".",
+                    11.5f, 0xFFE8A33D);
+            lock.setPadding(0, Ui.dp(this, 4), Ui.dp(this, 8), 0);
+            row.addView(lock);
+        }
 
         Runnable refresh = () -> {
             int i = c.index(prefs);
@@ -293,9 +311,15 @@ public class OptionsActivity extends Activity {
         return row;
     }
 
-    private static void step(Settings.Choice c, SharedPreferences prefs, int delta) {
+    private void step(Settings.Choice c, SharedPreferences prefs, int delta) {
         int n = c.values.length;
-        int i = ((c.index(prefs) + delta) % n + n) % n;
+        int i = c.index(prefs);
+        // r19: locked values (the Mali high-settings lock) are skipped.
+        for (int tries = 0; tries < n; tries++) {
+            i = ((i + delta) % n + n) % n;
+            if (Settings.lockReason(this, c, c.values[i]) == null) break;
+        }
+        if (Settings.lockReason(this, c, c.values[i]) != null) return;
         prefs.edit().putString(c.key, c.values[i]).apply();
     }
 
@@ -323,7 +347,7 @@ public class OptionsActivity extends Activity {
             advice = "Keep the System driver unless you know a custom driver for your GPU.";
         }
         TextView info = Ui.body(this, phone + ".\n" + advice + "\n\nBUILT-IN drivers come with the app. You can still "
-                + "import any adrenotools driver zip (meta.json + libvulkan_*.so). If a driver crashes the game, the "
+                + "import any driver: a zip, tar or tar.gz package, or the driver .so itself. If a driver crashes the game, the "
                 + "launcher switches back to System by itself.", 12.5f, Ui.GREY);
         info.setPadding(0, Ui.dp(this, 4), 0, Ui.dp(this, 6));
         p.addView(info);
@@ -340,6 +364,9 @@ public class OptionsActivity extends Activity {
             if (d.bundled) detail.append("BUILT-IN · ");
             if (recommended != null && d.name.equals(recommended.name)) detail.append("RECOMMENDED FOR YOUR GPU · ");
             if (Drivers.wrongFamily(this, d)) detail.append("NOT FOR YOUR GPU · ");
+            if (d.isQualcommBlob()) detail.append("QUALCOMM DRIVER: SLOW SHADERS IN THIS GAME (BLACK REPLAYS) · ");
+            Drivers.Driver better = Drivers.betterBuiltIn(this, d);
+            if (better != null) detail.append("USE " + better.name.toUpperCase(java.util.Locale.ROOT) + " INSTEAD · ");
             detail.append(d.note.isEmpty() ? d.library : d.note);
             if (!d.description.isEmpty()) detail.append(" · ").append(d.description);
             p.addView(driverRow(d.name, detail.toString(), d.name.equals(current), v -> {
@@ -370,7 +397,8 @@ public class OptionsActivity extends Activity {
                     .setNegativeButton("Cancel", null)
                     .show()), Ui.fill(gap));
         }
-        p.addView(Ui.menuButton(this, "Import driver (.zip)", "Choose a Turnip / adrenotools driver zip", true, v -> {
+        p.addView(Ui.menuButton(this, "Import driver", "Any driver file: .zip, .tar, .tar.gz or the .so itself (Turnip, "
+                + "Qualcomm, Mali and other adrenotools drivers)", true, v -> {
             Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
             i.addCategory(Intent.CATEGORY_OPENABLE);
             i.setType("*/*");

@@ -78,6 +78,9 @@
 #define WWE2K16_TIMING_BLOCK 0x83793780
 #endif
 
+// (r19) SDK patch 0009: 1 once frame generation gave up for the session. Weak: absent in an SDK without the patch.
+extern "C" int wwe2k16_framegen_gave_up() __attribute__((weak));
+
 namespace {
 
 constexpr uint32_t kTimingBlock = WWE2K16_TIMING_BLOCK;
@@ -124,6 +127,10 @@ uint32_t FrameCap() {
 // heat at a 60 cap, vivo V2432, 2026-11-23). It only lowers, never above the player's own cap, and lifts again as the
 // phone cools. WWE2K16_THERMAL_GUARD: 0 off, 1 normal (Adreno default), 2 earlier (Mali default, they throttle hard).
 std::atomic<int> g_thermal_status{0};
+// (r19) Android's heat forecast (PowerManager.getThermalHeadroom, 10 s ahead) as the same 0..6 scale, sent by
+// GameActivity in BALANCED / COOL so the governor acts before the phone is hot, not after (1.2.0 testers: "runs smooth
+// but the phone heats"). 0 when not used.
+std::atomic<int> g_thermal_forecast{0};
 
 int ThermalGuard() {
   static const int guard = [] {
@@ -133,12 +140,13 @@ int ThermalGuard() {
   return guard;
 }
 
-// The highest cap allowed at the current temperature (snapped to 30 / 45 / 60 so the game-speed fix stays on a step
-// it handles). 60 = no heat limit.
-uint32_t ThermalCeiling() {
+// The highest cap the temperature allows right now (snapped to 30 / 45 / 60 so the game-speed fix stays on a step it
+// handles). 60 = no heat limit.
+uint32_t ThermalTarget() {
   const int guard = ThermalGuard();
   if (guard == 0) return 60;
-  const int status = g_thermal_status.load(std::memory_order_relaxed);
+  const int status = std::max(g_thermal_status.load(std::memory_order_relaxed),
+                              g_thermal_forecast.load(std::memory_order_relaxed));
   if (guard == 2) {  // Mali: start earlier
     if (status >= 3) return 30;   // SEVERE+
     if (status >= 2) return 45;   // MODERATE
@@ -149,10 +157,48 @@ uint32_t ThermalCeiling() {
   return 60;
 }
 
+// (r19) Hysteresis: a lowered ceiling is kept at least 20 s, then raised one step (30 -> 45 -> 60) at a time, so the
+// frame rate no longer flips between 45 and 60 every few seconds as the reading hovers at a boundary (a Mali-G615:
+// lowered, "cooled" 2 s later, lowered again, 2026-11-24).
+uint32_t ThermalCeiling() {
+  using clock = std::chrono::steady_clock;
+  static uint32_t held = 60;
+  static clock::time_point changed{};
+  const uint32_t target = ThermalTarget();
+  const auto now = clock::now();
+  if (target < held) {
+    held = target;
+    changed = now;
+  } else if (target > held && now - changed >= std::chrono::seconds(20)) {
+    held = held == 30 ? 45u : 60u;
+    changed = now;
+  }
+  return held;
+}
+
+// (r19) Frame generation forces a 30 cap (it doubles 30 to 60). When it gives up for the session (SDK patch 0009: the
+// phone could not paint the in-between frames in time, twice) the cap goes back to the player's own frame rate
+// (WWE2K16_FG_RESTORE_CAP: 0 = 60), so the game runs at what the phone can do instead of a plain 30.
+uint32_t BaseCap() {
+  static const uint32_t restore = [] {
+    const char* v = std::getenv("WWE2K16_FG_RESTORE_CAP");
+    return v ? uint32_t(std::atoi(v)) : 0u;
+  }();
+  static bool announced = false;
+  if (std::getenv("WWE2K16_FRAMEGEN") && std::getenv("WWE2K16_FRAMEGEN")[0] == '1' && wwe2k16_framegen_gave_up &&
+      wwe2k16_framegen_gave_up()) {
+    if (!announced) {
+      announced = true;
+      REXLOG_INFO("[wwe2k16-fg] frame generation stopped: frame cap back to {} FPS", restore ? restore : 60u);
+    }
+    return restore ? restore : 60u;
+  }
+  return FrameCap() ? FrameCap() : 60u;
+}
+
 // The cap actually enforced this frame: the player's cap (60 when they chose "no host cap"), lowered by heat.
 uint32_t EffectiveCap() {
-  const uint32_t base = FrameCap() ? FrameCap() : 60u;
-  return std::min(base, ThermalCeiling());
+  return std::min(BaseCap(), ThermalCeiling());
 }
 
 uint64_t SteadyNs() {
@@ -314,15 +360,22 @@ void SpeedFixOnFrame(uint8_t* base, uint64_t now_ns) {
 // and steps the game by 1/30 s, so it runs at normal speed).
 void FrameCapOnFrame() {
   const uint32_t cap = EffectiveCap();
-  // Log when heat moves the cap, so the perf log shows the governor working.
-  static uint32_t last_logged = 0;
-  if (cap != last_logged) {
-    if (cap < 60 && (last_logged == 0 || last_logged >= 60)) {
-      REXLOG_INFO("[wwe2k16-thermal] phone hot (status {}): frame cap lowered to {} FPS", g_thermal_status.load(), cap);
-    } else if (cap >= 60 && last_logged && last_logged < 60) {
-      REXLOG_INFO("[wwe2k16-thermal] phone cooled: frame cap back to normal");
+  // Log when heat moves the cap, so the perf log shows the governor working. (r19) Only heat: a cap below 60 that the
+  // player chose (45 / 30 / frame generation) is not "phone hot" (1.2.0 logged "status 0: lowered to 30").
+  {
+    static uint32_t last_heat = 60;
+    const uint32_t heat = ThermalCeiling();
+    const uint32_t base = BaseCap();
+    const uint32_t heat_cap = heat < base ? heat : 60u;
+    if (heat_cap != last_heat) {
+      if (heat_cap < 60) {
+        REXLOG_INFO("[wwe2k16-thermal] phone hot (status {}, forecast {}): frame cap lowered to {} FPS",
+                    g_thermal_status.load(), g_thermal_forecast.load(), heat_cap);
+      } else {
+        REXLOG_INFO("[wwe2k16-thermal] phone cooled: frame cap back to {} FPS", base);
+      }
+      last_heat = heat_cap;
     }
-    last_logged = cap;
   }
   if (cap < 10 || cap >= 60) return;
   static uint64_t next_ns = 0;
@@ -432,4 +485,10 @@ extern "C" PPC_FUNC(WWE2K16_FN_GpuInterrupt) {
 extern "C" JNIEXPORT void JNICALL Java_com_savanindurkar7_wwe2k16_GameActivity_nativeSetThermalStatus(JNIEnv*, jclass,
                                                                                                      jint status) {
   g_thermal_status.store(int(status), std::memory_order_relaxed);
+}
+
+// r19: the heat forecast (getThermalHeadroom mapped to the same 0..6 scale by GameActivity).
+extern "C" JNIEXPORT void JNICALL Java_com_savanindurkar7_wwe2k16_GameActivity_nativeSetThermalForecast(JNIEnv*, jclass,
+                                                                                                       jint status) {
+  g_thermal_forecast.store(int(status), std::memory_order_relaxed);
 }

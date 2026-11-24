@@ -80,14 +80,45 @@ public class LauncherActivity extends Activity {
                     chose = true;
                 }
             }
+            // r19: a built-in Turnip for another Adreno generation is switched to the matching one (an Adreno 825 ran
+            // the A6xx-A7xx build). Only built-in ones: a driver the player imported is left alone.
+            String corrected = null;
+            Drivers.Driver current = Drivers.find(this, prefs.getString(Settings.KEY_DRIVER, ""));
+            Drivers.Driver better = Drivers.betterBuiltIn(this, current);
+            if (better != null) {
+                prefs.edit().putString(Settings.KEY_DRIVER, better.name).apply();
+                corrected = better.name;
+                current = better;
+            }
+            // r19: an Adreno phone on the System driver or a Qualcomm driver is offered the built-in Turnip (once per
+            // driver choice).
+            final String advice = Drivers.adrenoAdvice(this, current);
+            final String adviceKey = prefs.getString(Settings.KEY_DRIVER, "");
+            final boolean showAdvice = advice != null && !adviceKey.equals(prefs.getString("driver_advice_for", null));
+            final Drivers.Driver rec = Drivers.recommended(this);
+            final String fixedTo = corrected;
             final boolean selected = chose;
             final String name = selected ? prefs.getString(Settings.KEY_DRIVER, "") : "";
-            if (unpacked > 0 || selected || presetFamily != null) handler.post(() -> {
+            if (unpacked > 0 || selected || presetFamily != null || fixedTo != null || showAdvice) handler.post(() -> {
                 if (presetFamily != null) Toast.makeText(this, "Best settings applied for your "
                         + presetFamily.toUpperCase(java.util.Locale.ROOT) + " GPU (change them in Settings)",
                         Toast.LENGTH_LONG).show();
                 if (selected) Toast.makeText(this, "Built-in driver \"" + name + "\" selected for your GPU "
                         + "(Settings > GPU driver)", Toast.LENGTH_LONG).show();
+                if (fixedTo != null) Toast.makeText(this, "Switched to \"" + fixedTo + "\": the driver made for your "
+                        + "GPU", Toast.LENGTH_LONG).show();
+                if (showAdvice && rec != null && !isFinishing()) {
+                    prefs.edit().putString("driver_advice_for", adviceKey).apply();
+                    new AlertDialog.Builder(this)
+                            .setTitle("Faster driver for your GPU")
+                            .setMessage(advice)
+                            .setPositiveButton("Use " + rec.name, (d, w) -> {
+                                prefs.edit().putString(Settings.KEY_DRIVER, rec.name).apply();
+                                build();
+                            })
+                            .setNegativeButton("Keep current", null)
+                            .show();
+                }
                 build();
             });
         }, "prepare-drivers").start();
@@ -148,10 +179,11 @@ public class LauncherActivity extends Activity {
             if (art == null || art.size() < 2 || heroArt == null) return;
             artIndex = (artIndex + 1) % art.size();
             final int id = art.get(artIndex);
-            heroArt.animate().alpha(0f).setDuration(350).withEndAction(() -> {
+            heroArt.animate().alpha(0f).setDuration(420).withEndAction(() -> {
                 setArt(heroArt, id, 1400);
                 setArt(backArt, id, 960);
-                heroArt.animate().alpha(1f).setDuration(450).start();
+                heroArt.animate().alpha(1f).setDuration(600).start();
+                Motion.kenBurns(heroArt, 7600, (artIndex & 1) == 1);  // r19: slow pan and zoom on each slide
             }).start();
             handler.postDelayed(this, 7000);
         }
@@ -161,6 +193,7 @@ public class LauncherActivity extends Activity {
     protected void onPause() {
         super.onPause();
         handler.removeCallbacks(slideshow);
+        Motion.stopAll();  // r19: no animation runs while the launcher is not on screen
     }
 
     private void setArt(ImageView v, int id, int maxWidth) {
@@ -172,8 +205,11 @@ public class LauncherActivity extends Activity {
     private int screenW() { return getResources().getDisplayMetrics().widthPixels; }
     private int screenH() { return getResources().getDisplayMetrics().heightPixels; }
 
+    private String animatedPage;  // r19: the page whose entrance animation already ran
+
     private void build() {
         handler.removeCallbacks(slideshow);
+        Motion.stopAll();
         art = Home.artIds(this);
         FrameLayout root = new FrameLayout(this);
         root.setBackgroundColor(0xFF0A0204);
@@ -205,6 +241,15 @@ public class LauncherActivity extends Activity {
         View first = root.findViewWithTag("first");
         if (first != null) first.requestFocus();
         if ("home".equals(page) && art.size() > 1) handler.postDelayed(slideshow, 7000);
+        // r19: a page slides in when it is opened (not on every refresh of the same page).
+        if (!page.equals(animatedPage)) {
+            animatedPage = page;
+            Motion.staggerIn(content, 30);
+        }
+        if ("home".equals(page) && heroArt != null) {
+            final ImageView h = heroArt;
+            h.post(() -> Motion.kenBurns(h, 7600, (artIndex & 1) == 1));
+        }
     }
 
     // --- Sidebar (Shell, shared with the settings) ---
@@ -317,7 +362,10 @@ public class LauncherActivity extends Activity {
                 ? Settings.RENDERER.labels[Settings.RENDERER.index(prefs)] : "Classic";
         String fps = "on".equals(Settings.FRAME_GEN.value(prefs)) && Settings.isNativeBuild(this) ? "30 → 60 FG"
                 : Settings.FRAME_RATE.labels[Settings.FRAME_RATE.index(prefs)].replace(" (STEADY)", "");
-        String[] chipText = {"Recomp", "Vulkan", renderer, fps, "Build " + BuildInfo.versionName(this).split(" ")[0]};
+        String version = "v" + BuildInfo.rawVersion(this);
+        // r19: a small screen gets the essential chips only, so the row never runs off the card.
+        String[] chipText = Ui.scale < 0.86f ? new String[] {renderer, fps, version}
+                : new String[] {"Recomp", "Vulkan", renderer, fps, version};
         for (int i = 0; i < chipText.length; i++) {
             LinearLayout.LayoutParams cl = wrap();
             if (i > 0) cl.leftMargin = Ui.dp(this, 8);
@@ -335,11 +383,27 @@ public class LauncherActivity extends Activity {
         play.setClickable(true);
         play.setTag("first");
         play.setOnClickListener(v -> play());
+        // r19: PLAY breathes, with a soft red halo pulsing behind it (the game is ready).
+        FrameLayout playBox = new FrameLayout(this);
+        View halo = new View(this);
+        halo.setBackground(Ui.rect(0xAAE01433, Ui.dp(this, 16)));
+        playBox.addView(halo, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT));
+        playBox.addView(play, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT));
+        playBox.setClipChildren(false);
+        hero.setClipChildren(false);
         FrameLayout.LayoutParams pl = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.END | Gravity.BOTTOM);
         pl.rightMargin = Ui.dp(this, 22);
         pl.bottomMargin = Ui.dp(this, 20);
-        hero.addView(play, pl);
+        hero.addView(playBox, pl);
+        if (filesProblem() == null) {
+            Motion.halo(halo, 1900);
+            Motion.breathe(play, 0.035f, 2400);
+        } else {
+            halo.setAlpha(0f);
+        }
         content.addView(hero, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
                 Math.max(Ui.dp(this, 200), Math.round(screenH() * 0.50f))));
 
@@ -371,6 +435,12 @@ public class LauncherActivity extends Activity {
         cards.addView(setupCard("Controls", new String[] {"Touch", pad ? "Gamepad ✔" : "Gamepad"}, "Edit layout ›", 2,
                 v -> startActivity(new Intent(this, TouchEditActivity.class))), second);
         content.addView(cards);
+
+        // r19: support the port (Buy Me a Coffee), animated.
+        LinearLayout.LayoutParams sl = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT);
+        sl.topMargin = Ui.dp(this, 16);
+        content.addView(Support.card(this, false), sl);
     }
 
     private View setupCard(String title, String[] chipText, String action, int artSlot, View.OnClickListener click) {
@@ -761,6 +831,7 @@ public class LauncherActivity extends Activity {
         h.setLetterSpacing(0.04f);
         content.addView(h);
         content.addView(Credits.card(this), gapTop(14));
+        content.addView(Support.card(this, true), gapTop(14));  // r19
         LinearLayout thanks = new LinearLayout(this);
         thanks.setOrientation(LinearLayout.VERTICAL);
         Credits.addThanks(this, thanks);
@@ -879,11 +950,11 @@ public class LauncherActivity extends Activity {
         Uri uri = data.getData();
         String path, problem, kind;
         if (requestCode == REQ_FOLDER) {
-            path = GameFiles.treeUriToPath(uri);
+            path = GameFiles.treeUriToPath(this, uri);
             problem = GameFiles.checkFolder(path);
             kind = "folder";
         } else if (requestCode == REQ_ISO) {
-            path = GameFiles.documentUriToPath(uri);
+            path = GameFiles.documentUriToPath(this, uri);
             problem = GameFiles.checkIso(path);
             kind = "iso";
         } else {

@@ -278,11 +278,32 @@ step "7/8 Build APK"
 VCODE="$(git rev-list --count HEAD 2>/dev/null || echo 1)"
 # r18: the version shown in Android App Info and in the app. The release number is WWE2K16_RELEASE (default 1.2.0);
 # the git hash goes in as a build id, shown in the status card and Logs, so a build is still identifiable.
-RELEASE="${WWE2K16_RELEASE:-1.2.0}"
+RELEASE="${WWE2K16_RELEASE:-1.2.1}"
 VNAME="$RELEASE"
 BUILD_ID="$(git rev-parse --short HEAD 2>/dev/null || echo dev)"
 git diff --quiet 2>/dev/null || BUILD_ID="$BUILD_ID+"
+# r19: the signing key. Android installs an update only if it is signed with the same key as the installed app, and
+# this APK is signed with the Codespace's debug key (~/.android/debug.keystore). A new or rebuilt Codespace makes a
+# new key, and players would have to uninstall (losing their saves) to install the next version. So:
+#   signing/debug.keystore in the repo folder (git-ignored: never committed) is the key to sign with, if present;
+#   otherwise the Codespace's key is copied there, so the same key is used from now on;
+#   keep a copy of that file on your phone / PC (the command is printed at the end of the build).
+KEY_SAVED="$ROOT/signing/debug.keystore"
+KEY_LIVE="$HOME/.android/debug.keystore"
+mkdir -p "$ROOT/signing" "$HOME/.android"
+if [ -f "$KEY_SAVED" ]; then
+    if [ -f "$KEY_LIVE" ] && ! cmp -s "$KEY_SAVED" "$KEY_LIVE"; then
+        mv "$KEY_LIVE" "$KEY_LIVE.replaced-$(date +%Y%m%d%H%M%S)"
+        echo "  signing: using the saved key (signing/debug.keystore) instead of this Codespace's new one"
+    fi
+    cp "$KEY_SAVED" "$KEY_LIVE"
+elif [ -f "$KEY_LIVE" ]; then
+    cp "$KEY_LIVE" "$KEY_SAVED"
+    echo "  signing: saved this Codespace's key to signing/debug.keystore (download it and keep it safe!)"
+fi
 (cd "$AP" && chmod +x gradlew && ./gradlew --no-daemon -q assembleDebug -PWWE2K16_VERSION_CODE="$VCODE" -PWWE2K16_VERSION_NAME="$VNAME" -PWWE2K16_BUILD_ID="$BUILD_ID")
+# Gradle makes the key on first use: save it now if it did.
+[ -f "$KEY_SAVED" ] || { [ -f "$KEY_LIVE" ] && cp "$KEY_LIVE" "$KEY_SAVED"; }
 
 step "8/8 Verify APK"
 APK_SRC="$AP/app/build/outputs/apk/debug/app-debug.apk"
@@ -298,6 +319,12 @@ echo "  built-in drivers: $(grep -c "assets/drivers/.*\.zip" <<<"$LISTING" || tr
 "$ASDK/build-tools/35.0.0/apksigner" verify "$APK" && echo "  signature ok"
 echo
 echo "==== DONE. APK: $APK ($(du -h "$APK" | cut -f1)), version $VNAME ($VCODE), build $BUILD_ID"
+if [ -f "$KEY_SAVED" ]; then
+    SHA=$(keytool -list -v -keystore "$KEY_SAVED" -storepass android 2>/dev/null | grep -m1 "SHA256:" | sed 's/.*SHA256: //')
+    echo "  signing key: signing/debug.keystore  (SHA-256 ${SHA:-unknown})"
+    echo "  KEEP A COPY of that key (updates only install over older versions signed with it). In Termux:"
+    echo "    gh codespace cp -e -c <codespace> remote:$KEY_SAVED ~/storage/downloads/wwe2k16-signing.keystore"
+fi
 echo "In the game: Options > Renderer: Classic / Native / Native+ (Native+ is the fastest, the least tested)."
 
 # Termux: the command that brings this APK to the phone (the Codespace's own name, from GitHub's environment).

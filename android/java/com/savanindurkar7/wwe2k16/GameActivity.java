@@ -117,11 +117,31 @@ public class GameActivity extends SDLActivity {
     // phone is through PowerManager; we forward each change to native. Off when WWE2K16_THERMAL_GUARD=0.
 
     static native void nativeSetThermalStatus(int status);
+    static native void nativeSetThermalForecast(int status);
+
+    // r19: Android's heat forecast, every 4 s (BALANCED / COOL). getThermalHeadroom(10) predicts how close the phone
+    // will be to throttling in 10 s (1.0 = throttling); it is mapped onto the thermal-status scale so the native
+    // governor lowers the cap a little before the phone is hot rather than after.
+    private final Runnable thermalForecast = new Runnable() {
+        @Override
+        public void run() {
+            PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+            if (pm != null && android.os.Build.VERSION.SDK_INT >= 30) {
+                try {
+                    float h = pm.getThermalHeadroom(10);
+                    int status = Float.isNaN(h) ? 0 : h >= 1.0f ? 4 : h >= 0.9f ? 3 : h >= 0.8f ? 2 : h >= 0.7f ? 1 : 0;
+                    nativeSetThermalForecast(status);
+                } catch (Throwable ignored) {
+                }
+            }
+            handler.postDelayed(this, 4000);
+        }
+    };
 
     private PowerManager.OnThermalStatusChangedListener thermalListener;
 
     private void setupThermalGuard() {
-        if ("0".equals(System.getenv("WWE2K16_THERMAL_GUARD"))) return;
+        if ("0".equals(android.system.Os.getenv("WWE2K16_THERMAL_GUARD"))) return;
         PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
         if (pm == null) return;
         try {
@@ -136,6 +156,7 @@ public class GameActivity extends SDLActivity {
         } catch (Throwable t) {
             Log.w(TAG, "thermal guard unavailable: " + t);
         }
+        if ("1".equals(android.system.Os.getenv("WWE2K16_THERMAL_FORECAST"))) handler.postDelayed(thermalForecast, 4000);
     }
 
     // --- FPS label with frame generation ----------------------------------------------------------------------------

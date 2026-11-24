@@ -1,0 +1,48 @@
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 057bc5d..f6c0057 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -573,6 +573,16 @@ REXCVAR_DEFINE_BOOL(vulkan_async_skip_incomplete_frames, true, "GPU/Vulkan",
+                     "When async shader compilation is enabled, skip presenting frames that "
+                     "used placeholder pipelines to avoid visible flashing")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
++// wwe2k16 patch (0008): with a driver that makes pipelines slowly (Qualcomm's own Adreno drivers: 34,393 draws skipped
++// while compiling in one session on an Adreno 650, 2026-11-23) every frame of a new scene had a skipped draw, so every
++// frame was held back and the screen stayed on the last complete one for seconds: black when that was a fade (WWE 2K16
++// replays went black for 2-4 s). After this many held frames in a row the next one is shown anyway (a draw or two
++// missing for a frame is far less visible than a frozen or black screen). 0 = hold without a limit (as before).
++REXCVAR_DEFINE_INT32(vulkan_async_skip_incomplete_frames_max, 3, "GPU/Vulkan",
++                     "wwe2k16: the most frames in a row held back by vulkan_async_skip_incomplete_frames; the next "
++                     "one is presented even with a placeholder draw. 0 = no limit")
++    .range(0, 600)
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
+ REXCVAR_DEFINE_BOOL(vulkan_submit_on_primary_buffer_end, true, "GPU/Vulkan",
+                     "Submit command buffer when PM4 primary buffer ends")
+@@ -6614,6 +6624,26 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+   bool skip_present_due_async_placeholder = REXCVAR_GET(async_shader_compilation) &&
+                                             REXCVAR_GET(vulkan_async_skip_incomplete_frames) &&
+                                             frame_used_async_placeholder_pipeline_;
++  // wwe2k16 patch (0008): never hold back more than vulkan_async_skip_incomplete_frames_max frames in a row.
++  {
++    static uint32_t held_in_a_row = 0;
++    static uint64_t shown_anyway = 0;
++    const int32_t max_held = REXCVAR_GET(vulkan_async_skip_incomplete_frames_max);
++    if (skip_present_due_async_placeholder) {
++      if (max_held > 0 && held_in_a_row >= uint32_t(max_held)) {
++        skip_present_due_async_placeholder = false;
++        held_in_a_row = 0;
++        if ((++shown_anyway & (shown_anyway - 1)) == 0) {  // 1, 2, 4, 8, ...
++          REXGPU_INFO("[0008] presented a frame with a draw still compiling after {} held in a row ({} so far): "
++                      "no frozen / black screen while a slow driver makes pipelines", max_held, shown_anyway);
++        }
++      } else {
++        ++held_in_a_row;
++      }
++    } else {
++      held_in_a_row = 0;
++    }
++  }
+   // wwe2k14 patch (Session 6, H1): log the frames held or shown with draws
+   // missing while pipelines are being created.
+   {

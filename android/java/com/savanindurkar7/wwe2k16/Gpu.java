@@ -64,6 +64,44 @@ public final class Gpu {
         return MALI.equals(family(c));
     }
 
+    /** r19: Mali performance tiers for the high-settings lock and presets. 0 = not a Mali. */
+    public static final int MALI_NONE = 0, MALI_LOW = 1, MALI_STANDARD = 2, MALI_HIGH = 3;
+
+    /**
+     * Tier of this phone's Mali GPU, from its name ("Mali-G52 MC2", "Mali-G610 MC6", "Immortalis-G715"):
+     *   HIGH     Immortalis, Mali-G7xx / G8xx / G9xx, or G610 / G615 / G620 with 6+ cores
+     *   STANDARD G68 / G76 / G77 / G78, smaller G610 / G615 builds (3-5 cores)
+     *   LOW      G31 / G51 / G52 / G57 / G71 / G72, and 1-2 core builds of anything newer (a G615 MC2 overheated to
+     *            25 FPS, a G52 ran 8 FPS, a G57 fell to 10 FPS from heat in the 2026-11 tests)
+     */
+    public static int maliTier(Context c) {
+        if (!isMali(c)) return MALI_NONE;
+        return maliTierOf(renderer(c));
+    }
+
+    static int maliTierOf(String r) {
+        String l = r.toLowerCase(Locale.ROOT);
+        int cores = 0;
+        java.util.regex.Matcher mc = java.util.regex.Pattern.compile("mc(\\d+)").matcher(l);
+        if (mc.find()) cores = Integer.parseInt(mc.group(1));
+        int model = 0;
+        java.util.regex.Matcher mm = java.util.regex.Pattern.compile("g(\\d{2,3})").matcher(l);
+        if (mm.find()) model = Integer.parseInt(mm.group(1));
+        if (l.contains("immortalis")) return MALI_HIGH;
+        if (model >= 700) return cores > 0 && cores <= 2 ? MALI_STANDARD : MALI_HIGH;
+        if (model >= 600) {  // G610 / G615 / G620
+            if (cores >= 6) return MALI_HIGH;
+            if (cores > 2) return MALI_STANDARD;
+            return MALI_LOW;
+        }
+        if (model == 68 || model == 76 || model == 77 || model == 78) return cores > 0 && cores <= 2 ? MALI_LOW : MALI_STANDARD;
+        return MALI_LOW;  // G31 / G51 / G52 / G57 / G71 / G72 and unknown
+    }
+
+    public static String maliTierName(int tier) {
+        return tier == MALI_HIGH ? "high-end" : tier == MALI_STANDARD ? "mid-range" : "entry-level";
+    }
+
     /** "Adreno 810"-style generation for picking a Turnip build: 6, 7, 8 or 0 when not an Adreno. */
     public static int adrenoGeneration(Context c) {
         String r = renderer(c);

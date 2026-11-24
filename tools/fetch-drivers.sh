@@ -37,6 +37,26 @@ release_json() {
     if [ -n "$2" ]; then api "repos/$1/releases/tags/$2"; else api "repos/$1/releases/latest"; fi
 }
 
+# release_matching <repo> <python regex on "name tag">  -> JSON of the newest release that matches (r19)
+release_matching() {
+    local list
+    list="$(api "repos/$1/releases?per_page=40")" || return 1
+    REL_LIST="$list" python3 - "$2" <<'PY'
+import json, os, re, sys
+try:
+    rels = json.loads(os.environ["REL_LIST"])
+except Exception:
+    sys.exit(1)
+if not isinstance(rels, list):
+    sys.exit(1)
+for r in rels:
+    text = "%s %s" % (r.get("name") or "", r.get("tag_name") or "")
+    if re.search(sys.argv[1], text, re.I) and r.get("assets"):
+        print(json.dumps(r))
+        break
+PY
+}
+
 # pick <json> <python regex to match> [<python regex to exclude>]  -> "name url" of the first matching asset
 pick() {
     REL_JSON="$1" python3 - "$2" "${3:-}" <<'PY'
@@ -71,8 +91,9 @@ add() {
     if [ -z "$hit" ]; then echo "  WARNING: $repo $tag: no asset matching /$4/"; return; fi
     name="${hit%% *}"; url="${hit#* }"
     if path="$(fetch "$repo" "$tag" "$name" "$url")"; then
-        cp "$path" "$OUT/$name"
-        echo "$name|$6|$7|$8|$9 ($tag)" >> "$INDEX"
+        local staged="${repo%%/*}-$name"   # r19: prefixed by the builder, so two builders' files never collide
+        cp "$path" "$OUT/$staged"
+        echo "$staged|$6|$7|$8|$9 ($tag)" >> "$INDEX"
         echo "  + $6: $name ($(du -h "$path" | cut -f1))"
     else
         echo "  WARNING: could not download $name"
@@ -92,11 +113,31 @@ if J="$(release_json "$REPO" "${TURNIP_TAG:-}")" && [ -n "$J" ]; then
 else
     echo "  WARNING: could not read $REPO releases (no network or rate limit)"
 fi
+# r19: more open-source Turnip builds, as alternatives (gens "any": shown for every Adreno, never auto-switched to or
+# away from). Mesa: MIT. whitebelyash publishes "Stable Turnip" (a Mesa stable branch: the safest pick for older
+# Adreno 6xx) and "Mainline Turnip" (A8xx + A7xx); K11MCH1 publishes Turnip revisions (A6xx / A7xx).
+REPO=whitebelyash/freedreno_turnip-CI
+if J="$(release_matching "$REPO" 'stable turnip')" && [ -n "$J" ]; then
+    T="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("tag_name",""))' <<<"$J")"
+    add "$J" "$REPO" "$T" '\.zip$' '(flushall_debug|debug)' "Turnip Stable (built-in)" adreno any \
+        "Mesa Turnip, stable branch (whitebelyash): the safe pick for older Adreno 6xx and if others glitch"
+fi
+if J="$(release_matching "$REPO" 'mainline turnip')" && [ -n "$J" ]; then
+    T="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("tag_name",""))' <<<"$J")"
+    add "$J" "$REPO" "$T" '\.zip$' '(flushall_debug|debug)' "Turnip Mainline (built-in)" adreno any \
+        "Mesa Turnip mainline (whitebelyash): Adreno 8xx and 7xx, alternative to the A8xx build"
+fi
+REPO=K11MCH1/AdrenoToolsDrivers
+if J="$(release_matching "$REPO" '(turnip|revision|mesa)')" && [ -n "$J" ]; then
+    T="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("tag_name",""))' <<<"$J")"
+    add "$J" "$REPO" "$T" '^[Tt]urnip.*\.zip$' '(a8xx|8xx)' "Turnip K11MCH1 (built-in)" adreno any \
+        "Mesa Turnip revision build (K11MCH1): Adreno 6xx / 7xx alternative"
+fi
 REPO=bmdhacks/malisx2
 if J="$(release_json "$REPO" "${MALISX2_TAG:-}")" && [ -n "$J" ]; then
     T="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("tag_name",""))' <<<"$J")"
     add "$J" "$REPO" "$T" '^malisx2-.*\.zip$' '' "malisx2 Mali (built-in experimental)" mali "" \
-        "Mesa PanVK for Mali (G52-G715, Arm kernel driver), experimental"
+        "Arm Mali driver build for Mali-G52 to G715 (malisx2), experimental: may glitch, System is safer"
 else
     echo "  WARNING: could not read $REPO releases"
 fi
@@ -104,8 +145,9 @@ fi
 n=$(grep -vc '^#' "$INDEX" || true)
 cat > "$ASSETS/LICENSE-drivers.txt" <<'EOF'
 Built-in GPU drivers (assets/drivers):
-- Mesa Turnip (freedreno Vulkan), builds by The412Banner/Banners-Turnip: Mesa 3D, MIT license (https://mesa3d.org).
-- malisx2 (bmdhacks/malisx2): MIT license; built from Mesa 3D (PanVK), MIT license.
+- Mesa Turnip (freedreno Vulkan), builds by The412Banner/Banners-Turnip, whitebelyash and K11MCH1: Mesa 3D, MIT license
+  (https://mesa3d.org).
+- malisx2 (bmdhacks/malisx2): distributed under its own release terms; see its GitHub page.
 Each driver package is unchanged from its GitHub release.
 EOF
 echo "built-in drivers: $n staged in $OUT"

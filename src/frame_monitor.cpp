@@ -369,13 +369,25 @@ struct Pinning {
   bool logged = false;
 
   void Init() {
-    if (const char* h = Env("WWE2K16_HOT_CORES"); h && h[0] == '1') {
+    if (const char* h = Env("WWE2K16_HOT_CORES"); h && h[0] >= '1' && h[0] <= '3') {
       cores = DetectCores();
       hot = cores.valid && cores.by_speed.size() >= 4;
       if (hot) {
-        REXLOG_INFO("[wwe2k16-cores] busy threads get their own cores; fastest cores: cpu{} ({} MHz), cpu{} ({} MHz)",
-                    cores.by_speed[0].first, cores.by_speed[0].second / 1000, cores.by_speed[1].first,
-                    cores.by_speed[1].second / 1000);
+        // (r19) Heat: WWE2K16_HOT_CORES=2 (BALANCED) / 3 (COOL) keep the busy threads off a lone "prime" core (one core
+        // clocked >= 5% above the next: the hottest one on most phones) and use the next two; COOL also keeps every
+        // other thread off it, so it can stay idle. 1 (MAX) = the fastest two, as before.
+        hot_level = h[0] - '0';
+        if (hot_level >= 2 && cores.by_speed.size() >= 5 &&
+            cores.by_speed[0].second * 100 >= cores.by_speed[1].second * 105) {
+          first = 1;
+        }
+        REXLOG_INFO("[wwe2k16-cores] busy threads get their own cores ({}): cpu{} ({} MHz), cpu{} ({} MHz){}",
+                    hot_level == 1 ? "max" : hot_level == 2 ? "balanced" : "cool",
+                    cores.by_speed[first].first, cores.by_speed[first].second / 1000, cores.by_speed[first + 1].first,
+                    cores.by_speed[first + 1].second / 1000,
+                    first ? fmt::format("; prime cpu{} left {}", cores.by_speed[0].first,
+                                        hot_level == 3 ? "idle" : "to light threads")
+                          : std::string());
         return;
       }
     }
@@ -394,6 +406,8 @@ struct Pinning {
   // cores alone; every other thread is kept off those two. Re-chosen every check (2 s), so a new busiest thread (the
   // entrances have their own) gets a core too.
   bool hot = false;
+  int hot_level = 1;   // (r19) 1 max, 2 balanced, 3 cool
+  size_t first = 0;    // (r19) index in by_speed of the first core given to a busy thread (1 = the prime core skipped)
   std::map<int, uint64_t> last_ticks;
   std::vector<int> hot_tids;
   void ApplyHot() {
@@ -430,13 +444,14 @@ struct Pinning {
     cpu_set_t rest;
     CPU_ZERO(&rest);
     for (auto& [cpu, khz] : cores.by_speed) CPU_SET(cpu, &rest);
-    for (size_t i = 0; i < chosen.size(); ++i) CPU_CLR(cores.by_speed[i].first, &rest);
+    for (size_t i = 0; i < chosen.size(); ++i) CPU_CLR(cores.by_speed[first + i].first, &rest);
+    if (first && hot_level == 3) CPU_CLR(cores.by_speed[0].first, &rest);  // (r19) COOL: the prime core stays idle
     for (auto& [tid, ticks] : last_ticks) {
       auto pos = std::find(chosen.begin(), chosen.end(), tid);
       if (pos != chosen.end()) {
         cpu_set_t own;
         CPU_ZERO(&own);
-        CPU_SET(cores.by_speed[size_t(pos - chosen.begin())].first, &own);
+        CPU_SET(cores.by_speed[first + size_t(pos - chosen.begin())].first, &own);
         sched_setaffinity(tid, sizeof(cpu_set_t), &own);
       } else {
         sched_setaffinity(tid, sizeof(cpu_set_t), &rest);
@@ -448,7 +463,7 @@ struct Pinning {
       for (size_t i = 0; i < chosen.size(); ++i) {
         ThreadStat st;
         ReadThreadStat(chosen[i], st);
-        names += fmt::format("{}{} -> cpu{}", i ? ", " : "", st.name, cores.by_speed[i].first);
+        names += fmt::format("{}{} -> cpu{}", i ? ", " : "", st.name, cores.by_speed[first + i].first);
       }
       REXLOG_INFO("[wwe2k16-cores] busy threads on their own cores: {}", names.empty() ? "none busy enough" : names);
     }

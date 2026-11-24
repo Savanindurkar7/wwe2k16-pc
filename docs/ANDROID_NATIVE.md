@@ -232,3 +232,46 @@ Changes:
   brand token doesn't match the Java one, the app kills itself after a random delay. Optional signing-cert pin via
   `WWE2K16_CERT_SHA256` (empty by default, so the owner's debug builds run). Both brand copies use the same FNV-1a, so
   the Java and native branding can't be edited apart.
+
+### r19 (2026-11-24): version 1.2.1 — glitches, heat, Mali lock, drivers, frame generation, launcher
+
+Tester logs (2026-11-23/24): Adreno 650 / 740 / 825, Mali-G52 / G57 / G615.
+- **Black screens in replays (2-4 s):** an Adreno 650 on Qualcomm's own driver v849 skipped 34,393 draws while shaders
+  compiled. Frames with skipped draws are held back, so the screen stayed on the last complete one, which was black
+  after a fade. The same phone on Mainline Turnip skipped 0. Fixes:
+  - **SDK 0008** `vulkan_async_skip_incomplete_frames_max` (default 3): at most 3 held frames in a row.
+  - Qualcomm drivers are flagged in the driver list, and Adreno phones on System / Qualcomm are offered the built-in
+    Turnip once.
+- **Wrong Turnip build:** an Adreno 825 ran the A6xx-A7xx build. `Drivers.betterBuiltIn` switches built-in Turnips to
+  the matching generation. Alternative builds (gens "any") are never switched away from.
+- **Mali glitches** (flat brown scenes, stretched ropes, red screen, Mali-G615 with MALI BOOST all + ASTC). The preset
+  now uses MALI BOOST "nogs" and normal textures. "all" is locked on Mali.
+- **Heat:**
+  - New **PERFORMANCE MODE**: MAX / **BALANCED** (default) / COOL.
+  - BALANCED: busy threads skip a lone prime core (`WWE2K16_HOT_CORES=2`), the GPU thread sleeps while waiting, and
+    the Android heat forecast is on (`getThermalHeadroom(10)` → `nativeSetThermalForecast`).
+  - COOL: also caps at 45 (Adreno) / 30 (Mali) and leaves the prime core idle (`=3`).
+  - Governor: hysteresis (a lowered cap is held ≥20 s, then rises one step at a time), and no false "phone hot" log
+    when the player's own cap is below 60.
+- **Mali high-settings lock** (`Settings.lockReason` / `enforceLocks`, `Gpu.maliTier`: LOW / STANDARD / HIGH by model
+  and core count):
+  - Locked on all Mali: frame generation, MSAA, MALI BOOST all, CP FAST all, classic renderer, full shadows.
+  - Tier limits: resolution 480p (540p HIGH), crowd 20% (50% HIGH), no 60 FPS / half shadows / filter >2x below HIGH,
+    no DoF on LOW.
+  - Applied before every launch and shown on locked rows.
+  - The tier presets: LOW 360p / 30 FPS / no crowd; STANDARD and HIGH 480p / 45.
+  - `preset_applied_v2` re-applies the presets once after the update.
+- **Frame generation:** locked unless Adreno 7xx/8xx. **SDK 0009**: after two guard pauses it stops for the session
+  (`wwe2k16_framegen_gave_up`), and `frame_rate.cpp` restores the player's cap (`WWE2K16_FG_RESTORE_CAP`) instead of
+  staying at 30.
+- **Drivers:**
+  - The importer takes zip (nested), tar, tar.gz or a bare .so, and finds the library by meta.json / libvulkan* /
+    vulkan.* / *vulkan* / the only .so. Each driver's kind is recorded (turnip / qualcomm / mali).
+  - New built-ins: whitebelyash Stable + Mainline Turnip, K11MCH1 Turnip (staged with a builder prefix).
+- **Launcher:**
+  - Fits every screen (`Ui.scale` 0.68-1.0; text no longer follows the system font size).
+  - Motion (`Motion`): Ken Burns hero, breathing PLAY with a halo, pages sliding in, the support card's running border.
+  - **Buy Me a Coffee** card (`Support`, QR verified to decode to buymeacoffee.com/catonix) on home and credits.
+  - The picker resolves msf: / msd: / home: / file-manager paths, then searches by name.
+- **Signing key:** `signing/debug.keystore` (git-ignored) is restored before each build, so updates keep installing
+  over 1.2.0.

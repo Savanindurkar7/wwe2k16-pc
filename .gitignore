@@ -32,3 +32,8 @@ __pycache__/
 /thirdparty/
 /generated_k14/
 /wwe2k16_k14_config.toml
+
+# r19: the APK signing key (tools/android-build-k14.sh). Never commit it.
+/signing/
+*.keystore
+*.jks
