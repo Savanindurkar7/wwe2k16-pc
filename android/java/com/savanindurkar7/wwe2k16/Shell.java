@@ -80,13 +80,21 @@ final class Shell {
         list.addView(rule(a), ruleLp(a, 8, 8));
         list.addView(item(a, "≡", "Logs", LOGS.equals(selected), v -> nav.go(LOGS)));
         list.addView(item(a, "★", "Credits", CREDITS.equals(selected), v -> nav.go(CREDITS)));
+        // r20: a yellow Support entry (Buy Me a Coffee) under Credits.
+        list.addView(supportItem(a));
+        // r20: the list, the game files' status and Settings scroll together as one column. Before, the status card
+        // sat over the bottom of a separate list, so on shorter screens "Logs" showed cut in half behind it.
+        View grow = new View(a);
+        list.addView(grow, new LinearLayout.LayoutParams(1, 0, 1f));
+        View status = statusCard(a);
+        ((LinearLayout.LayoutParams) status.getLayoutParams()).topMargin = Ui.dp(a, 10);
+        list.addView(status);
+        list.addView(item(a, "⚙", "Settings", SETTINGS.equals(selected), v -> nav.go(SETTINGS)));
         ScrollView scroll = new ScrollView(a);
         scroll.setVerticalScrollBarEnabled(false);
+        scroll.setFillViewport(true);
         scroll.addView(list);
         side.addView(scroll, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
-
-        side.addView(statusCard(a));
-        side.addView(item(a, "⚙", "Settings", SETTINGS.equals(selected), v -> nav.go(SETTINGS)));
         return side;
     }
 
@@ -122,6 +130,28 @@ final class Shell {
         ic.setGravity(Gravity.CENTER);
         item.addView(ic, new LinearLayout.LayoutParams(Ui.dp(a, 26), ViewGroup.LayoutParams.WRAP_CONTENT));
         TextView t = Ui.text(a, label, 18, selected ? Ui.WHITE : 0xFFD4D4D8, selected ? Ui.bold() : Ui.regular());
+        t.setPadding(Ui.dp(a, 12), 0, 0, 0);
+        item.addView(t);
+        return item;
+    }
+
+    private static View supportItem(Activity a) {
+        LinearLayout item = new LinearLayout(a);
+        item.setOrientation(LinearLayout.HORIZONTAL);
+        item.setGravity(Gravity.CENTER_VERTICAL);
+        item.setPadding(0, Ui.dp(a, 7), Ui.dp(a, 6), Ui.dp(a, 7));
+        item.setBackground(Home.pill(a, 0x00000000, 0x26FFDD00, Ui.dp(a, 8)));
+        item.setFocusable(true);
+        item.setClickable(true);
+        item.setOnClickListener(v -> Support.open(a));
+        View bar = new View(a);
+        LinearLayout.LayoutParams bl = new LinearLayout.LayoutParams(Ui.dp(a, 4), Ui.dp(a, 26));
+        bl.rightMargin = Ui.dp(a, 12);
+        item.addView(bar, bl);
+        TextView ic = Ui.text(a, "☕", 19, 0xFFFFDD00, android.graphics.Typeface.DEFAULT_BOLD);
+        ic.setGravity(Gravity.CENTER);
+        item.addView(ic, new LinearLayout.LayoutParams(Ui.dp(a, 26), ViewGroup.LayoutParams.WRAP_CONTENT));
+        TextView t = Ui.text(a, "Support", 18, 0xFFFFDD00, Ui.semi());
         t.setPadding(Ui.dp(a, 12), 0, 0, 0);
         item.addView(t);
         return item;

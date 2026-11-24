@@ -32,6 +32,20 @@ final class Support {
         }
     }
 
+    /** r20: the small yellow "Buy me a coffee" pill for the top bar, breathing. */
+    static View pill(Activity a) {
+        TextView b = Ui.text(a, "☕  Buy me a coffee", 13.5f, 0xFF1A1200, Ui.bold());
+        b.setGravity(Gravity.CENTER);
+        b.setPadding(Ui.dp(a, 14), Ui.dp(a, 7), Ui.dp(a, 16), Ui.dp(a, 7));
+        b.setBackground(Ui.rect(YELLOW, Ui.dp(a, 18)));
+        b.setElevation(Ui.dp(a, 3));
+        b.setFocusable(true);
+        b.setClickable(true);
+        b.setOnClickListener(v -> open(a));
+        Motion.breathe(b, 0.04f, 2400);
+        return b;
+    }
+
     /** The animated card. compact = the credits page's smaller version. */
     static View card(Activity a, boolean compact) {
         float radius = Ui.dp(a, 18);

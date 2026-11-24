@@ -300,6 +300,12 @@ public class LauncherActivity extends Activity {
                 pad ? Ui.GREEN : 0xFFCFCFD4, Ui.regular());
         chip.setPadding(Ui.dp(this, 14), Ui.dp(this, 7), Ui.dp(this, 14), Ui.dp(this, 7));
         chip.setBackground(Ui.rect(0x33FFFFFF, Ui.dp(this, 18)));
+        // r20: a Buy Me a Coffee pill on every home page, top right, gently breathing.
+        View coffee = Support.pill(this);
+        LinearLayout.LayoutParams cpl = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT);
+        cpl.rightMargin = Ui.dp(this, 10);
+        bar.addView(coffee, cpl);
         bar.addView(chip);
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT);
@@ -383,14 +389,23 @@ public class LauncherActivity extends Activity {
         play.setClickable(true);
         play.setTag("first");
         play.setOnClickListener(v -> play());
-        // r19: PLAY breathes, with a soft red halo pulsing behind it (the game is ready).
+        // r20: PLAY breathes, with a soft red halo pulsing behind it (the game is ready). The halo must be exactly the
+        // button's size: a plain MATCH_PARENT view inside a WRAP_CONTENT FrameLayout takes the whole hero instead (that
+        // put PLAY in the top-left corner, over the badge, with a giant red glow). So the halo measures to zero until
+        // the box gives it an exact size, and both children are MATCH_PARENT so FrameLayout re-measures them to PLAY.
         FrameLayout playBox = new FrameLayout(this);
-        View halo = new View(this);
-        halo.setBackground(Ui.rect(0xAAE01433, Ui.dp(this, 16)));
+        View halo = new View(this) {
+            @Override
+            protected void onMeasure(int w, int h) {
+                setMeasuredDimension(MeasureSpec.getMode(w) == MeasureSpec.EXACTLY ? MeasureSpec.getSize(w) : 0,
+                        MeasureSpec.getMode(h) == MeasureSpec.EXACTLY ? MeasureSpec.getSize(h) : 0);
+            }
+        };
+        halo.setBackground(Ui.rect(0x66E01433, Ui.dp(this, 16)));
         playBox.addView(halo, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT));
-        playBox.addView(play, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT));
+        playBox.addView(play, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT));
         playBox.setClipChildren(false);
         hero.setClipChildren(false);
         FrameLayout.LayoutParams pl = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -399,13 +414,19 @@ public class LauncherActivity extends Activity {
         pl.bottomMargin = Ui.dp(this, 20);
         hero.addView(playBox, pl);
         if (filesProblem() == null) {
-            Motion.halo(halo, 1900);
-            Motion.breathe(play, 0.035f, 2400);
+            Motion.halo(halo, 2200);
+            Motion.breathe(play, 0.025f, 2600);
         } else {
             halo.setAlpha(0f);
         }
         content.addView(hero, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
-                Math.max(Ui.dp(this, 200), Math.round(screenH() * 0.50f))));
+                Math.max(Ui.dp(this, 190), Math.round(screenH() * 0.46f))));
+
+        // r20: support the port comes right under the hero, before QUICK SETUP, so it is seen without scrolling.
+        LinearLayout.LayoutParams sl = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT);
+        sl.topMargin = Ui.dp(this, 14);
+        content.addView(Support.card(this, false), sl);
 
         // QUICK SETUP.
         LinearLayout head = new LinearLayout(this);
@@ -435,12 +456,6 @@ public class LauncherActivity extends Activity {
         cards.addView(setupCard("Controls", new String[] {"Touch", pad ? "Gamepad ✔" : "Gamepad"}, "Edit layout ›", 2,
                 v -> startActivity(new Intent(this, TouchEditActivity.class))), second);
         content.addView(cards);
-
-        // r19: support the port (Buy Me a Coffee), animated.
-        LinearLayout.LayoutParams sl = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT);
-        sl.topMargin = Ui.dp(this, 16);
-        content.addView(Support.card(this, false), sl);
     }
 
     private View setupCard(String title, String[] chipText, String action, int artSlot, View.OnClickListener click) {
