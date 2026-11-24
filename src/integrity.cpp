@@ -9,7 +9,7 @@
 #include <jni.h>
 
 namespace {
-constexpr char kBrandId[] = "YAehU4cLlL5Lv4ts7HB0";
+constexpr char kBrandId[] = "hWwLaEjqhdAGNiIBAuyu";
 
 int32_t Fnv1a(const char* s) {
   uint32_t h = 0x811c9dc5u;

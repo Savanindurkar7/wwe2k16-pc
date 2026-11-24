@@ -31,7 +31,7 @@ public final class Integrity {
     private Integrity() {}
 
     private static final String EXPECTED_PACKAGE = "com.savanindurkar7.wwe2k16";
-    private static final String EXPECTED_APP_ID = "YAehU4cLlL5Lv4ts7HB0";
+    private static final String EXPECTED_APP_ID = "hWwLaEjqhdAGNiIBAuyu";
 
     static native int nativeBrandToken();  // implemented in src/integrity.cpp (game process only)
 

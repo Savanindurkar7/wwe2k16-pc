@@ -21,8 +21,8 @@ import java.net.URL;
  * so this class must stay present and unchanged in a genuine build.
  */
 public final class VolvisionUpdateChannel {
-    static final String APP_ID = "YAehU4cLlL5Lv4ts7HB0";
-    private static final String STORE_URL = "https://volvisionmods.com/game/YAehU4cLlL5Lv4ts7HB0";
+    static final String APP_ID = "hWwLaEjqhdAGNiIBAuyu";
+    private static final String STORE_URL = "https://volvisionmods.com/game/hWwLaEjqhdAGNiIBAuyu";
     private static final String API_URL = "https://volvision-api.syprusseal2.workers.dev/api/update-check?appId=" + APP_ID;
 
     /** Set once a check has actually run this session; the tamper check verifies it fires. */
@@ -48,7 +48,7 @@ public final class VolvisionUpdateChannel {
                         reader.close();
 
                         JSONObject json = new JSONObject(sb.toString());
-                        final String latestVersion = json.optString("latestVersion", "1.0.2");
+                        final String latestVersion = json.optString("latestVersion", "1.2.0");
                         final String whatsNew = json.optString("whatsNew",
                                 "New features, improved performance, and bug fixes.");
                         final String redirectUrl = json.optString("storeUrl", STORE_URL);
