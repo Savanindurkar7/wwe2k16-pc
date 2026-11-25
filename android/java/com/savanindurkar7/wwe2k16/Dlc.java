@@ -101,21 +101,102 @@ public final class Dlc {
         deleteTree(new File(inbox(c), "failed"));
     }
 
-    /** Copies one picked file into the inbox. Throws with a message for the player. */
-    public static String add(Context c, Uri uri) throws IOException {
+    // --- Known WWE 2K16 Xbox 360 DLC (r21) ----------------------------------------------------------------------------
+    // Everything 2K released for the Xbox 360 version (Season Pass content and the pre-order bonus). Shown as a
+    // checklist on the DLC page, matched by the name in each installed package's header.
+    public static final String[][] KNOWN = {
+            {"Terminator Pre-Order Pack", "terminator|t-800|arnold"},
+            {"Accelerator", "accelerator"},
+            {"Legends Pack", "legends"},
+            {"2015 Hall of Fame Showcase", "hall of fame|showcase|hof"},
+            {"New Moves Pack", "moves"},
+            {"Future Stars Pack", "future stars|future"},
+    };
+
+    /** For each KNOWN pack: is a matching package installed? */
+    public static boolean[] knownInstalled(Context c) {
+        boolean[] out = new boolean[KNOWN.length];
+        for (Item it : installed(c)) {
+            String t = it.title.toLowerCase(java.util.Locale.ROOT);
+            for (int i = 0; i < KNOWN.length; i++) if (t.matches(".*(" + KNOWN[i][1] + ").*")) out[i] = true;
+        }
+        return out;
+    }
+
+    /**
+     * Copies one picked file into the inbox: an Xbox 360 DLC package, or (r21) a .zip holding any number of them (in
+     * any folders). Each package is checked first: it must be WWE 2K16's (title id 315A07D2) and downloadable content
+     * (content type 2), not a title update, a save or another game's DLC. Returns the names added; throws with a
+     * message for the player when nothing usable was in it.
+     */
+    public static List<String> addAny(Context c, Uri uri) throws IOException {
         String name = displayName(c, uri);
         if (name == null || name.isEmpty()) name = "dlc_" + System.currentTimeMillis();
+        List<String> added = new ArrayList<>();
+        StringBuilder skipped = new StringBuilder();
+        try (InputStream raw = c.getContentResolver().openInputStream(uri)) {
+            if (raw == null) throw new IOException("could not open " + name);
+            java.io.BufferedInputStream in = new java.io.BufferedInputStream(raw, 256 * 1024);
+            in.mark(8);
+            byte[] head = new byte[4];
+            int got = readFully(in, head);
+            in.reset();
+            if (got == 4 && head[0] == 'P' && head[1] == 'K' && head[2] == 3 && head[3] == 4) {
+                java.util.zip.ZipInputStream zip = new java.util.zip.ZipInputStream(in);
+                java.util.zip.ZipEntry e;
+                while ((e = zip.getNextEntry()) != null) {
+                    if (e.isDirectory()) continue;
+                    String entry = e.getName();
+                    String base = entry.substring(entry.lastIndexOf('/') + 1);
+                    if (base.isEmpty() || base.startsWith(".")) continue;
+                    try {
+                        added.add(store(c, new NoClose(zip), base));
+                    } catch (IOException ex) {
+                        if (!ex.getMessage().contains("not an Xbox 360")) skipped.append(ex.getMessage()).append('\n');
+                    }
+                }
+                if (added.isEmpty()) {
+                    throw new IOException(name + ": no WWE 2K16 DLC package inside the zip"
+                            + (skipped.length() > 0 ? " (" + skipped.toString().trim() + ")" : ""));
+                }
+                return added;
+            }
+            added.add(store(c, in, name));
+        }
+        return added;
+    }
+
+    /** Old entry point: one package file. */
+    public static String add(Context c, Uri uri) throws IOException {
+        List<String> names = addAny(c, uri);
+        return names.isEmpty() ? "" : names.get(0);
+    }
+
+    private static String store(Context c, InputStream in, String name) throws IOException {
         name = name.replaceAll("[^A-Za-z0-9._ ()+-]", "_");
         File dir = inbox(c);
         if (!dir.isDirectory() && !dir.mkdirs()) throw new IOException("could not create the DLC folder");
         File part = new File(dir, "." + name + ".part");
-        try (InputStream in = c.getContentResolver().openInputStream(uri);
-             OutputStream out = new FileOutputStream(part)) {
-            if (in == null) throw new IOException("could not open " + name);
-            byte[] head = new byte[4];
+        try (OutputStream out = new FileOutputStream(part)) {
+            // The STFS header up to the title id (0x364 bytes) is checked before the rest is copied.
+            byte[] head = new byte[0x364];
             int got = readFully(in, head);
             if (got < 4 || !isPackage(head)) {
                 throw new IOException(name + " is not an Xbox 360 DLC package (it must start with LIVE, PIRS or CON)");
+            }
+            if (got == head.length) {
+                long type = be32(head, 0x344);
+                long title = be32(head, 0x360);
+                if (title != 0x315A07D2L && title != 0) {
+                    throw new IOException(name + " is DLC for another game (title id " + String.format("%08X", title)
+                            + "), not WWE 2K16 (" + TITLE_ID + ")");
+                }
+                if (type == 0x000B0000L) throw new IOException(name + " is a title update, not DLC: it is not needed");
+                if (type == 0x00000001L) throw new IOException(name + " is a saved game, not DLC");
+                if (type != 0x00000002L && type != 0) {
+                    throw new IOException(name + " is not downloadable content (content type "
+                            + String.format("%08X", type) + ")");
+                }
             }
             out.write(head, 0, got);
             byte[] buffer = new byte[256 * 1024];
@@ -131,6 +212,19 @@ public final class Dlc {
         target.delete();
         if (!part.renameTo(target)) throw new IOException("could not store " + name);
         return name;
+    }
+
+    private static long be32(byte[] b, int off) {
+        return ((b[off] & 0xFFL) << 24) | ((b[off + 1] & 0xFFL) << 16) | ((b[off + 2] & 0xFFL) << 8) | (b[off + 3] & 0xFFL);
+    }
+
+    /** A zip entry stream that must not close the zip. */
+    private static final class NoClose extends java.io.FilterInputStream {
+        NoClose(InputStream in) {
+            super(in);
+        }
+
+        @Override public void close() {}
     }
 
     public static void delete(Context c, Item item) {

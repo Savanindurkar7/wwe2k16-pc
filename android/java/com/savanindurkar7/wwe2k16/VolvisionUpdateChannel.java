@@ -29,16 +29,31 @@ public final class VolvisionUpdateChannel {
     static volatile boolean checkStarted = false;
 
     public static void checkForUpdates(final Activity activity, final String currentVersion) {
+        check(activity, currentVersion, false);
+    }
+
+    /**
+     * r21: the "Check for updates" button. Same check, but it always answers: the update popup, "you have the latest
+     * version", or "could not reach the site".
+     */
+    public static void checkNow(final Activity activity, final String currentVersion) {
+        android.widget.Toast.makeText(activity, "Checking volvisionmods.com…", android.widget.Toast.LENGTH_SHORT).show();
+        check(activity, currentVersion, true);
+    }
+
+    private static void check(final Activity activity, final String currentVersion, final boolean manual) {
         checkStarted = true;
         new Thread(new Runnable() {
             @Override
             public void run() {
+                String latest = null, notes = null, url = STORE_URL;
                 try {
                     HttpURLConnection conn = (HttpURLConnection) new URL(API_URL).openConnection();
                     conn.setConnectTimeout(7000);
                     conn.setReadTimeout(7000);
                     conn.setRequestMethod("GET");
                     conn.setRequestProperty("Accept", "application/json");
+                    conn.setUseCaches(false);
 
                     if (conn.getResponseCode() == 200) {
                         BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream()));
@@ -48,24 +63,34 @@ public final class VolvisionUpdateChannel {
                         reader.close();
 
                         JSONObject json = new JSONObject(sb.toString());
-                        final String latestVersion = json.optString("latestVersion", "1.2.0");
-                        final String whatsNew = json.optString("whatsNew",
-                                "New features, improved performance, and bug fixes.");
-                        final String redirectUrl = json.optString("storeUrl", STORE_URL);
-
-                        if (isNewerVersion(latestVersion, currentVersion)) {
-                            new Handler(Looper.getMainLooper()).post(new Runnable() {
-                                @Override
-                                public void run() {
-                                    showDialog(activity, latestVersion, whatsNew, redirectUrl);
-                                }
-                            });
-                        }
+                        latest = json.optString("latestVersion", "1.2.0");
+                        notes = json.optString("whatsNew", "New features, improved performance, and bug fixes.");
+                        url = json.optString("storeUrl", STORE_URL);
                     }
                 } catch (Exception e) {
                     // Offline or the site is unreachable: no popup, the game is unaffected.
                     e.printStackTrace();
                 }
+                final String latestVersion = latest, whatsNew = notes, redirectUrl = url;
+                new Handler(Looper.getMainLooper()).post(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (latestVersion != null && isNewerVersion(latestVersion, currentVersion)) {
+                            showDialog(activity, latestVersion, whatsNew, redirectUrl);
+                        } else if (manual && activity != null && !activity.isFinishing()) {
+                            new AlertDialog.Builder(activity)
+                                    .setTitle(latestVersion != null ? "You're up to date" : "Could not check")
+                                    .setMessage(latestVersion != null
+                                            ? "You have the latest version (v" + currentVersion + ")."
+                                            : "volvisionmods.com could not be reached. Check your internet "
+                                            + "connection and try again.")
+                                    .setPositiveButton("OK", null)
+                                    .setNeutralButton("Open site", (d, w) -> activity.startActivity(
+                                            new Intent(Intent.ACTION_VIEW, Uri.parse(STORE_URL))))
+                                    .show();
+                        }
+                    }
+                });
             }
         }).start();
     }

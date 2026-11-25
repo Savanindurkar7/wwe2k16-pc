@@ -57,6 +57,7 @@ public class LauncherActivity extends Activity {
         VolvisionUpdateChannel.checkForUpdates(this, BuildInfo.rawVersion(this));
         checkDriverTrial();
         build();
+        CrashGuard.check(this);  // r21: after a crash, switch away from what caused it
         prepareDrivers();
     }
 
@@ -699,15 +700,27 @@ public class LauncherActivity extends Activity {
     private void dlcPage(LinearLayout content) {
         content.addView(banner("DLC", "Add Xbox 360 DLC packages: they install when you press PLAY", 2));
         LinearLayout p = panel();
-        TextView how = Ui.body(this, "Pick the DLC files themselves (Xbox 360 content packages: LIVE / PIRS / CON, "
-                + "usually a long hex name with no extension, from a console's Content/0000000000000000/" + Dlc.TITLE_ID
-                + "/00000002 folder or a backup). They are copied into the app and unpacked the next time the game "
-                + "starts (that start takes a little longer). Only DLC for WWE 2K16 (" + Dlc.TITLE_ID + ") works.",
-                13, 0xFFE0E0E4);
+        TextView how = Ui.body(this, "Pick the DLC files (Xbox 360 content packages: LIVE / PIRS / CON, usually a long hex "
+                + "name with no extension, from Content/0000000000000000/" + Dlc.TITLE_ID + "/00000002) or a .zip with "
+                + "them inside — you can pick several at once. Each file is checked: DLC for another game, title "
+                + "updates and saves are refused with the reason. They are unpacked and unlocked the next time the game "
+                + "starts (that start takes a little longer).", 13, 0xFFE0E0E4);
         p.addView(how);
+        // r21: every WWE 2K16 Xbox 360 DLC, ticked when installed.
+        boolean[] have = Dlc.knownInstalled(this);
+        StringBuilder list = new StringBuilder();
+        int count = 0;
+        for (int k = 0; k < Dlc.KNOWN.length; k++) {
+            list.append(have[k] ? "✔  " : "○  ").append(Dlc.KNOWN[k][0]).append('\n');
+            if (have[k]) count++;
+        }
+        TextView known = Ui.body(this, "ALL WWE 2K16 DLC (" + count + " of " + Dlc.KNOWN.length + " installed)\n"
+                + list.toString().trim(), 13, 0xFFE0E0E4);
+        known.setPadding(0, Ui.dp(this, 10), 0, 0);
+        p.addView(known);
         LinearLayout b = new LinearLayout(this);
         b.setOrientation(LinearLayout.HORIZONTAL);
-        TextView add = redAction("Add DLC files", v -> {
+        TextView add = redAction("Add DLC files / zip", v -> {
             Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
             i.addCategory(Intent.CATEGORY_OPENABLE);
             i.setType("*/*");
@@ -791,8 +804,7 @@ public class LauncherActivity extends Activity {
             StringBuilder errors = new StringBuilder();
             for (Uri u : uris) {
                 try {
-                    Dlc.add(this, u);
-                    ok++;
+                    ok += Dlc.addAny(this, u).size();  // r21: zips with packages inside too
                 } catch (IOException e) {
                     errors.append(e.getMessage()).append('\n');
                 }
@@ -931,6 +943,9 @@ public class LauncherActivity extends Activity {
         SharedPreferences prefs = Settings.prefs(this);
         String driver = prefs.getString(Settings.KEY_DRIVER, "");
         if (driver.isEmpty()) return;
+        // r21: remembered for this phone, so the automatic choice does not pick it again.
+        Drivers.Driver failed = Drivers.find(this, driver);
+        if (failed != null && CrashGuard.lastExitWasCrash(this)) Drivers.markFailed(this, failed);
         prefs.edit().putString(Settings.KEY_DRIVER, "").apply();
         Toast.makeText(this, "The last run with the driver \"" + driver + "\" ended before the game got going, so the "
                 + "launcher switched back to the phone's driver. Pick it again in Options to retry.", Toast.LENGTH_LONG).show();

@@ -69,7 +69,7 @@ public final class Settings {
     public static final Choice FRAME_GEN = new Choice(S_GRAPHICS, "frame_gen", "FRAME GENERATION", 0,
             a("off", "on"),
             a("OFF", "ON (30 -> 60)"),
-            a("Every frame the game draws is shown once.",
+            a("Every frame the game draws is shown once. (r21: frame generation is switched off for everyone.)",
               "Native APK: the game runs at a steady 30 FPS and an in-between frame is made between every two, so the "
               + "screen shows 60 (the screen is set to 60 Hz). The GPU has room for the extra frames at 30, which it "
               + "did not at 40 (tests 2026-11-21: uncapped frame generation halved the game's own frames). Controls "
@@ -286,14 +286,15 @@ public final class Settings {
               + "(about +2 FPS in the Mali test), a little slower to load and slightly lossy. Only on GPUs that lack the "
               + "formats: no effect on Adreno."));
 
-    // (Key "native_shortcuts_v2": ON is the new default for everyone. The spikes blamed on these shortcuts were
-    // Turnip's (fixed by the Turnip skin fix); phone test T3, 2026-11-22: ALL ran 38-47 FPS with no glitches.)
-    public static final Choice SHORTCUTS = new Choice(S_ADVANCED, "native_shortcuts_v2", "NATIVE SHORTCUTS", 0,
+    // (Key "native_shortcuts_v3", OFF for everyone again, r21: with the phone's own drivers (Adreno 650 / 740, Mali)
+    // the 1.2.1 testers got huge flat brown / blue triangles and stretched ropes near the camera in matches and replays
+    // (2026-11-25 screenshots). The T3 test that found no glitches was on Turnip only.)
+    public static final Choice SHORTCUTS = new Choice(S_ADVANCED, "native_shortcuts_v3", "NATIVE SHORTCUTS", 1,
             a("all", "safe"),
-            a("ON (FAST)", "OFF"),
-            a("Native APK: geometry page trust and vertex endian baking on. Faster and smoother; no glitches with the "
-              + "Turnip skin fix ON.",
-              "Native APK: those shortcuts off (slower). Only for testing."));
+            a("ON (TEST)", "OFF (SAFE)"),
+            a("Native APK, test: geometry page trust and vertex endian baking on. A little faster, but with some "
+              + "drivers it draws huge flat triangles and stretched ropes near the camera.",
+              "Native APK: those shortcuts off. No geometry glitches. Recommended."));
 
     public static final Choice TURNIP_FIX = new Choice(S_ADVANCED, "turnip_skin_fix", "TURNIP SKIN FIX", 0,
             a("on", "off"),
@@ -383,7 +384,7 @@ public final class Settings {
               "Off: the Adreno driver alone sends about a million messages per match."));
 
     public static final Choice[] CHOICES = {
-            PERF_MODE, RENDERER, RESOLUTION, FRAME_GEN, CROWD, ENTRANCE_CROWD, SHADOWS, DOF, PASS_TRIM, FRAME_RATE, MSAA, FAST_AA, UPSCALER, TEXTURES, FILTER,
+            PERF_MODE, RENDERER, RESOLUTION, CROWD, ENTRANCE_CROWD, SHADOWS, DOF, PASS_TRIM, FRAME_RATE, MSAA, FAST_AA, UPSCALER, TEXTURES, FILTER,
             DISPLAY, SCREEN_SHAPE, VSYNC, SHARPNESS,
             CPU_CORES, SPEED_FIX, SHADER_CACHE, FRAME_MONITOR, PERF_HINT, SUSTAINED,
             TOUCH, TOUCH_VIBRATE, RUMBLE,
@@ -392,6 +393,50 @@ public final class Settings {
 
     public static final String KEY_EXTRA_ARGS = "extra_args";
     public static final String KEY_DRIVER = "gpu_driver";  // "" = the phone's driver, else the driver folder's name
+
+    // --- Simple / expert settings (r21) ----------------------------------------------------------------------------
+    // Players changed renderer switches they did not need (NATIVE instead of NATIVE+, shadows ON on a Mali, a Turnip
+    // driver on a Mali phone, ...) and then the game ran badly or crashed (1.2.1 logs, 2026-11-25). Normal players now see
+    // only the settings below; everything else is hidden AND held at the tested value for their GPU at every launch
+    // (presetValue). EXPERT MODE (asked with a warning) shows and uses every setting, the extra arguments too.
+    public static final String KEY_EXPERT = "expert_mode";
+
+    public static final Choice[] SIMPLE = {
+            PERF_MODE, FRAME_RATE, RESOLUTION, CROWD, SHADOWS, TEXTURES, FILTER, UPSCALER,
+            SCREEN_SHAPE, SHARPNESS, FRAME_MONITOR, DISPLAY,
+            TOUCH, TOUCH_VIBRATE, RUMBLE,
+    };
+
+    public static boolean isExpert(Context c) {
+        return prefs(c).getBoolean(KEY_EXPERT, false);
+    }
+
+    public static boolean isSimple(Choice c) {
+        for (Choice s : SIMPLE) if (s == c) return true;
+        return false;
+    }
+
+    /** The choices of a section a player sees: all in expert mode, the SIMPLE ones otherwise. */
+    public static List<Choice> visibleInSection(Context ctx, String section) {
+        List<Choice> out = new ArrayList<>();
+        boolean expert = isExpert(ctx);
+        for (Choice c : CHOICES) {
+            if (expert ? c.section.equals(section) : (isSimple(c) && simpleSectionOf(c).equals(section))) out.add(c);
+        }
+        return out;
+    }
+
+    /** Where a simple setting is shown when expert mode is off (FRAME MONITOR moves to Display). */
+    public static String simpleSectionOf(Choice c) {
+        if (c == FRAME_MONITOR) return S_DISPLAY;
+        return c.section;
+    }
+
+    /** The sections shown: Performance and Advanced only in expert mode. */
+    public static String[] visibleSections(Context ctx) {
+        if (isExpert(ctx)) return SECTIONS;
+        return new String[] {S_GRAPHICS, S_DISPLAY, S_CONTROLS, S_DRIVER, S_CREDITS};
+    }
 
     private Settings() {}
 
@@ -427,7 +472,9 @@ public final class Settings {
         for (Choice c : CHOICES) e.remove(c.key);
         e.remove(KEY_EXTRA_ARGS);
         e.remove(KEY_DRIVER);
+        e.remove(KEY_QUALITY);
         e.apply();
+        applyPreset(ctx, Gpu.family(ctx));  // r21: reset = the tested settings for this GPU
     }
 
     // --- GPU presets (r18, r19) -----------------------------------------------------------------------------------
@@ -435,60 +482,129 @@ public final class Settings {
     // version) the launcher detects the GPU (Gpu.family / Gpu.maliTier) and applies the matching preset; the player
     // can re-apply it any time from Graphics. Re-applying only sets the keys below.
 
-    public static final String KEY_PRESET_APPLIED = "preset_applied_v2";  // r19: v2 = re-applied once after 1.2.1
+    // r21: v3 = applied once more after 1.2.2 (shortcuts off, shadows off, Mali filter / textures / sustained mode).
+    public static final String KEY_PRESET_APPLIED = "preset_applied_v3";
 
     private static void put(SharedPreferences.Editor e, Choice c, String value) {
         e.putString(c.key, value);
     }
 
-    /** Applies the best-known settings for this phone's GPU (family: "mali", "adreno", others get the Adreno set). */
-    public static void applyPreset(Context ctx, String family) {
-        SharedPreferences.Editor e = prefs(ctx).edit();
+    /** The tested value of every choice for this phone's GPU (choices not listed keep their default). */
+    public static java.util.LinkedHashMap<Choice, String> presetValues(Context ctx, String family) {
+        java.util.LinkedHashMap<Choice, String> m = new java.util.LinkedHashMap<>();
         boolean mali = Gpu.MALI.equals(family);
         int tier = mali ? Gpu.maliTier(ctx) : Gpu.MALI_NONE;
+        int gen = Gpu.ADRENO.equals(family) ? Gpu.adrenoGeneration(ctx) : 0;
         // Shared base (the tested Adreno setup).
-        put(e, RENDERER, "native_plus");
-        put(e, RESOLUTION, "480");
-        put(e, CROWD, "20");
-        put(e, ENTRANCE_CROWD, "10");
-        put(e, SHADOWS, "off");
-        put(e, MSAA, "off");
-        put(e, FRAME_GEN, "off");
-        put(e, NATIVE_FRAME, "on");
-        put(e, SHORTCUTS, "all");
-        put(e, CROWD_CULL, "on");
-        put(e, HOT_CORES, "on");
-        put(e, PASS_TRIM, "off");
-        put(e, READBACK, "auto");
-        put(e, CP_FAST, "safe");
-        put(e, THERMAL, "on");
-        put(e, PERF_MODE, "balanced");
+        m.put(RENDERER, "native_plus");
+        m.put(RESOLUTION, "480");
+        m.put(CROWD, "20");
+        m.put(ENTRANCE_CROWD, "10");
+        // Dynamic shadows OFF everywhere: every shadow caster's map is its own render pass (440-540 passes a frame with
+        // shadows, about 95-110 without, 2026-11-22), the biggest single GPU cost and a big part of the heat.
+        m.put(SHADOWS, "off");
+        m.put(MSAA, "off");
+        m.put(FRAME_GEN, "off");
+        m.put(NATIVE_FRAME, "on");
+        m.put(SHORTCUTS, "safe");
+        m.put(TURNIP_FIX, "on");
+        m.put(CROWD_CULL, "on");
+        m.put(HOT_CORES, "on");
+        m.put(PASS_TRIM, "off");
+        m.put(READBACK, "auto");
+        m.put(CP_FAST, "safe");
+        m.put(THERMAL, "on");
+        m.put(PERF_MODE, "balanced");
+        m.put(UPSCALER, "sgsr");
+        m.put(TEXTURES, "0");
+        m.put(FAST_AA, "none");
+        m.put(SPEED_FIX, "1");
+        m.put(SHADER_CACHE, "1");
+        m.put(PERF_HINT, "1");
+        m.put(CPU_CORES, "auto");
+        m.put(VSYNC, "1");
+        m.put(PERF_LOG, "off");
+        m.put(VK_DEBUG, "0");
         if (mali) {
-            // r19: the safe half of the Mali boost only (geometry shaders avoided). The other two switches (classic
-            // render passes, vertices as attributes) and the ASTC textures were suspects in the 1.2.0 Mali glitches
-            // (flat brown / orange scenes, stretched ropes, a red screen on a Mali-G615), so they are off.
-            put(e, MALI_BOOST, "nogs");
-            put(e, MALI_TEXTURES, "normal");
-            put(e, GPU_WAIT, "sleep");
-            put(e, DOF, "off");
-            put(e, FILTER, "0");
+            // The safe half of the Mali boost only (geometry shaders avoided); the other two switches and the ASTC
+            // textures were suspects in the 1.2.0 Mali glitches (flat brown / orange scenes, stretched ropes).
+            m.put(MALI_BOOST, "nogs");
+            m.put(MALI_TEXTURES, "normal");
+            m.put(GPU_WAIT, "sleep");
+            m.put(DOF, "off");
+            // r21: Android's sustained-performance mode: steady clocks instead of bursts that overheat and throttle.
+            m.put(SUSTAINED, "1");
             if (tier == Gpu.MALI_LOW) {
-                put(e, RESOLUTION, "360");
-                put(e, FRAME_RATE, "30");
-                put(e, CROWD, "0");
-                put(e, ENTRANCE_CROWD, "0");
+                m.put(RESOLUTION, "360");
+                m.put(FRAME_RATE, "30");
+                m.put(CROWD, "0");
+                m.put(ENTRANCE_CROWD, "0");
+                m.put(FILTER, "0");
             } else {
-                put(e, FRAME_RATE, "45");
+                // r21: 2x filtering (floors and the ring mat were blurry with none: "texture was not good").
+                m.put(FILTER, "2");
+                m.put(FRAME_RATE, "45");
+                if (tier == Gpu.MALI_HIGH) m.put(RESOLUTION, "540");
             }
         } else {
             // Adreno / others: 60 cap, DoF on — the r14-r16 setup (Nothing A059 ~50-55 in matches).
-            put(e, FRAME_RATE, "60");
-            put(e, GPU_WAIT, "spin");
-            put(e, MALI_BOOST, "nogs");
-            put(e, MALI_TEXTURES, "normal");
-            put(e, DOF, "on");
+            m.put(FRAME_RATE, "60");
+            m.put(GPU_WAIT, "spin");
+            m.put(MALI_BOOST, "nogs");
+            m.put(MALI_TEXTURES, "normal");
+            m.put(DOF, "on");
+            m.put(SUSTAINED, "0");
+            m.put(FILTER, "3");
+            if (gen > 0 && gen <= 6) m.put(FILTER, "2");
         }
+        return m;
+    }
+
+    /** Applies the best-known settings for this phone's GPU (family: "mali", "adreno", others get the Adreno set). */
+    public static void applyPreset(Context ctx, String family) {
+        SharedPreferences.Editor e = prefs(ctx).edit();
+        for (java.util.Map.Entry<Choice, String> en : presetValues(ctx, family).entrySet()) put(e, en.getKey(), en.getValue());
         e.putBoolean(KEY_PRESET_APPLIED, true);
+        e.apply();
+        enforceLocks(ctx);
+    }
+
+    /** The value a hidden setting is held at for a normal player: the GPU's tested value, else the default. */
+    public static String presetValue(Context ctx, Choice c) {
+        String v = presetValues(ctx, Gpu.family(ctx)).get(c);
+        return v != null ? v : c.values[c.defaultIndex];
+    }
+
+    // --- Quality levels (r21): one tap instead of eight settings -----------------------------------------------------
+    public static final String Q_SMOOTH = "smooth", Q_BALANCED = "balanced", Q_QUALITY = "quality";
+    public static final String KEY_QUALITY = "quality_level";
+
+    public static void applyQuality(Context ctx, String level) {
+        String family = Gpu.family(ctx);
+        java.util.LinkedHashMap<Choice, String> m = presetValues(ctx, family);
+        SharedPreferences.Editor e = prefs(ctx).edit();
+        for (Choice c : new Choice[] {RESOLUTION, CROWD, ENTRANCE_CROWD, SHADOWS, TEXTURES, FILTER, FRAME_RATE, DOF}) {
+            String v = m.get(c);
+            if (v != null) put(e, c, v);
+        }
+        boolean mali = Gpu.MALI.equals(family);
+        if (Q_SMOOTH.equals(level)) {
+            put(e, RESOLUTION, mali ? "360" : "480");
+            put(e, CROWD, "0");
+            put(e, ENTRANCE_CROWD, "0");
+            put(e, SHADOWS, "off");
+            put(e, FILTER, mali ? "0" : "2");
+            put(e, DOF, "off");
+            put(e, FRAME_RATE, mali ? "30" : "45");
+        } else if (Q_QUALITY.equals(level)) {
+            put(e, RESOLUTION, "540");
+            put(e, CROWD, "50");
+            put(e, ENTRANCE_CROWD, "10");
+            put(e, SHADOWS, mali ? "off" : "half");
+            put(e, FILTER, mali ? "2" : "4");
+            put(e, TEXTURES, "0");
+        }
+        e.putString(KEY_QUALITY, level);
         e.apply();
         enforceLocks(ctx);
     }
@@ -510,10 +626,8 @@ public final class Settings {
     public static String lockReason(Context ctx, Choice c, String value) {
         // r19: frame generation needs a GPU that paints the in-between frames in time: Adreno 7xx / 8xx. Elsewhere it
         // only lowered the real frame rate (and on a Mali-G52 lost the GPU device), so it is locked.
-        if (c == FRAME_GEN && "on".equals(value) && !(Gpu.ADRENO.equals(Gpu.family(ctx))
-                && Gpu.adrenoGeneration(ctx) >= 7)) {
-            return "Frame generation needs an Adreno 7xx / 8xx GPU";
-        }
+        // r21: frame generation is off for everyone (it lowered the real frame rate and smeared fast moves).
+        if (c == FRAME_GEN && "on".equals(value)) return "Frame generation is switched off in this version";
         int tier = Gpu.maliTier(ctx);
         if (tier == Gpu.MALI_NONE) return null;
         String tierName = Gpu.maliTierName(tier) + " Mali";
@@ -626,6 +740,15 @@ public final class Settings {
     public static Launch buildLaunch(Context ctx) {
         enforceLocks(ctx);  // r19: no locked value reaches the game, whatever is saved
         SharedPreferences p = prefs(ctx);
+        // r21: a normal player's hidden settings are held at the tested value for this GPU (an old tweak, or one made
+        // before this version, can no longer make the game slow or crash).
+        final boolean expert = isExpert(ctx);
+        if (!expert) {
+            SharedPreferences.Editor hold = p.edit();
+            for (Choice c : CHOICES) if (!isSimple(c)) hold.putString(c.key, presetValue(ctx, c));
+            hold.putString(FRAME_GEN.key, "off");
+            hold.apply();
+        }
         Launch l = new Launch();
         // Resolution: the SDK draws at whole multiples of the game's 720p.
         final boolean nat = isNativeBuild(ctx);
@@ -656,7 +779,7 @@ public final class Settings {
             if ("off".equals(shadows)) cvar(l, "gpu_dynamic_shadows", "false");
             if ("half".equals(shadows)) cvar(l, "gpu_shadow_half_rate", "true");
             if ("off".equals(DOF.value(p))) cvar(l, "gpu_depth_of_field", "false");
-            boolean frameGen = "on".equals(FRAME_GEN.value(p));
+            boolean frameGen = false;  // r21: frame generation removed for everyone
             if (frameGen) cvar(l, "present_frame_generation", "true");
             l.env.put("WWE2K16_FRAMEGEN", frameGen ? "1" : "0");
         }
@@ -677,7 +800,7 @@ public final class Settings {
         }
 
         String fr = FRAME_RATE.value(p);
-        boolean fg = nat && "on".equals(FRAME_GEN.value(p));
+        boolean fg = false;  // r21
         // r19: the player's own cap, restored if frame generation gives up for the session (SDK patch 0009).
         l.env.put("WWE2K16_FG_RESTORE_CAP", "45".equals(fr) ? "45" : "30".equals(fr) ? "30" : "0");
         if (fg) fr = "30";  // frame generation v3: a steady 30 from the game, 60 on the screen
@@ -714,6 +837,9 @@ public final class Settings {
         boolean cache = "1".equals(SHADER_CACHE.value(p));
         cvar(l, nat ? "vulkan_disk_pipeline_cache" : "vulkan_pipeline_cache", cache ? "true" : "false");
         cvar(l, "async_shader_compilation", "true");
+        // r21: hold up to 8 frames (not 3) while a new shader compiles before showing one with a draw missing: fewer
+        // half-drawn / black frames when a new scene starts (Mali phones compile slowly: up to 4.9 s for one shader).
+        if (nat) cvar(l, "vulkan_async_skip_incomplete_frames_max", "8");
         l.env.put("WWE2K16_FRAME_MONITOR", FRAME_MONITOR.value(p));
         l.env.put("WWE2K16_PERF_HINT", PERF_HINT.value(p));
         l.env.put("WWE2K16_TOUCH", TOUCH.value(p));
@@ -764,7 +890,13 @@ public final class Settings {
         String driver = p.getString(KEY_DRIVER, "");
         if (!driver.isEmpty()) {
             Drivers.Driver d = Drivers.find(ctx, driver);
+            // r21: a driver for another GPU family is never used (Turnip on a Mali phone did nothing but confuse).
+            if (d != null && Drivers.wrongFamily(ctx, d)) d = null;
             if (d != null) {
+                // r21: the game reports whether the driver really took over (Drivers.STATUS_FILE): a Turnip package
+                // that the phone silently replaced with its own driver (Adreno 650, Android 14) is switched away from.
+                l.env.put("WWE2K16_DRIVER_STATUS", Drivers.statusFile(ctx).getAbsolutePath());
+                if (d.isTurnip()) l.env.put("WWE2K16_DRIVER_EXPECT", "turnip");
                 l.env.put("WWE2K16_DRIVER", d.library);
                 l.env.put("WWE2K16_DRIVER_DIR", d.dir.getAbsolutePath() + "/");
                 l.env.put("WWE2K16_DRIVER_TRIAL", Drivers.trialFile(ctx).getAbsolutePath());
@@ -790,7 +922,7 @@ public final class Settings {
 
         // Extra arguments: "--cvar=value" go to the SDK, "NAME=value" become environment variables. They come last, so
         // they win over everything above.
-        String extra = p.getString(KEY_EXTRA_ARGS, "").trim();
+        String extra = expert ? p.getString(KEY_EXTRA_ARGS, "").trim() : "";
         if (!extra.isEmpty()) {
             for (String word : extra.split("\\s+")) {
                 if (word.startsWith("--")) {
@@ -808,6 +940,7 @@ public final class Settings {
         else l.args.add(game);
 
         for (Choice c : CHOICES) l.summary.append(c.title).append(": ").append(c.labels[c.index(p)]).append('\n');
+        l.summary.append("EXPERT MODE: ").append(expert ? "ON" : "OFF").append('\n');
         l.summary.append("BUILD: ").append(nat ? "native (WWE 2K14 SDK)" : "classic (ReXGlue 0.7)").append('\n');
         l.summary.append("GPU DRIVER: ").append(driver.isEmpty() ? "System" : driver).append('\n');
         l.summary.append("GPU: ").append(Gpu.renderer(ctx)).append(" (").append(gpuFamily).append(")\n");

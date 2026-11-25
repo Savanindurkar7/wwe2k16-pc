@@ -275,3 +275,36 @@ Tester logs (2026-11-23/24): Adreno 650 / 740 / 825, Mali-G52 / G57 / G615.
   - The picker resolves msf: / msd: / home: / file-manager paths, then searches by name.
 - **Signing key:** `signing/debug.keystore` (git-ignored) is restored before each build, so updates keep installing
   over 1.2.0.
+
+### r21 (2026-11-25): 1.2.2 — safe defaults, simple settings, crash guard
+
+1.2.1 testers' logs (Adreno 650 / 730 / 740 / 825, Mali-G615 / G610 / G925):
+- **Huge flat triangles / stretched ropes near the camera** (matches, replays): NATIVE SHORTCUTS were ON for everyone,
+  and the phones were on their own drivers (the T3 test that found no glitches was on Turnip). New key
+  `native_shortcuts_v3`, OFF by default.
+- **Crash after the main menu (Adreno 650, POCO F4, Android 14):** SIGSEGV in `vulkan.adreno.so` (Qualcomm 1.1.128)
+  under `DeferredCommandBuffer::ExecuteStreamT`, every match. The built-in Turnip A6xx-A7xx and an imported Turnip had
+  "loaded", but the GPU still reported the Qualcomm driver: libadrenotools kept the phone's own driver. A Mainline
+  Turnip v32 had really loaded on the same model before.
+  - `android_driver.cpp`: with `WWE2K16_DRIVER_EXPECT=turnip`, a GPU name without "Turnip" is logged and written to
+    `WWE2K16_DRIVER_STATUS` (`files/drivers/status.txt`: `ok|notloaded <lib> <GPU>`).
+  - `Drivers.candidates`: built-in Turnips best first, minus those marked `failed_on_<GPU>`; Adreno 6xx starts with the
+    Mesa mainline build.
+  - `CrashGuard` (launcher start, `ApplicationExitInfo` of `:game`): not-loaded driver → next Turnip; an Adreno crash on
+    the System / a Qualcomm driver → best Turnip; a second crash in a row → the GPU preset again, expert mode off.
+- **Mali phones on Turnip / players' own tweaks** (NATIVE instead of NATIVE+, shadows ON, ...):
+  - **Simple settings** for normal players (`Settings.SIMPLE`); every hidden setting is held at the tested value for
+    the GPU at each launch (`presetValue`). **Expert settings** (asked with a warning) show and use everything,
+    extra arguments included.
+  - A driver for another GPU family is never passed to the game and is hidden from normal players.
+- **Frame generation** removed for everyone (locked, not in the list).
+- **Presets v3** (`preset_applied_v3`, applied once): shadows OFF everywhere, shortcuts OFF, Mali filter 2x and
+  sustained-performance mode, Mali HIGH 540p, Adreno filter 4x (2x on 6xx).
+- **QUALITY** card: SMOOTH / BALANCED / QUALITY in one tap (locks still apply).
+- **Black frames when a scene starts:** `vulkan_async_skip_incomplete_frames_max=8` (was 3).
+- **Touch:** a button stays pressed for the game at least 70 ms (quick taps were missed between two pad reads); a
+  finger inside a face button's circle always presses it.
+- **DLC:** .zip files with packages inside; each package's STFS header is checked (title id 315A07D2, content type 2;
+  title updates, saves and other games' DLC are refused with the reason); the DLC page lists all six WWE 2K16 Xbox 360
+  packs and ticks the installed ones.
+- **Check for updates** in the sidebar (also checked at every start). Version 1.2.2.

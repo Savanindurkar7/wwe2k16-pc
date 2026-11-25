@@ -70,6 +70,58 @@ public final class Drivers {
         return new File(root(c), "trial.txt");
     }
 
+    // --- Did the driver really take over? (r21) ----------------------------------------------------------------------
+    // On an Adreno 650 (POCO F4, Android 14) the built-in "Turnip A6xx-A7xx" and an imported Turnip both opened, but
+    // the phone's own Qualcomm driver (Vulkan 1.1.128) answered instead, and that old driver crashed the game in a
+    // match ("crash after the main menu", 2026-11-25). The game writes one line to this file after it opens a custom
+    // driver: "ok <library> <GPU name>" or "notloaded <library> <GPU name>" (a Turnip package whose GPU name has no
+    // "Turnip": the phone kept its own driver). The launcher then marks that driver as not working on this phone and
+    // switches to the next built-in Turnip.
+    public static File statusFile(Context c) {
+        return new File(root(c), "status.txt");
+    }
+
+    /** Reads and deletes the status file. Returns {result, library} or null. */
+    public static String[] takeStatus(Context c) {
+        File f = statusFile(c);
+        if (!f.isFile()) return null;
+        String line = "";
+        try (InputStream in = new FileInputStream(f)) {
+            byte[] b = new byte[512];
+            int n = in.read(b);
+            if (n > 0) line = new String(b, 0, n, java.nio.charset.StandardCharsets.UTF_8).trim();
+        } catch (IOException ignored) {
+        }
+        //noinspection ResultOfMethodCallIgnored
+        f.delete();
+        String[] w = line.split(" ", 3);
+        return w.length >= 2 ? new String[] {w[0], w[1]} : null;
+    }
+
+    private static String failedKey(Context c) {
+        return "failed_on_" + sanitize(Gpu.renderer(c)).replace(' ', '_');
+    }
+
+    /** Marks a driver as "does not load on this phone" (kept in its driver.properties). */
+    public static void markFailed(Context c, Driver d) {
+        Properties p = new Properties();
+        File info = new File(d.dir, "driver.properties");
+        try (InputStream in = new FileInputStream(info)) {
+            p.load(in);
+        } catch (IOException e) {
+            return;
+        }
+        p.setProperty(failedKey(c), "true");
+        try (java.io.OutputStream out = new java.io.FileOutputStream(info)) {
+            p.store(out, null);
+        } catch (IOException ignored) {
+        }
+    }
+
+    public static boolean failedHere(Context c, Driver d) {
+        return "true".equals(readProperty(d.dir, failedKey(c)));
+    }
+
     public static List<Driver> list(Context c) {
         List<Driver> out = new ArrayList<>();
         File[] dirs = root(c).listFiles();
@@ -513,18 +565,46 @@ public final class Drivers {
         return p.getProperty(key);
     }
 
-    /** The built-in driver made for this phone's GPU, or null (Mali: the experimental PanVK one is offered, not this). */
-    public static Driver recommended(Context c) {
-        String family = Gpu.family(c);
-        if (!Gpu.ADRENO.equals(family)) return null;
-        String renderer = Gpu.renderer(c);
-        int gen = Gpu.adrenoGeneration(c);
-        boolean small7 = renderer.matches(".*Adreno[^0-9]*7(10|20|22)\\b.*");
+    /**
+     * r21: the built-in Turnips for this Adreno, best first, without those that did not load on this phone. Adreno 6xx:
+     * the Mesa mainline build first (it loaded on an Adreno 650 with Android 14, where the A6xx-A7xx build did not).
+     */
+    public static List<Driver> candidates(Context c) {
+        List<Driver> out = new ArrayList<>();
+        if (!Gpu.ADRENO.equals(Gpu.family(c))) return out;
+        String code = phoneGenCode(c);
+        List<Driver> made = new ArrayList<>(), mainline = new ArrayList<>(), stable = new ArrayList<>(), other = new ArrayList<>();
         for (Driver d : list(c)) {
-            if (!d.bundled || !Gpu.ADRENO.equals(d.family)) continue;
-            if (small7 && d.gens.contains("710")) return d;
-            if (!small7 && gen > 0 && java.util.Arrays.asList(d.gens.split(",")).contains(String.valueOf(gen))) return d;
+            if (!d.bundled || !Gpu.ADRENO.equals(d.family) || failedHere(c, d)) continue;
+            String n = d.name.toLowerCase(java.util.Locale.ROOT);
+            boolean forThis = code != null && java.util.Arrays.asList(d.gens.split(",")).contains(code);
+            if (forThis) made.add(d);
+            else if (n.contains("mainline")) mainline.add(d);
+            else if (n.contains("stable")) stable.add(d);
+            else if (d.gens.contains("any")) other.add(d);
         }
+        if ("6".equals(code)) {
+            out.addAll(mainline);
+            out.addAll(stable);
+            out.addAll(made);
+        } else {
+            out.addAll(made);
+            out.addAll(mainline);
+            out.addAll(stable);
+        }
+        out.addAll(other);
+        return out;
+    }
+
+    /** The built-in driver for this phone's GPU, or null (Mali: the experimental PanVK one is offered, not this). */
+    public static Driver recommended(Context c) {
+        List<Driver> list = candidates(c);
+        return list.isEmpty() ? null : list.get(0);
+    }
+
+    /** The next built-in Turnip to try after `failed`, or null. */
+    public static Driver nextAfter(Context c, Driver failed) {
+        for (Driver d : candidates(c)) if (failed == null || !d.name.equals(failed.name)) return d;
         return null;
     }
 
@@ -575,9 +655,18 @@ public final class Drivers {
 
     /** True when this driver is made for another GPU family than the phone's (shown as a warning). */
     public static boolean wrongFamily(Context c, Driver d) {
-        if (d.family.isEmpty()) return false;
+        String fam = familyOf(d);
+        if (fam.isEmpty()) return false;
         String phone = Gpu.family(c);
-        return !Gpu.OTHER.equals(phone) && !d.family.equals(phone);
+        return !Gpu.OTHER.equals(phone) && !fam.equals(phone);
+    }
+
+    /** The GPU family a driver is for: its own label, else from its kind (Turnip / Qualcomm = Adreno). */
+    static String familyOf(Driver d) {
+        if (!d.family.isEmpty()) return d.family;
+        if (d.isTurnip() || "qualcomm".equals(d.kind)) return Gpu.ADRENO;
+        if ("mali".equals(d.kind)) return Gpu.MALI;
+        return "";
     }
 
     private static String sanitize(String s) {

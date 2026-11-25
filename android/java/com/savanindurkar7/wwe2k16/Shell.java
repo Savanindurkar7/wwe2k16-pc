@@ -82,6 +82,9 @@ final class Shell {
         list.addView(item(a, "★", "Credits", CREDITS.equals(selected), v -> nav.go(CREDITS)));
         // r20: a yellow Support entry (Buy Me a Coffee) under Credits.
         list.addView(supportItem(a));
+        // r21: check volvisionmods.com for a newer version now (it is also checked every time the app opens).
+        list.addView(item(a, "↻", "Check for updates", false,
+                v -> VolvisionUpdateChannel.checkNow(a, BuildInfo.rawVersion(a))));
         // r20: the list, the game files' status and Settings scroll together as one column. Before, the status card
         // sat over the bottom of a separate list, so on shorter screens "Logs" showed cut in half behind it.
         View grow = new View(a);

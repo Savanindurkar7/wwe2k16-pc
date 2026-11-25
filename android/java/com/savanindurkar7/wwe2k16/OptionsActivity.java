@@ -49,7 +49,7 @@ public class OptionsActivity extends Activity {
         Ui.init(this);
         Settings.enforceLocks(this);  // r19: the Mali high-settings lock
         String wanted = getIntent().getStringExtra(EXTRA_SECTION);
-        if (wanted != null) for (String sec : Settings.SECTIONS) if (sec.equals(wanted)) section = sec;
+        if (wanted != null) for (String sec : Settings.visibleSections(this)) if (sec.equals(wanted)) section = sec;
         build();
     }
 
@@ -79,7 +79,10 @@ public class OptionsActivity extends Activity {
             switch (target) {
                 case Shell.GRAPHICS: section = Settings.S_GRAPHICS; build(); break;
                 case Shell.CONTROLS: section = Settings.S_CONTROLS; build(); break;
-                case Shell.SETTINGS: section = Settings.S_PERFORMANCE; build(); break;
+                case Shell.SETTINGS:
+                    section = Settings.isExpert(this) ? Settings.S_PERFORMANCE : Settings.S_DISPLAY;
+                    build();
+                    break;
                 default: Shell.toHome(this, target); break;
             }
         }), new LinearLayout.LayoutParams(Shell.sidebarWidth(this), ViewGroup.LayoutParams.MATCH_PARENT));
@@ -100,7 +103,7 @@ public class OptionsActivity extends Activity {
 
     private static String about(String sec) {
         switch (sec) {
-            case Settings.S_GRAPHICS: return "Pick the renderer and how much the game draws: the options below are its own.";
+            case Settings.S_GRAPHICS: return "Pick a quality level, or fine-tune the picture below. Your GPU's limits are applied for you.";
             case Settings.S_DISPLAY: return "How the picture is shown on your screen.";
             case Settings.S_PERFORMANCE: return "Frame rate helpers, CPU cores and the frame monitor.";
             case Settings.S_CONTROLS: return "Touch controls, vibration and rumble.";
@@ -119,7 +122,7 @@ public class OptionsActivity extends Activity {
         LinearLayout tabs = new LinearLayout(this);
         tabs.setOrientation(LinearLayout.HORIZONTAL);
         tabs.setGravity(Gravity.CENTER_VERTICAL);
-        for (String sec : Settings.SECTIONS) {
+        for (String sec : Settings.visibleSections(this)) {
             if (Settings.S_CREDITS.equals(sec)) continue;  // the sidebar's Credits page
             boolean active = sec.equals(section);
             TextView tab = Ui.text(this, tabLabel(sec), 15, active ? Ui.WHITE : 0xFFD8D8DC, active ? Ui.semi() : Ui.regular());
@@ -193,6 +196,7 @@ public class OptionsActivity extends Activity {
             addCredits(p);
             return p;
         }
+        if (Settings.S_GRAPHICS.equals(section)) p.addView(qualityCard(prefs), Ui.fill(Ui.dp(this, 12)));
         if (Settings.S_GRAPHICS.equals(section)) {
             // r18: re-apply the best-settings preset for this phone's GPU.
             String fam = Gpu.family(this);
@@ -210,7 +214,7 @@ public class OptionsActivity extends Activity {
                             .setNegativeButton("Cancel", null)
                             .show()), Ui.fill(Ui.dp(this, 14)));
         }
-        List<Settings.Choice> choices = Settings.inSection(section);
+        List<Settings.Choice> choices = Settings.visibleInSection(this, section);
         for (Settings.Choice c : choices) p.addView(choiceRow(c, prefs), Ui.fill(gap));
         if (Settings.S_CONTROLS.equals(section)) {
             p.addView(Ui.menuButton(this, "Edit touch layout", "Move and resize the on-screen controls", true,
@@ -218,6 +222,7 @@ public class OptionsActivity extends Activity {
         }
         if (Settings.S_DRIVER.equals(section)) addDriverRows(p, prefs);
         if (Settings.S_ADVANCED.equals(section)) addExtraArgs(p, prefs);
+        p.addView(expertRow(), Ui.fill(Ui.dp(this, 22)));
         if (Settings.S_PERFORMANCE.equals(section)) {
             TextView tip = Ui.body(this, "Best start for most phones: 720p, 30 FPS, texture quality Medium, texture filter "
                     + "2x, fast anti-aliasing off, CPU cores Auto, game speed fix and shader cache on.", 12.5f, Ui.GREY);
@@ -225,6 +230,85 @@ public class OptionsActivity extends Activity {
             p.addView(tip);
         }
         return p;
+    }
+
+    // --- r21: quality levels and expert mode -----------------------------------------------------------------------
+
+    /** Three big buttons: SMOOTH / BALANCED / QUALITY (Settings.applyQuality), the current one red. */
+    private View qualityCard(SharedPreferences prefs) {
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setPadding(Ui.dp(this, 16), Ui.dp(this, 14), Ui.dp(this, 16), Ui.dp(this, 14));
+        card.setBackground(Ui.menuBackground(this, false));
+        card.addView(Ui.label(this, "QUALITY", 16));
+        TextView hint = Ui.body(this, "One tap sets resolution, crowd, shadows, textures and frame rate for your GPU.",
+                12, Ui.GREY);
+        hint.setPadding(0, Ui.dp(this, 3), 0, Ui.dp(this, 10));
+        card.addView(hint);
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        String cur = prefs.getString(Settings.KEY_QUALITY, Settings.Q_BALANCED);
+        String[][] levels = {
+                {Settings.Q_SMOOTH, "SMOOTH", "Highest FPS, coolest"},
+                {Settings.Q_BALANCED, "BALANCED", "Recommended"},
+                {Settings.Q_QUALITY, "QUALITY", "Sharper, more crowd"},
+        };
+        for (String[] lv : levels) {
+            boolean on = lv[0].equals(cur);
+            LinearLayout b = new LinearLayout(this);
+            b.setOrientation(LinearLayout.VERTICAL);
+            b.setGravity(Gravity.CENTER);
+            b.setPadding(Ui.dp(this, 8), Ui.dp(this, 10), Ui.dp(this, 8), Ui.dp(this, 10));
+            b.setBackground(on ? Home.pill(this, Ui.RED, 0xFFF0364A, Ui.dp(this, 12))
+                    : Home.pill(this, 0x99281418, 0xCC3A2026, Ui.dp(this, 12)));
+            b.setFocusable(true);
+            b.setClickable(true);
+            TextView t = Ui.text(this, lv[1], 16, Ui.WHITE, Ui.bold());
+            t.setGravity(Gravity.CENTER);
+            b.addView(t);
+            TextView d = Ui.text(this, lv[2], 11.5f, on ? Ui.WHITE : 0xFFB9B4B8, Ui.regular());
+            d.setGravity(Gravity.CENTER);
+            b.addView(d);
+            b.setOnClickListener(v -> {
+                Settings.applyQuality(this, lv[0]);
+                Toast.makeText(this, lv[1] + " quality set", Toast.LENGTH_SHORT).show();
+                build();
+            });
+            LinearLayout.LayoutParams bl = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+            bl.rightMargin = Ui.dp(this, 8);
+            row.addView(b, bl);
+        }
+        card.addView(row);
+        return card;
+    }
+
+    /** EXPERT MODE: shows (and uses) every setting; asks first, since wrong values can make the game slow or crash. */
+    private View expertRow() {
+        boolean on = Settings.isExpert(this);
+        return Ui.menuButton(this, on ? "Expert settings: ON" : "Expert settings: OFF",
+                on ? "Every renderer switch, the Performance and Advanced pages and extra arguments are shown and used. "
+                        + "Tap to go back to the simple settings (the tested values come back)."
+                        : "Only the settings that are safe to change are shown; the rest stay at the tested values for "
+                        + "your GPU. Tap to show everything (for testers).",
+                false, v -> {
+                    if (on) {
+                        Settings.prefs(this).edit().putBoolean(Settings.KEY_EXPERT, false).apply();
+                        section = Settings.S_GRAPHICS;
+                        build();
+                        return;
+                    }
+                    new AlertDialog.Builder(this)
+                            .setTitle("Turn on expert settings?")
+                            .setMessage("Expert settings are for testing. Wrong values can make the game slow, glitchy "
+                                    + "or crash. If that happens, turn expert settings off again: the tested settings "
+                                    + "come back by themselves.")
+                            .setPositiveButton("Turn on", (d, w) -> {
+                                Settings.prefs(this).edit().putBoolean(Settings.KEY_EXPERT, true).apply();
+                                build();
+                            })
+                            .setNegativeButton("Cancel", null)
+                            .show();
+                });
     }
 
     private void addCredits(LinearLayout p) {
@@ -359,8 +443,12 @@ public class OptionsActivity extends Activity {
         java.util.List<Drivers.Driver> drivers = Drivers.list(this);
         // Built-in first: the recommended one, then those for this GPU family, then the rest; imported after.
         java.util.Collections.sort(drivers, (x, y) -> Integer.compare(rank(x, recommended), rank(y, recommended)));
+        final boolean expert = Settings.isExpert(this);
         for (Drivers.Driver d : drivers) {
+            // r21: a normal player only sees drivers for their GPU family (a Turnip on a Mali did nothing).
+            if (!expert && Drivers.wrongFamily(this, d)) continue;
             StringBuilder detail = new StringBuilder();
+            if (Drivers.failedHere(this, d)) detail.append("DID NOT LOAD ON YOUR PHONE · ");
             if (d.bundled) detail.append("BUILT-IN · ");
             if (recommended != null && d.name.equals(recommended.name)) detail.append("RECOMMENDED FOR YOUR GPU · ");
             if (Drivers.wrongFamily(this, d)) detail.append("NOT FOR YOUR GPU · ");
@@ -397,7 +485,7 @@ public class OptionsActivity extends Activity {
                     .setNegativeButton("Cancel", null)
                     .show()), Ui.fill(gap));
         }
-        p.addView(Ui.menuButton(this, "Import driver", "Any driver file: .zip, .tar, .tar.gz or the .so itself (Turnip, "
+        if (expert) p.addView(Ui.menuButton(this, "Import driver", "Any driver file: .zip, .tar, .tar.gz or the .so itself (Turnip, "
                 + "Qualcomm, Mali and other adrenotools drivers)", true, v -> {
             Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
             i.addCategory(Intent.CATEGORY_OPENABLE);

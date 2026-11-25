@@ -47,6 +47,14 @@ public class TouchControls extends View {
     private final float[] knobX = new float[2], knobY = new float[2];  // stick knob offsets in px
     private int dpadDir;  // DPAD_* bits held
 
+    // r21: every button stays pressed for the game at least this long. A quick tap (finger down and up in 20-40 ms)
+    // could start and end between two of the game's controller reads, so the game never saw it ("A button not
+    // pressing properly", 1.2.1 testers). The game reads the pad once a frame (17-33 ms).
+    private static final long MIN_PRESS_MS = 70;
+    private final long[] pressedAt = new long[16];   // per button bit index: when it went down (uptime ms)
+    private int lastFingers;                         // the buttons fingers pressed at the last update
+    private final Runnable releaseHeld = this::releaseHeldButtons;
+
     private final Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG), stroke = new Paint(Paint.ANTI_ALIAS_FLAG),
             text = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final RectF rect = new RectF();
@@ -90,6 +98,13 @@ public class TouchControls extends View {
 
     /** The control under (x, y), with a generous margin; sticks and the d-pad win over small buttons near them. */
     private int hit(float x, float y) {
+        // r21: a finger inside a face button's own circle always presses it, even when a stick's (bigger) touch area
+        // overlaps it in a custom layout.
+        for (int i = TouchLayout.A; i <= TouchLayout.Y; i++) {
+            float r = radius(i);
+            float dx = x - cx(i), dy = y - cy(i);
+            if (dx * dx + dy * dy <= r * r) return i;
+        }
         int best = -1;
         float bestScore = Float.MAX_VALUE;
         for (int i = 0; i < TouchLayout.COUNT; i++) {
@@ -241,10 +256,43 @@ public class TouchControls extends View {
             }
         }
         newButtons |= dpadDir;
+        newButtons = withMinimumPress(newButtons);
         if (newButtons != buttons || nlx != lx || nly != ly || nrx != rx || nry != ry || nlt != lt || nrt != rt) {
             buttons = newButtons;
             lx = nlx; ly = nly; rx = nrx; ry = nry; lt = nlt; rt = nrt;
             send();
+        }
+    }
+
+    /** Keeps a just-released button down until it has been pressed for MIN_PRESS_MS. */
+    private int withMinimumPress(int fingers) {
+        long now = android.os.SystemClock.uptimeMillis();
+        int out = fingers;
+        long wait = 0;
+        for (int bit = 0; bit < 16; bit++) {
+            int m = 1 << bit;
+            if ((fingers & m) != 0 && (lastFingers & m) == 0) pressedAt[bit] = now;
+            if ((fingers & m) == 0 && (buttons & m) != 0) {
+                long left = pressedAt[bit] + MIN_PRESS_MS - now;
+                if (left > 0) {
+                    out |= m;
+                    wait = Math.max(wait, left);
+                }
+            }
+        }
+        lastFingers = fingers;
+        removeCallbacks(releaseHeld);
+        if (wait > 0) postDelayed(releaseHeld, wait + 1);
+        return out;
+    }
+
+    /** The minimum press time of a tapped button is over: send the pad without it. */
+    private void releaseHeldButtons() {
+        int next = withMinimumPress(lastFingers);
+        if (next != buttons) {
+            buttons = next;
+            send();
+            invalidate();
         }
     }
 
@@ -259,6 +307,8 @@ public class TouchControls extends View {
 
     void releaseAll() {
         for (int i = 0; i < pointerControl.length; i++) pointerControl[i] = -1;
+        removeCallbacks(releaseHeld);
+        lastFingers = 0;
         buttons = 0;
         lx = ly = rx = ry = lt = rt = 0;
         knobX[0] = knobY[0] = knobX[1] = knobY[1] = 0;

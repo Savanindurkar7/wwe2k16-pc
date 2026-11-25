@@ -278,7 +278,7 @@ step "7/8 Build APK"
 VCODE="$(git rev-list --count HEAD 2>/dev/null || echo 1)"
 # r18: the version shown in Android App Info and in the app. The release number is WWE2K16_RELEASE (default 1.2.0);
 # the git hash goes in as a build id, shown in the status card and Logs, so a build is still identifiable.
-RELEASE="${WWE2K16_RELEASE:-1.2.1}"
+RELEASE="${WWE2K16_RELEASE:-1.2.2}"
 VNAME="$RELEASE"
 BUILD_ID="$(git rev-parse --short HEAD 2>/dev/null || echo dev)"
 git diff --quiet 2>/dev/null || BUILD_ID="$BUILD_ID+"

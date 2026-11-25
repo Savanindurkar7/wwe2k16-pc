@@ -24,6 +24,7 @@
 #include <unistd.h>
 
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <mutex>
 #include <string>
@@ -54,6 +55,18 @@ std::string Env(const char* name) {
 std::string WithSlash(std::string dir) {
   if (!dir.empty() && dir.back() != '/') dir += '/';
   return dir;
+}
+
+std::string g_device_name;  // r21: the first GPU's name as the opened driver reports it
+
+// r21: one line for the launcher (Drivers.statusFile): "ok <library> <GPU>" or "notloaded <library> <GPU>".
+void WriteStatus(const char* result, const std::string& name) {
+  const std::string path = Env("WWE2K16_DRIVER_STATUS");
+  if (path.empty()) return;
+  if (FILE* f = std::fopen(path.c_str(), "w")) {
+    std::fprintf(f, "%s %s %s\n", result, name.c_str(), g_device_name.c_str());
+    std::fclose(f);
+  }
 }
 
 bool TestStart(void* handle, const std::string& name) {
@@ -88,6 +101,7 @@ bool TestStart(void* handle, const std::string& name) {
     enumerate(instance, &count, devices.data());
     VkPhysicalDeviceProperties p{};
     props(devices[0], &p);
+    g_device_name = p.deviceName;
     REXLOG_INFO("[driver] {}: {} GPU(s); first: {}, Vulkan {}.{}.{}, driver 0x{:08X}", name, count, p.deviceName,
                 VK_API_VERSION_MAJOR(p.apiVersion), VK_API_VERSION_MINOR(p.apiVersion),
                 VK_API_VERSION_PATCH(p.apiVersion), p.driverVersion);
@@ -121,6 +135,16 @@ void* OpenDriverOnce() {
   if (!TestStart(handle, name)) {
     REXLOG_WARN("[driver] {} did not start: the phone's driver is used", name);
     return nullptr;  // left open: unloading a half-started driver is not safe
+  }
+  // r21: a Turnip package must report a Turnip GPU. When the phone's own driver answers instead (libadrenotools
+  // could not swap it in: an Adreno 650 on Android 14 kept its Qualcomm 1.1.128 driver, which then crashed), say so.
+  if (Env("WWE2K16_DRIVER_EXPECT") == "turnip" && g_device_name.find("Turnip") == std::string::npos &&
+      g_device_name.find("turnip") == std::string::npos) {
+    REXLOG_WARN("[driver] {} opened, but the GPU reports '{}': the phone's own driver is running, not Turnip", name,
+                g_device_name);
+    WriteStatus("notloaded", name);
+  } else {
+    WriteStatus("ok", name);
   }
   REXLOG_INFO("[driver] using {} (custom driver)", name);
   g_driver_used = name;
